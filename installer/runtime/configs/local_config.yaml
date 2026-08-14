@@ -1,0 +1,121 @@
+mode: interactive                # one of: interactive | batch | continuous | session
+
+ingest:
+  video:
+    enabled: true
+    device: 0
+    fps: 30
+    output_dir: "~/.federated/data/secure_store/processed/video"
+    receipt_dir: "~/.federated/data/secure_store/receipts"
+    params:
+      blur_kernel: 99
+      head_pose_normalize: true
+      openface:
+        enabled: true
+        features: ["AUs", "gaze", "pose", "blink"]
+        binary_path: "~/.federated/deps/windows/OpenFace/FeatureExtraction.exe"
+        haar_path: "~/.federated/deps/windows/OpenFace/classifiers/haarcascade_frontalface_alt.xml"
+    persist_clips: true
+
+  audio:
+    enabled: true
+    device: "default"
+    sr: 16000
+    output_dir: "~/.federated/data/secure_store/processed/audio"
+    receipt_dir: "~/.federated/data/secure_store/receipts"
+    params:
+      vad: "webrtc"
+      denoise: true
+      features:
+        prosody: true
+        egemaps:
+          enabled: true
+          opensmile_binary: "~/.federated/deps/windows/opensmile/build/progsrc/smilextract/Release/SMILExtract.exe"
+          opensmile_config: "~/.federated/deps/windows/opensmile/config/egemaps/v02/eGeMAPSv02.conf"
+        wav2vec2:
+          enabled: true
+          model: "facebook/wav2vec2-base-960h"
+          pool: "mean"
+          chunk_seconds: 20.0
+    persist_clips: true
+
+  text:
+    enabled: true
+    source: "asr"
+    # whisper model name (used when openai-whisper package IS installed)
+    asr_model: "small"
+    # HuggingFace model ID (used as fallback when openai-whisper is NOT installed)
+    asr_hf_model: "openai/whisper-small"
+    offline: true
+    output_dir: "~/.federated/data/secure_store/processed/text"
+    receipt_dir: "~/.federated/data/secure_store/receipts"
+    params:
+      ner_scrub: ["PERSON", "GPE", "ORG"]
+      embedder: "sentence-transformers/all-MiniLM-L6-v2"
+      metrics: ["sentiment", "ttr", "pronoun_ratio"]
+
+  sensors:
+    enabled: false
+
+privacy_policy:
+  export_raw_media: false
+  pii_scrub_text: true
+  persist_windows_seconds: 5
+  retention:
+    raw_buffer_minutes: 2
+    feature_store_days: 90
+  purge_on_startup: false
+
+video_pipe:
+  head_pose_normalize: true
+  openface:
+    enabled: true
+    features: ["AUs", "gaze", "pose", "blink"]
+    binary_path: "~/.federated/deps/windows/OpenFace/FeatureExtraction.exe"
+    haar_path: "~/.federated/deps/windows/OpenFace/classifiers/haarcascade_frontalface_alt.xml"
+
+audio_pipe:
+  vad: "webrtc"
+  denoise: true
+  energy_threshold: 5.0e-6
+  features:
+    prosody: true
+    egemaps:
+      enabled: true
+      opensmile_binary: "~/.federated/deps/windows/opensmile/build/progsrc/smilextract/Release/SMILExtract.exe"
+      opensmile_config: "~/.federated/deps/windows/opensmile/config/egemaps/v02/eGeMAPSv02.conf"
+    wav2vec2:
+      enabled: true
+      model: "facebook/wav2vec2-base-960h"
+      pool: "mean"
+
+text_pipe:
+  asr_enabled: true
+  # "whisper" uses openai-whisper package; "hf" uses transformers pipeline
+  asr_backend: "whisper"
+  # Whisper model name (tiny/base/small/medium/large)
+  asr_model: "small"
+  # HuggingFace model ID used as fallback when whisper package is unavailable
+  asr_hf_model: "openai/whisper-small"
+  ner_scrub: ["PERSON", "GPE", "ORG"]
+  embedder: "sentence-transformers/all-MiniLM-L6-v2"
+  metrics: ["sentiment", "ttr", "pronoun_ratio"]
+
+storage:
+  # MUST match _CANONICAL_ROOT in centralized_secure_store.py
+  root: "~/.federated/data/secure_store"
+  encrypt: true
+  key_provider: "file"
+  key_path: "~/.federated/data/secure_store/master.key"
+
+outputs:
+  parquet_partitioning: ["modality", "date", "hour"]
+  emit_manifest: true
+  emit_receipts: true
+
+limits:
+  max_concurrent_sessions: 4
+  max_raw_buffer_mb: 200
+  max_upload_mb: 200
+  log_level: "info"
+  debug: false

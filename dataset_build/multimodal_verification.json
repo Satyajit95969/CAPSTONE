@@ -1,0 +1,362 @@
+{
+  "ablation": {
+    "audio_score": 0.933872640132904,
+    "raw": {
+      "audio_phqdelta": 1.2274311184883118,
+      "audio_posdelta": 0.6403141617774963,
+      "text_phqdelta": 0.0,
+      "text_posdelta": 0.0,
+      "vision_phqdelta": 1.0555346012115479,
+      "vision_posdelta": 0.09576886892318726
+    },
+    "run": true,
+    "text_score": 0.0,
+    "vision_score": 0.5756517350673676
+  },
+  "batch_statistics": {
+    "batch_size": 8,
+    "batches": [
+      {
+        "audio_vec_zero_rows": 0,
+        "batch": 0,
+        "tensors": {
+          "attention_mask": {
+            "dtype": "int64",
+            "finite": true,
+            "max": 1.0,
+            "min": 1.0,
+            "shape": [
+              8,
+              128
+            ]
+          },
+          "audio_vec": {
+            "dtype": "float32",
+            "finite": true,
+            "max": 4431.212890625,
+            "min": -9.304038047790527,
+            "shape": [
+              8,
+              154
+            ]
+          },
+          "input_ids": {
+            "dtype": "int64",
+            "finite": true,
+            "max": 27649.0,
+            "min": 101.0,
+            "shape": [
+              8,
+              128
+            ]
+          },
+          "label": {
+            "dtype": "int64",
+            "finite": true,
+            "max": 0.0,
+            "min": 0.0,
+            "shape": [
+              8
+            ]
+          },
+          "phq": {
+            "dtype": "float32",
+            "finite": true,
+            "max": 7.0,
+            "min": 0.0,
+            "shape": [
+              8
+            ]
+          },
+          "video_vec": {
+            "dtype": "float32",
+            "finite": true,
+            "max": 752.4710083007812,
+            "min": -9.43673324584961,
+            "shape": [
+              8,
+              84
+            ]
+          }
+        },
+        "video_vec_zero_rows": 0
+      },
+      {
+        "audio_vec_zero_rows": 0,
+        "batch": 1,
+        "tensors": {
+          "attention_mask": {
+            "dtype": "int64",
+            "finite": true,
+            "max": 1.0,
+            "min": 1.0,
+            "shape": [
+              8,
+              128
+            ]
+          },
+          "audio_vec": {
+            "dtype": "float32",
+            "finite": true,
+            "max": 4448.42236328125,
+            "min": -9.916674613952637,
+            "shape": [
+              8,
+              154
+            ]
+          },
+          "input_ids": {
+            "dtype": "int64",
+            "finite": true,
+            "max": 26580.0,
+            "min": 101.0,
+            "shape": [
+              8,
+              128
+            ]
+          },
+          "label": {
+            "dtype": "int64",
+            "finite": true,
+            "max": 1.0,
+            "min": 0.0,
+            "shape": [
+              8
+            ]
+          },
+          "phq": {
+            "dtype": "float32",
+            "finite": true,
+            "max": 22.0,
+            "min": 1.0,
+            "shape": [
+              8
+            ]
+          },
+          "video_vec": {
+            "dtype": "float32",
+            "finite": true,
+            "max": 705.8250122070312,
+            "min": -29.815141677856445,
+            "shape": [
+              8,
+              84
+            ]
+          }
+        },
+        "video_vec_zero_rows": 0
+      },
+      {
+        "audio_vec_zero_rows": 0,
+        "batch": 2,
+        "tensors": {
+          "attention_mask": {
+            "dtype": "int64",
+            "finite": true,
+            "max": 1.0,
+            "min": 1.0,
+            "shape": [
+              8,
+              128
+            ]
+          },
+          "audio_vec": {
+            "dtype": "float32",
+            "finite": true,
+            "max": 4457.3759765625,
+            "min": -10.735750198364258,
+            "shape": [
+              8,
+              154
+            ]
+          },
+          "input_ids": {
+            "dtype": "int64",
+            "finite": true,
+            "max": 26351.0,
+            "min": 101.0,
+            "shape": [
+              8,
+              128
+            ]
+          },
+          "label": {
+            "dtype": "int64",
+            "finite": true,
+            "max": 1.0,
+            "min": 0.0,
+            "shape": [
+              8
+            ]
+          },
+          "phq": {
+            "dtype": "float32",
+            "finite": true,
+            "max": 20.0,
+            "min": 1.0,
+            "shape": [
+              8
+            ]
+          },
+          "video_vec": {
+            "dtype": "float32",
+            "finite": true,
+            "max": 604.9275512695312,
+            "min": -124.42044830322266,
+            "shape": [
+              8,
+              84
+            ]
+          }
+        },
+        "video_vec_zero_rows": 0
+      }
+    ],
+    "batches_checked": 3
+  },
+  "dataset": {
+    "getitem_keys": [
+      "attention_mask",
+      "audio_vec",
+      "input_ids",
+      "label",
+      "phq",
+      "video_vec"
+    ],
+    "len": 188,
+    "max_len": 128
+  },
+  "determinism": {
+    "loading_and_batching_identical": true
+  },
+  "digest": "397e36725eed6fb88906422e83140537b7970313cedccb4de92620757734fd85",
+  "findings": [
+    {
+      "check": "A16.text_zero",
+      "message": "text_score is 0.0 because trainer line 442 requires module-level 'args', which exists only when the trainer runs as __main__; this is an execution-context artifact, not a data property",
+      "severity": "WARN"
+    }
+  ],
+  "forward_pass": {
+    "batches": [
+      {
+        "batch": 0,
+        "logits": {
+          "dtype": "float32",
+          "finite": true,
+          "max": -7.39146089553833,
+          "min": -11.825901985168457,
+          "shape": [
+            8,
+            2
+          ]
+        },
+        "loss_cls": 3.6404829025268555,
+        "loss_reg": 6.697659969329834,
+        "loss_total": 6.989313125610352,
+        "reg_pred": {
+          "dtype": "float32",
+          "finite": true,
+          "max": 2.5329017639160156,
+          "min": 1.8237720727920532,
+          "shape": [
+            8
+          ]
+        }
+      },
+      {
+        "batch": 1,
+        "logits": {
+          "dtype": "float32",
+          "finite": true,
+          "max": -7.541080474853516,
+          "min": -11.536149978637695,
+          "shape": [
+            8,
+            2
+          ]
+        },
+        "loss_cls": 1.91078782081604,
+        "loss_reg": 116.24165344238281,
+        "loss_total": 60.0316162109375,
+        "reg_pred": {
+          "dtype": "float32",
+          "finite": true,
+          "max": 2.53641676902771,
+          "min": 2.007701873779297,
+          "shape": [
+            8
+          ]
+        }
+      },
+      {
+        "batch": 2,
+        "logits": {
+          "dtype": "float32",
+          "finite": true,
+          "max": -7.382990837097168,
+          "min": -11.405891418457031,
+          "shape": [
+            8,
+            2
+          ]
+        },
+        "loss_cls": 2.009406089782715,
+        "loss_reg": 74.4321517944336,
+        "loss_total": 39.22548294067383,
+        "reg_pred": {
+          "dtype": "float32",
+          "finite": true,
+          "max": 2.6404874324798584,
+          "min": 1.741416573524475,
+          "shape": [
+            8
+          ]
+        }
+      }
+    ],
+    "objective": "CrossEntropy + 0.5 * MSE (frozen)",
+    "run": true
+  },
+  "generated_by": "verify_daic_multimodal_records.py",
+  "infer_dims": {
+    "audio_dim": 154,
+    "expected": [
+      154,
+      84
+    ],
+    "vision_dim": 84
+  },
+  "inputs": {
+    "bert_model": "mental/mental-bert-base-uncased",
+    "parquet": "C:\\Users\\DELL\\Desktop\\pipeline backup\\BE-Major-Project\\dataset_build\\daic_records_multimodal.parquet",
+    "parquet_sha256": "1ac9f53e6102ec0dbaab84dcfdfa3f2e70f2b4a1867a841ea2b7e3ba24c67a95",
+    "trainer": "C:\\Users\\DELL\\Desktop\\pipeline backup\\BE-Major-Project\\trainer_mentalbert_daic.py",
+    "trainer_module_args_present": false,
+    "trainer_sha256": "65b1902e2ba8dd996c6960db1a6595d84fd48500f4d8707cb79688093d7a230b",
+    "trainer_sha_matches_frozen": true
+  },
+  "records": {
+    "expected": 188,
+    "loaded": 188,
+    "with_audio": 188,
+    "with_text": 188,
+    "with_vision": 188
+  },
+  "runtime_seconds": 17.68,
+  "schema": "daic_multimodal_verification/1",
+  "supplementary_text_check": {
+    "method": "attention_mask zeroed; model.forward from the frozen trainer",
+    "note": "SUPPLEMENTARY diagnostic only - not a substitute for the frozen ablation, and not comparable to Phase 9.5's 2.3365",
+    "run": true,
+    "text_phqdelta": 0.13004076480865479,
+    "text_posdelta": 0.0028238296508789062,
+    "text_score": 0.06643229722976685
+  },
+  "trained": false,
+  "validation_summary": {
+    "compatible": true,
+    "fail": 0,
+    "warn": 1
+  }
+}

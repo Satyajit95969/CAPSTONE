@@ -1,0 +1,99 @@
+{
+  "coverage_summary": {
+    "audio_coverage": {
+      "max": 0.723923,
+      "mean": 0.46188808510638285,
+      "min": 0.116073
+    },
+    "video_coverage": {
+      "max": 0.99677,
+      "mean": 0.948508005319149,
+      "min": 0.740728
+    }
+  },
+  "elapsed_seconds": 23.52,
+  "feature_dimensions": {
+    "audio_dim": 154,
+    "vision_dim": 84
+  },
+  "findings": [],
+  "findings_digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+  "generated_by": "build_daic_multimodal_records.py",
+  "inputs": {
+    "features": "C:\\Users\\DELL\\Desktop\\pipeline backup\\BE-Major-Project\\dataset_build\\multimodal_features.json",
+    "features_digest": "3d5d15d5b28acb0d6a84d21c958d936f011c18af3c8fff188c9fd0da6b0025a2",
+    "features_sha256": "a268a94432656a1419dacffc57f84267cea4979f241f254fc71decbdeec1f941",
+    "parquet": "C:\\Users\\DELL\\Desktop\\pipeline backup\\BE-Major-Project\\daic_records.parquet",
+    "parquet_sha256": "9a241851760727779fcaa4d50041b8bdc4406fe6b66ddbbd7105f4ce4fc55f00",
+    "parquet_sha256_pinned": "9a241851760727779fcaa4d50041b8bdc4406fe6b66ddbbd7105f4ce4fc55f00",
+    "parquet_sha_matches_pin": true
+  },
+  "output": {
+    "compression": "snappy",
+    "parquet": "C:\\Users\\DELL\\Desktop\\pipeline backup\\BE-Major-Project\\dataset_build\\daic_records_multimodal.parquet",
+    "parquet_sha256": "1ac9f53e6102ec0dbaab84dcfdfa3f2e70f2b4a1867a841ea2b7e3ba24c67a95",
+    "size_bytes": 1678900
+  },
+  "row_count": 188,
+  "schema": "daic_multimodal_records_report/1",
+  "schema_summary": {
+    "appended_columns": [
+      "features",
+      "audio_coverage",
+      "video_coverage"
+    ],
+    "columns": [
+      {
+        "name": "participant_id",
+        "type": "string"
+      },
+      {
+        "name": "text",
+        "type": "string"
+      },
+      {
+        "name": "phq_score",
+        "type": "double"
+      },
+      {
+        "name": "features",
+        "type": "string"
+      },
+      {
+        "name": "audio_coverage",
+        "type": "double"
+      },
+      {
+        "name": "video_coverage",
+        "type": "double"
+      }
+    ],
+    "features_encoding": "JSON string (trainer decodes at lines 89-96)",
+    "features_keys": {
+      "audio": "features.audio.wav2vec2",
+      "video": "features.video.densenet"
+    },
+    "frozen_columns": [
+      "participant_id",
+      "text",
+      "phq_score"
+    ]
+  },
+  "totals": {
+    "fail": 0,
+    "warn": 0
+  },
+  "trainer_contract": {
+    "audio_extracted": 188,
+    "audio_shapes": [
+      "(154,)"
+    ],
+    "checked": true,
+    "records_loaded": 188,
+    "trainer_sha": "65b1902e2ba8dd996c6960db1a6595d84fd48500f4d8707cb79688093d7a230b",
+    "vision_extracted": 188,
+    "vision_shapes": [
+      "(84,)"
+    ]
+  }
+}

@@ -1,0 +1,112 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Rust
+target/
+
+# Generated training outputs
+trainer_outputs/
+
+# Logs
+*.log
+
+# Secrets / credentials
+*.pem
+*.key
+*.csr
+*.p12
+*.pfx
+*.bin
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local secure storage / encrypted runtime state
+secure_store/
+
+# Generated federated global models
+server/orchestration_agent/aggregated_round_*.pt
+
+# Additional Python environment
+.venv_py313/
+
+# Generated certificates
+*.cer
+
+# Experiment / transfer archives
+*.zip
+
+# Generated / local ML data and model artifacts
+*.parquet
+*.pt
+
+# Local AI/editor configuration
+.claude/settings.local.json
+
+# Local environment configuration
+.env
+
+# Generated TLS certificates
+server/orchestration_agent/certs/
+
+# Generated/archive ZIP files
+*.zip
+
+############################
+# DAIC-WOZ DATASET - LOCAL PREREQUISITE, NEVER COMMIT
+# Licensed human-subjects data. Supply it locally on each machine.
+############################
+data/
+data_norm/
+labels/
+transcripts/
+audio/
+video/
+
+############################
+# Generated runtime / experiment artifacts
+############################
+receipts/
+plots/
+processed/
+explain_logs/
+*.srl
+
+############################
+# Machine-specific local config
+############################
+configs/local_config.yaml
+
+############################
+# Rust build artifacts
+############################
+installer/windows_signer/target/
+server/orchestration_agent/target/
+
+############################
+# Crypto scratch / local identity
+############################
+client_id.bin
+msg.bin
+sig.bin
+device_key.pem
+client_agent/certs/
+installer/runtime/keys/
+
+############################
+# Extra caches
+############################
+.pytest_cache/
+.mypy_cache/
+.idea/
+*.swp
