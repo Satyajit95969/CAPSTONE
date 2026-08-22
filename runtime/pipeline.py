@@ -449,7 +449,10 @@ def run_pipeline(
     log.info("[pipeline] Applying DP noise...")
 
     store    = SecureStore(agent="trainer", root=_STORE_ROOT)
-    dp_clip_norm = 1.0
+    # Fix C: calibrated to measured delta sensitivity, not left at the dead
+    # default of 1.0 (see scripts/calibrate_clip_norm.py, N=30: max=0.1177).
+    # Overridable per-run; env var wins over the calibrated default.
+    dp_clip_norm = float(os.environ.get("DP_CLIP_NORM", "0.15"))
     dp_noise_multiplier = 1.0
     dp_mechanism = "gaussian"
     dp_agent = DPAgent(

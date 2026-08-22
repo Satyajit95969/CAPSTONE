@@ -7,13 +7,35 @@ SECURITY FIX:
              field absent. Previously pipeline.py hardcoded epsilon_spent=1.0
              in the receipt because the DP agent never reported actual epsilon.
 
-  The Gaussian mechanism RDP epsilon for one step:
-    eps_rdp(alpha) = alpha * (clip_norm * noise_multiplier)^-2 / 2
+  The Gaussian mechanism RDP epsilon for one step depends on noise_multiplier
+  (sigma) only - NOT on clip_norm. (An earlier version of this comment stated
+  a clip_norm-dependent formula; that was never what _rdp_to_dp() computed -
+  the comment was wrong, not the code. Corrected here as part of Fix C.)
+  For the Gaussian mechanism with std = noise_multiplier * clip_norm and
+  sensitivity = clip_norm, the *ratio* std/sensitivity = noise_multiplier is
+  what RDP depends on, which is why clip_norm cancels out of the epsilon
+  formula even though it fixes the absolute noise scale:
+    eps_rdp(alpha) = alpha / (2 * noise_multiplier^2)
   Converted to (eps, delta)-DP via the standard RDP → DP conversion:
     eps(delta) = min over alpha [ eps_rdp(alpha) + log(1/delta)/(alpha-1) ]
 
   This is a single-step accounting. For full multi-round accounting across
   all clients, wire up the Opacus RDP accountant in the orchestrator.
+
+  FIX-C: add_noise() previously hardcoded sensitivity=1.0 at its call site
+         in process_local_update(), completely decoupled from self.clip.
+         clip_norm therefore bounded the signal (clipping) but had zero
+         effect on the noise - DP-SGD (Abadi et al. 2016) requires
+         g_tilde = g + N(0, sigma^2 * C^2 * I), i.e. noise scale must equal
+         noise_multiplier * clip_norm. Now passes sensitivity=self.clip,
+         restoring that coupling. clip_norm default calibrated to measured
+         delta sensitivity (scripts/calibrate_clip_norm.py, N=30: min=0.0393,
+         median=0.0719, p90=0.1100, max=0.1177) -> clip_norm=0.15. This is
+         NOT a privacy weakening: the epsilon formula above is unchanged
+         (still noise_multiplier/delta only), and clipping now genuinely
+         bounds sensitivity at the value noise is calibrated against, instead
+         of bounding it at 1.0 while noising at 1.0 regardless of where the
+         clip threshold was set.
 """
 
 import os, io, time, math, torch
@@ -71,7 +93,7 @@ class DPAgent:
 
     def __init__(
         self,
-        clip_norm: float = 1.0,
+        clip_norm: float = 0.15,  # Fix C: calibrated to measured delta sensitivity (N=30, max=0.1177) — see scripts/calibrate_clip_norm.py
         noise_multiplier: float = 1.0,
         mechanism: str = "gaussian",
         secure_store_dir: str = str(_DP_STORE_DIR),
@@ -196,9 +218,36 @@ class DPAgent:
         l2_post_clip = float(torch.norm(flat, p=2).item()) if flat.numel() > 0 else 0.0
         rpt.kv("L2 norm after clip", f"{l2_post_clip:.6f}", indent=2)
 
-        noisy    = self.add_noise(flat, sensitivity=1.0)
+        # Fix C: DP-SGD (Abadi et al. 2016) defines the noised update as
+        #   g_tilde = g + N(0, sigma^2 * C^2 * I)
+        # i.e. noise scale MUST equal noise_multiplier * clip_norm, because
+        # clip_norm IS the sensitivity bound the Gaussian mechanism is
+        # calibrated against. This project's own paper states that formula.
+        # Previously this call hardcoded sensitivity=1.0 regardless of
+        # self.clip, so clip_norm bounded the signal but had zero effect on
+        # the noise - clipping to a tighter C bought nothing. Passing
+        # self.clip here restores the documented mechanism.
+        noisy    = self.add_noise(flat, sensitivity=self.clip)
         l2_after = float(torch.norm(noisy, p=2).item()) if noisy.numel() > 0 else 0.0
         noise_norm = float(torch.norm(noisy - flat, p=2).item()) if noisy.numel() > 0 else 0.0
+
+        # Runtime self-check: if add_noise() ever silently regresses to a
+        # hardcoded/decoupled sensitivity again, catch it immediately rather
+        # than quietly wasting privacy budget on unenforced noise. Compares
+        # the empirical per-element noise std (noise_norm / sqrt(n), valid
+        # for zero-mean noise over enough dimensions for CLT to apply) to the
+        # theoretical noise_multiplier * clip_norm.
+        if self.mechanism == "gaussian" and param_count > 100:
+            empirical_noise_std = noise_norm / math.sqrt(param_count)
+            expected_noise_std  = self.noise_multiplier * self.clip
+            rel_error = abs(empirical_noise_std - expected_noise_std) / max(expected_noise_std, 1e-8)
+            assert rel_error < 0.15, (
+                f"DP noise scale has diverged from clip_norm: empirical per-element "
+                f"std={empirical_noise_std:.6f}, expected noise_multiplier*clip_norm="
+                f"{expected_noise_std:.6f} (rel_error={rel_error:.1%}). add_noise() may "
+                f"no longer be receiving sensitivity=self.clip - this would silently "
+                f"waste privacy budget on unenforced noise (Fix C regression)."
+            )
 
         rpt.subheader("STEP 2 - NOISE")
         rpt.kv("Mechanism", self.mechanism, indent=2)

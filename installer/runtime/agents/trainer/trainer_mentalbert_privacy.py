@@ -69,7 +69,19 @@ FREEZE_TEXT_ENCODER = os.environ.get("FREEZE_TEXT_ENCODER", "true").strip().lowe
 
 # Safety hyperparameters (tunable)
 DEFAULT_MAX_PARAM_CHANGE = 1e-3        # per-parameter absolute clamp on delta
-DEFAULT_MAX_GLOBAL_DELTA_NORM = 1.0   # max L2 norm of delta state (after per-param clamp will be scaled down to this)
+# Fix C: recalibrated from the old dead 1.0 (never fired - observed delta L2
+# range is [0.039, 0.118], N=30, see scripts/calibrate_clip_norm.py). This is
+# a general safety backstop applied BEFORE encryption, upstream of and
+# separate from dp_agent.py's own clip_norm=0.15 (applied AFTER decryption,
+# on the already safety-clamped delta - see process_local_update()). Set to
+# 0.3 (2x clip_norm, ~2.5x the observed max) so DP's tighter 0.15 threshold
+# is always the one that actually engages/binds; this backstop only fires for
+# deltas beyond 2x today's observed max, i.e. genuine training instability,
+# not normal operation. Deliberately above clip_norm, not below it: if this
+# were tighter than clip_norm, it would always clip first and clip_norm would
+# never fire, which would sever the tie between the clip threshold and the
+# noise scale that Fix C just restored.
+DEFAULT_MAX_GLOBAL_DELTA_NORM = 0.3   # max L2 norm of delta state (after per-param clamp will be scaled down to this)
 RL_PHQ_RANGE = 30.0                   # normalization range for PHQ when computing reward
 
 
