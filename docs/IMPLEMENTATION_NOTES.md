@@ -45,3 +45,28 @@ list it's given, so a per-client partition would automatically get its own
 independent stratified split. The gap to close, if that's ever wanted, is
 upstream: something has to hand each client a different local subset of the
 corpus in the first place.
+
+---
+
+## Fix E4 — more training steps make delta magnitude more predictable (2026-08-23)
+
+Side finding from recalibrating `clip_norm` after raising `lr` (2e-5→1e-4) and
+`epochs` (1→10, 19→190 optimizer steps): the delta L2 norm distribution got
+*much* tighter, not just bigger.
+
+```
+old regime (lr=2e-5, epochs=1, N=30): mean=0.0509  stdev=0.0157  CV≈30.8%
+new regime (lr=1e-4, epochs=10, N=30): mean=0.6670  stdev=0.0259  CV≈3.9%
+```
+
+More optimizer steps per round produced a far more consistent delta
+magnitude run to run - intuitively, 19 steps means the final weight delta is
+dominated by whichever few batches happened to land late in that short run
+(high variance), while 190 steps averages over enough batches that the
+result is much less sensitive to which specific examples got sampled when.
+
+This matters operationally, not just statistically: a calibration with lower
+CV is safer to trust with less margin above the observed max, and clipping
+behavior is more predictable round to round - fewer surprise clips on tail
+runs. Not the reason Fix E4 was done (that was fixing the degenerate
+collapse), but worth recording as a real, measured side benefit.

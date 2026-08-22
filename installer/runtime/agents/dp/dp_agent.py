@@ -93,7 +93,7 @@ class DPAgent:
 
     def __init__(
         self,
-        clip_norm: float = 0.15,  # Fix C: calibrated to measured delta sensitivity (N=30, max=0.1177) — see scripts/calibrate_clip_norm.py
+        clip_norm: float = 0.85,  # Fix E4 recalibration: measured delta sensitivity shifted with lr/epochs (N=30, max=0.7294, was max=0.1177 under the old regime) — see scripts/calibrate_clip_norm.py
         noise_multiplier: float = 1.0,
         mechanism: str = "gaussian",
         secure_store_dir: str = str(_DP_STORE_DIR),

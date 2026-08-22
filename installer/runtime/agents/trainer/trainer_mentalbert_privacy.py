@@ -94,21 +94,40 @@ PHQ_SCALE_MAX = 24.0
 # visible on every run.
 TRAIN_LOG_INTERVAL = int(os.environ.get("TRAIN_LOG_INTERVAL", "5"))
 
+# Fix E4: training volume and learning rate for the supervised path. lr=2e-5
+# was a full-BERT-fine-tuning rate, wrong for a randomly-initialised 281K
+# head; epochs=1 (19 steps) was thin regardless of lr. Chosen from
+# scripts/sweep_lr_epochs.py's offline grid (5 lr x 4 epochs x 3 seeds, 60
+# runs): lr=1e-4/epochs=10 had the best mean F1 (0.5729) among the 0/3-
+# degenerate cells, and the tightest per-seed spread (0.550-0.609) of the top
+# tier - the 5e-3 cells scored comparably on average (0.54-0.57) but swung
+# 0.47-0.76 per seed, which is variance, not a better-trained model. Every
+# epochs=1 cell was degenerate in 2 or 3 of 3 seeds at every lr tried - one
+# epoch was never viable, independent of learning rate.
+# Single source of truth for both values - runtime/pipeline.py imports these
+# constants rather than hardcoding its own copy, so the two files cannot
+# drift apart the way pipeline.py's old hardcoded "epochs": 1 did.
+SUPERVISED_LR = float(os.environ.get("SUPERVISED_LR", "1e-4"))
+SUPERVISED_EPOCHS = int(os.environ.get("SUPERVISED_EPOCHS", "10"))
+
 # Safety hyperparameters (tunable)
 DEFAULT_MAX_PARAM_CHANGE = 1e-3        # per-parameter absolute clamp on delta
-# Fix C: recalibrated from the old dead 1.0 (never fired - observed delta L2
-# range is [0.039, 0.118], N=30, see scripts/calibrate_clip_norm.py). This is
-# a general safety backstop applied BEFORE encryption, upstream of and
-# separate from dp_agent.py's own clip_norm=0.15 (applied AFTER decryption,
-# on the already safety-clamped delta - see process_local_update()). Set to
-# 0.3 (2x clip_norm, ~2.5x the observed max) so DP's tighter 0.15 threshold
-# is always the one that actually engages/binds; this backstop only fires for
-# deltas beyond 2x today's observed max, i.e. genuine training instability,
-# not normal operation. Deliberately above clip_norm, not below it: if this
-# were tighter than clip_norm, it would always clip first and clip_norm would
-# never fire, which would sever the tie between the clip threshold and the
-# noise scale that Fix C just restored.
-DEFAULT_MAX_GLOBAL_DELTA_NORM = 0.3   # max L2 norm of delta state (after per-param clamp will be scaled down to this)
+# Fix C, recalibrated again for Fix E4 (lr/epochs changed the delta scale
+# entirely - see scripts/calibrate_clip_norm.py, N=30: max shifted from
+# 0.1177 to 0.7294). This is a general safety backstop applied BEFORE
+# encryption, upstream of and separate from dp_agent.py's own
+# clip_norm=0.85 (applied AFTER decryption, on the already safety-clamped
+# delta - see process_local_update()). Set to 1.7 (2x clip_norm, same ratio
+# as the original 0.3-vs-0.15 pairing) so DP's tighter 0.85 threshold is
+# always the one that actually engages/binds; this backstop only fires for
+# deltas beyond ~2.3x today's observed max, i.e. genuine training
+# instability, not normal operation. Deliberately above clip_norm, not
+# below it: if this were tighter than clip_norm, it would always clip first
+# and clip_norm would never fire, severing the tie between the clip
+# threshold and the noise scale that Fix C restored - confirmed empirically
+# this was about to happen at the old 0.3 once Fix E4 landed (measured min
+# delta 0.6247 already exceeded it).
+DEFAULT_MAX_GLOBAL_DELTA_NORM = 1.7   # max L2 norm of delta state (after per-param clamp will be scaled down to this)
 RL_PHQ_RANGE = 30.0                   # normalization range for PHQ when computing reward
 
 
@@ -473,7 +492,7 @@ def run_inference(model: MultiModalModel, dataloader: DataLoader, device: str = 
     return results
 
 
-def fine_tune_supervised(model: MultiModalModel, dataset: MultiModalDataset, epochs: int = 1, batch_size: int = 8, lr: float = 2e-5, device: str = DEFAULT_DEVICE):
+def fine_tune_supervised(model: MultiModalModel, dataset: MultiModalDataset, epochs: int = SUPERVISED_EPOCHS, batch_size: int = 8, lr: float = SUPERVISED_LR, device: str = DEFAULT_DEVICE):
     model.to(device)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_batch)
     # Fix B: only trainable (requires_grad=True) params get an optimizer slot.
@@ -510,7 +529,7 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support, mea
 
 def train_model(dataset: MultiModalDataset, model: MultiModalModel,
                 output_dir: str = "./trainer_outputs",
-                epochs: int = 5, batch_size: int = 8, lr: float = 2e-5,
+                epochs: int = SUPERVISED_EPOCHS, batch_size: int = 8, lr: float = SUPERVISED_LR,
                 device: str = DEFAULT_DEVICE,
                 eval_dataset: Optional[MultiModalDataset] = None):
     """
@@ -1058,9 +1077,9 @@ def orchestrate(
     session_id: str,
     mode: str = "autonomous",
     device: str = None,
-    epochs: int = 1,
+    epochs: int = SUPERVISED_EPOCHS,
     batch_size: int = 8,
-    lr: float = 2e-5,
+    lr: float = SUPERVISED_LR,
     rl_supervised_lambda: float = 0.0,
     max_samples=None,
     safety_params=None,
@@ -1448,9 +1467,9 @@ def main():
     parser.add_argument("--mode", choices=["autonomous", "supervised", "rl"], required=True)
     parser.add_argument("--input", required=True, help="parquet/json/csv path from LDA")
     parser.add_argument("--device", default=DEFAULT_DEVICE)
-    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--epochs", type=int, default=SUPERVISED_EPOCHS)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--lr", type=float, default=SUPERVISED_LR)
     parser.add_argument("--rl-supervised-lambda", type=float, default=0.0, help="mix supervised MSE into RL updates")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-param-change", type=float, default=DEFAULT_MAX_PARAM_CHANGE)

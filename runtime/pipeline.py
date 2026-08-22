@@ -35,6 +35,10 @@ from typing import Optional
 
 from agents.lda.main import preprocess, PreprocessRequest
 from agents.trainer.trainer_mentalbert_privacy import orchestrate as trainer_orchestrate
+# Fix E4: single source of truth lives in trainer_mentalbert_privacy.py -
+# imported, not re-declared, so this file cannot hold a stale default the way
+# the old hardcoded "epochs": 1 below used to.
+from agents.trainer.trainer_mentalbert_privacy import SUPERVISED_LR, SUPERVISED_EPOCHS
 from agents.dp.dp_agent import DPAgent
 from agents.enc.enc_agent import EncryptionAgent
 from core.centralized_secure_store import SecureStore
@@ -412,8 +416,9 @@ def run_pipeline(
         "input_path":  manifest_uri,
         "session_id":  session_id,
         "mode":        "supervised",
-        "epochs":      1,
+        "epochs":      SUPERVISED_EPOCHS,
         "batch_size":  8,
+        "lr":          SUPERVISED_LR,
     }
     if PIPELINE_MODE == "multimodal":
         trainer_kwargs["max_samples"] = _MULTIMODAL_MAX_SAMPLES
@@ -425,6 +430,7 @@ def run_pipeline(
     rpt.kv("Initialization", "Global model (warm-start)" if global_model_path else "Random / local pretrained")
     rpt.kv("Epochs", trainer_kwargs["epochs"])
     rpt.kv("Batch size", trainer_kwargs["batch_size"])
+    rpt.kv("Learning rate", trainer_kwargs["lr"])
     rpt.kv("Optimizer", "AdamW")
 
     t0 = time.time()
@@ -449,10 +455,11 @@ def run_pipeline(
     log.info("[pipeline] Applying DP noise...")
 
     store    = SecureStore(agent="trainer", root=_STORE_ROOT)
-    # Fix C: calibrated to measured delta sensitivity, not left at the dead
-    # default of 1.0 (see scripts/calibrate_clip_norm.py, N=30: max=0.1177).
-    # Overridable per-run; env var wins over the calibrated default.
-    dp_clip_norm = float(os.environ.get("DP_CLIP_NORM", "0.15"))
+    # Fix E4 recalibration: lr/epochs changes shifted the measured delta
+    # sensitivity from max=0.1177 to max=0.7294 (see
+    # scripts/calibrate_clip_norm.py, N=30) - 0.15 would now clip almost
+    # every run. Overridable per-run; env var wins over the calibrated default.
+    dp_clip_norm = float(os.environ.get("DP_CLIP_NORM", "0.85"))
     dp_noise_multiplier = 1.0
     dp_mechanism = "gaussian"
     dp_agent = DPAgent(
