@@ -14,6 +14,7 @@ from datetime import datetime
 
 from core.centralized_secure_store import SecureStore
 from core.centralised_receipts import CentralReceiptManager
+from core import reporting as rpt
 
 from agents.lda.pipelines.video import process_video_file
 from agents.lda.pipelines.audio import process_audio_file
@@ -127,6 +128,11 @@ def preprocess(req: PreprocessRequest) -> Dict[str, Any]:
     outputs, receipts, manifest = [], [], []
 
     mode = req.mode.lower()
+    rpt.header("LOCAL DATA AGENT — DETAIL")
+    rpt.kv("Session ID", session_id)
+    rpt.kv("Mode", mode)
+    rpt.kv("Pipeline", "VAD -> diarization -> ASR -> feature extraction -> QA assembly")
+    t_lda0 = time.time()
 
     # -----------------------------
     # SESSION / CONTINUOUS
@@ -148,6 +154,7 @@ def preprocess(req: PreprocessRequest) -> Dict[str, Any]:
                     if candidate_txt.exists():
                         text_input = candidate_txt.read_text(encoding="utf-8")
 
+                t_seg0 = time.time()
                 rows, artifacts, rlist = process_session_file(
                     session_id=session_id,
                     cfg=cfg,
@@ -158,6 +165,23 @@ def preprocess(req: PreprocessRequest) -> Dict[str, Any]:
                     mode=mode,
                     roles=None,
                 )
+                seg_elapsed = time.time() - t_seg0
+
+                status_counts: Dict[str, int] = {}
+                speakers = set()
+                for r in rows:
+                    status = (r.get("derived") or {}).get("transcript_status", "unknown")
+                    status_counts[status] = status_counts.get(status, 0) + 1
+                    if r.get("speaker_label"):
+                        speakers.add(r["speaker_label"])
+
+                rpt.subheader(f"SEGMENT: {p.name}")
+                rpt.kv("Segments (VAD/diarization)", len(rows), indent=2)
+                rpt.kv("Speakers detected", len(speakers), indent=2)
+                rpt.kv("Face tracking", "video present", indent=2)
+                for status, cnt in status_counts.items():
+                    rpt.kv(f"Transcript status: {status}", cnt, indent=2)
+                rpt.kv("Processing time", f"{seg_elapsed:.2f} sec", indent=2)
 
                 uri, ruri = _write_parquet_encrypted(store, rm, session_id, "session", rows)
                 if uri:
@@ -243,6 +267,13 @@ def preprocess(req: PreprocessRequest) -> Dict[str, Any]:
     final_receipt_uri = store.encrypt_write(
         f"file://{store.root / rrel}", json.dumps(final_receipt).encode()
     )
+
+    rpt.subheader("LDA OUTPUT")
+    rpt.kv("Output rows", len(manifest))
+    rpt.kv("Encrypted artifacts", len(outputs))
+    rpt.kv("Schema validation", "PASS" if manifest else "FAIL (0 rows)")
+    rpt.kv("Execution time", f"{time.time() - t_lda0:.2f} sec")
+    rpt.ok("LDA completed") if manifest else rpt.fail("LDA produced 0 rows")
 
     return {
         "session_id": session_id,

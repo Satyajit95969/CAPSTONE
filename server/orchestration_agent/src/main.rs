@@ -33,16 +33,25 @@ async fn main() -> anyhow::Result<()> {
 
     let mongo = mongodb::Client::with_uri_str(&mongo_uri).await?;
 
+    // FIX-MULTIMODAL-1: database name from environment, defaulting to the
+    // existing "federated" name — zero behavior change unless MONGO_DATABASE
+    // is explicitly set. This lets a separate experiment (e.g. the
+    // multimodal model, which has different parameter shapes and must not
+    // share round numbering with the existing text-only chain) run against
+    // an independent database using the identical binary and identical
+    // DP/encryption/TPM/mTLS/aggregation code paths.
+    let db_name = std::env::var("MONGO_DATABASE").unwrap_or_else(|_| "federated".to_string());
+
     // Verify connectivity
-    mongo.database("federated")
+    mongo.database(&db_name)
         .run_command(mongodb::bson::doc! { "ping": 1 }, None)
         .await
         .map_err(|e| anyhow::anyhow!("MongoDB connection failed: {}", e))?;
 
-    tracing::info!("MongoDB connected: {}", mongo_uri);
+    tracing::info!("MongoDB connected: {} (database={})", mongo_uri, db_name);
 
     // Ensure indexes exist
-    _ensure_indexes(&mongo).await?;
+    _ensure_indexes(&mongo, &db_name).await?;
 
     // ── 4. Create shared orchestrator state ───────────────────────────────────
     let state = OrchestratorState::new();
@@ -57,17 +66,17 @@ async fn main() -> anyhow::Result<()> {
     pubsub::start(state.clone());
 
     // ── 7. Start gRPC server ──────────────────────────────────────────────────
-    grpc::server::serve(cfg, state, mongo).await?;
+    grpc::server::serve(cfg, state, mongo, db_name).await?;
 
     Ok(())
 }
 
-async fn _ensure_indexes(mongo: &mongodb::Client) -> anyhow::Result<()> {
+async fn _ensure_indexes(mongo: &mongodb::Client, db_name: &str) -> anyhow::Result<()> {
     use mongodb::bson::doc;
     use mongodb::IndexModel;
     use mongodb::options::IndexOptions;
 
-    let db = mongo.database("federated");
+    let db = mongo.database(db_name);
 
     // devices: unique index on device_id
     db.collection::<mongodb::bson::Document>("devices")

@@ -1,6 +1,6 @@
 use dashmap::DashMap;
 use std::sync::Arc;
-use crate::round::{Round, RoundState};
+use crate::round::Round;
 
 pub type DeviceId = Vec<u8>;
 
@@ -19,25 +19,21 @@ pub struct OrchestratorState {
 }
 
 impl OrchestratorState {
+    /// FIX-RECOVERY-1: `rounds` starts EMPTY. Previously this hardcoded round 1
+    /// into the map at construction time, which meant `hydrate_and_resume_aggregation()`
+    /// — which only ever walks round_ids already present in this map — could
+    /// never discover round 2, round 3, etc. that a prior process instance had
+    /// already created and possibly completed. The map is now populated
+    /// entirely by `hydrate_and_resume_aggregation()` at startup, which
+    /// reconstructs the full round chain from MongoDB (receipts + global_models),
+    /// including the fresh-install case (no MongoDB data yet) where it creates
+    /// round 1 itself. See server.rs for the recovery logic.
     pub fn new() -> Arc<Self> {
-        let s = Arc::new(Self {
+        Arc::new(Self {
             devices: DashMap::new(),
             rounds: DashMap::new(),
             enrollment_tokens: DashMap::new(),
             pending_enrollments: DashMap::new(),
-        });
-
-        s.rounds.insert(1, Round {
-            id: 1,
-            model_version: "v1".into(),
-            epsilon_max: 100.0,
-            upload_uri: "objectstore://round-1".into(),
-            state: RoundState::Collecting,
-            updates: Vec::new(),
-            aggregation_receipt: None,
-            epsilon_spent: 0.0,
-        });
-
-        s
+        })
     }
 }

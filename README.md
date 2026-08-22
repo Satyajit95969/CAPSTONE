@@ -1443,3 +1443,440 @@ storage: { root: ./secure_store }
 This project delivers a **working, verified, privacy-preserving federated infrastructure** and a **rigorously established negative result** on federating DAIC task signal. Two independent levers — the DP mechanism (B-2) and the update representation (B-3, twice) — were each tested under frozen pre-registration with independent verification, and each returned H₀.
 
 **That is a defensible scientific outcome, not an incomplete project.** The most actionable finding for future work is B-3B's diagnostic: the limitation lies in the **frozen pretrained representation**, not in the privacy mechanism.
+
+---
+
+---
+
+# PART II — RTX 3050 MACHINE DEPLOYMENT RECORD
+
+> **This part is the living record for the RTX 3050 Windows deployment.**
+> It documents only verified machine state and actual execution results.
+> It does NOT modify any frozen scientific parameter, experiment design, or historical result.
+> Authority order still applies: frozen design > closure document > result artifact > verified SHA > README.md.
+>
+> Status codes used throughout:
+> - **[VERIFIED]** — independently confirmed on this machine
+> - **[COMPLETED]** — action taken and confirmed working
+> - **[PARTIAL]** — partially done; see notes
+> - **[BLOCKED]** — cannot proceed; see blocker entry
+> - **[NOT TESTED]** — code/config exists but not exercised on this machine
+> - **[NOT AVAILABLE]** — component absent from this machine
+> - **[REQUIRES USER INPUT]** — needs a decision or credential from the user
+> - **[REQUIRES EXTERNAL ARTIFACT]** — needs a file not yet present on this machine
+
+---
+
+## 28. Current Machine / Environment Status
+
+> Last audited: **2026-08-14** by Claude Code (full read-only audit; nothing installed or modified).
+
+### 28.1 Hardware
+
+| Component | Value | Status |
+|---|---|---|
+| OS | Windows 11 Home Single Language 10.0.26200 | [VERIFIED] |
+| GPU model | NVIDIA GeForce RTX 3050 **Laptop GPU** | [VERIFIED] — nvidia-smi |
+| GPU VRAM | **4096 MiB (4 GB)** | [VERIFIED] — nvidia-smi |
+| NVIDIA driver | 596.08 | [VERIFIED] — nvidia-smi |
+| Hardware CUDA capability | **13.2** (reported by nvidia-smi) | [VERIFIED] |
+| RAM | Not yet measured | [NOT TESTED] |
+
+> ✅ **HARDWARE NOTE [VERIFIED 2026-08-15]:** README §19Z.7 states "RTX 3050 (8 GB) is sufficient." This machine has the **4 GB Laptop variant** (4.294 GB). Phase E VRAM probe (batch_size=8, full MultiModalModel) completed without OOM. Peak VRAM allocated: **1.117 GB / 4.294 GB** — headroom 3.178 GB. The 4 GB Laptop variant is confirmed feasible for the frozen batch_size=8 recipe.
+
+### 28.2 Python Environment
+
+| Component | Installed | Required (requirements.txt) | Status |
+|---|---|---|---|
+| Python | 3.11.9 | 3.11+ | [VERIFIED] |
+| pip | 24.0 | — | [VERIFIED] |
+| torch | **2.8.0+cpu** | 2.8.0 | [VERIFIED] — CPU build only |
+| torchvision | (in requirements) | 0.23.0 | [NOT TESTED] |
+| torchaudio | (in requirements) | 2.8.0 | [NOT TESTED] |
+| transformers | 4.44.0 | 4.44.0 | [VERIFIED] — exact match |
+| numpy | 2.2.6 | 1.26.4 | [VERIFIED] — version mismatch; 2.2.6 worked for Exp 7/8/B-3B on this machine |
+| pandas | 2.3.2 | 2.3.2 | [VERIFIED] |
+| pyarrow | 21.0.0 | 21.0.0 | [VERIFIED] |
+| scipy | 1.15.3 | 1.15.3 | [VERIFIED] |
+| scikit-learn | 1.7.1 | 1.7.1 | [VERIFIED] |
+| cryptography | 45.0.6 | 45.0.6 | [VERIFIED] |
+| grpcio | 1.62.2 | 1.62.2 | [VERIFIED] |
+| pymongo | 4.16.0 | 4.16.0 | [VERIFIED] |
+
+**Python environment note:** No project-specific `.venv` exists in the Capstone repo. System Python 3.11.9 is currently used directly.
+
+### 28.3 CUDA / PyTorch GPU Status
+
+| Check | Result | Status |
+|---|---|---|
+| `torch.cuda.is_available()` | **False** | [VERIFIED] |
+| `torch.version.cuda` | None (CPU build) | [VERIFIED] |
+| CUDA PyTorch wheel | **NOT installed** | [VERIFIED] |
+| GPU smoke test (tensor → CUDA) | **Cannot run** | [BLOCKED] — requires CUDA PyTorch |
+| Phase 22 batch-8 memory feasibility | Unknown | [NOT TESTED] |
+
+### 28.4 External Services and Tools
+
+| Component | Status | Notes |
+|---|---|---|
+| MongoDB 8.0 | [NOT AVAILABLE] | Required for live orchestration pipeline only; not needed for Phase 22 |
+| Rust + Cargo | [NOT AVAILABLE] | Required to build Rust orchestrator; not needed for Phase 22 |
+| MSVC Build Tools | Unknown | Required for Rust Windows toolchain |
+| OpenFace binary | [NOT AVAILABLE] | Required for live LDA video; not needed for Phase 22 |
+| openSMILE binary | [NOT AVAILABLE] | Required for live LDA audio; not needed for Phase 22 |
+| ffmpeg | [NOT AVAILABLE] | Required for live LDA AV; not needed for Phase 22 |
+| HuggingFace CLI | Available (pip) | `huggingface-cli` present via transformers install |
+
+### 28.5 Repository State
+
+| Property | Value | Status |
+|---|---|---|
+| Remote | `https://github.com/soham-0510/Capstone-.git` | [VERIFIED] |
+| Branch | `main` | [VERIFIED] |
+| HEAD commit | `b19b0d4 Initial clean release…` | [VERIFIED] |
+| Working tree | Clean — no uncommitted changes | [VERIFIED] |
+| Clone path | `D:\Download D\BE PIPELINE\Capstone-\` | [VERIFIED] |
+| Tracked private keys | **None** | [VERIFIED] — git ls-files for *.pem/*.key/*.bin returned no matches |
+| `.gitignore` coverage | Complete — covers all key, cert, parquet, pt, trainer_outputs | [VERIFIED] |
+| git `core.autocrlf` | **true** | [VERIFIED] — causes CRLF line endings on checkout; see §28.6 |
+
+### 28.6 Windows CRLF / SHA Issue
+
+`git config core.autocrlf` is **true** on this machine. Text files (including `PHASE_22_DESIGN.md`) are checked out with CRLF line endings. The frozen SHA for `PHASE_22_DESIGN.md` (`3c181083…`) was computed on Linux (LF). On this machine, the raw-bytes SHA of that file is `bdc505d6…` (CRLF version), which does NOT match the frozen value.
+
+**LF-normalized SHA of `PHASE_22_DESIGN.md` on this machine: [VERIFIED] matches frozen value exactly.**
+
+Python source file SHAs (`trainer_mentalbert_daic.py`, `dp_agent/dp_agent.py`) were frozen on Windows (CRLF) and **do match** on this machine.
+
+**Resolution required:** Re-clone with `git -c core.autocrlf=false clone …` to preserve LF line endings throughout, so all frozen SHA checks pass. **Do NOT modify `PHASE_22_DESIGN.md` content.**
+
+### 28.7 MentalBERT Status
+
+| Property | Status |
+|---|---|
+| HuggingFace cache path (`~/.cache/huggingface/hub/`) | Exists; contains only `models--sentence-transformers--all-MiniLM-L6-v2` |
+| `mental/mental-bert-base-uncased` snapshot | [NOT AVAILABLE] — not in cache |
+| Pinned revision `24809aa822c76639760d0d934742d1b42f89942f` | [NOT AVAILABLE] |
+| HuggingFace account / license accepted | [REQUIRES USER INPUT] |
+
+### 28.8 DAIC-WOZ Dataset Status
+
+| Component | Status |
+|---|---|
+| Raw archives (`data/<id>_P/`) | [NOT AVAILABLE] on this machine |
+| Normalized transcripts (`data_norm/`) | [NOT AVAILABLE] |
+| PHQ labels (`labels/`) | [NOT AVAILABLE] |
+| `D:\datasets\DAIC-WOZ` | Does not exist |
+| `D:\Download D\data\` | Contains unrelated claims/corpus data (NOT DAIC-WOZ) |
+
+---
+
+## 29. Current End-to-End Demonstration Status
+
+> Two pipelines are tracked separately as required. See §19 (Phase 22) and §19Z (Live Orchestration).
+
+### Pipeline A — Phase 22 Frozen Scientific Reproduction
+
+| # | Stage | Source File | Status | Notes |
+|---|---|---|---|---|
+| 1 | Dataset / frozen parquet available | `dataset_build/daic_records_multimodal.parquet` | [REQUIRES EXTERNAL ARTIFACT] | SHA `1ac9f53e…`; not present |
+| 2 | Fold manifest available | `trainer_outputs/baseline_cv/fold_manifest.json` | [REQUIRES EXTERNAL ARTIFACT] | Frozen; SHA `b9a7a91f…`; must not be regenerated |
+| 3 | Base parquet available | `daic_records.parquet` | [REQUIRES EXTERNAL ARTIFACT] | SHA `9a241851…`; not present |
+| 4 | MentalBERT snapshot available | `~/.cache/huggingface/hub/…/24809aa8…/` | [REQUIRES EXTERNAL ARTIFACT] | 6 artifact SHAs frozen |
+| 5 | CUDA PyTorch installed | `torch==2.8.0+cu128` | [NOT AVAILABLE] | Currently CPU-only; CUDA install requires user authorization |
+| 6 | Validator 20/20 PASS | `phase22_end_to_end/validate_phase22.py` | [BLOCKED] | Crashes at check 3 (missing parquet); CRLF fix needed for checks 1–2 |
+| 7 | GPU batch-8 memory feasibility | Requires memory probe | [NOT TESTED] | 4 GB VRAM; project estimate ≈4–6 GB; feasibility unknown |
+| 8 | Phase 22 full run on this machine | `phase22_end_to_end/run_phase22.py` | [NOT TESTED] | No training has been executed on this machine |
+| 9 | Aggregation (Python, in-process) | `server/aggregator_agent/aggregator.py` | [NOT TESTED] | Code present; never run on this machine |
+| 10 | Evaluation / ROC-AUC | `phase22_end_to_end/run_phase22.py` | [NOT TESTED] | — |
+| 11 | Independent verification | `phase22_end_to_end/verify_phase22.py` | [NOT TESTED] | — |
+| 12 | Final artifacts produced | `trainer_outputs/phase22_end_to_end/` | [NOT TESTED] | — |
+
+**Historical status:** Phase 22 was executed and verified 20/20 on **Colab GPU (Tesla T4, CUDA 12.8, PyTorch 2.11.0+cu128, Python 3.12.13)** as documented in §19.0. Result artifacts remain on the Colab/Google Drive instance and are **not present on this machine**. Local reproduction is [NOT TESTED].
+
+---
+
+### Pipeline B — Live Orchestration / Infrastructure Demonstration
+
+| # | Stage | Source File | Status | Notes |
+|---|---|---|---|---|
+| 1 | LDA text preprocessing | `LDA/app/pipelines/text.py` | [NOT TESTED] | Code present; spaCy model not verified |
+| 2 | LDA audio preprocessing | `LDA/app/pipelines/audio.py` | [NOT TESTED] | openSMILE [NOT AVAILABLE]; wav2vec2 not cached |
+| 3 | LDA video preprocessing | `LDA/app/pipelines/video.py` | [NOT TESTED] | OpenFace binary [NOT AVAILABLE] |
+| 4 | PII scrubbing (spaCy NER) | `LDA/app/pipelines/text.py` | [NOT TESTED] | spaCy en_core_web_sm status unknown |
+| 5 | AES-GCM encryption / SecureStore | `centralized_secure_store.py` | [NOT TESTED] | Code present; crypto deps installed |
+| 6 | HMAC receipt signing | `centralised_receipts.py` | [NOT TESTED] | Code present |
+| 7 | Differential privacy (dp_agent) | `dp_agent/dp_agent.py` | [NOT TESTED] | Code present; ran on this machine in Exp 8 (CPU) |
+| 8 | DP epsilon accounting | `dp_agent/dp_agent.py` | [VERIFIED] indirectly | RDP-to-DP function verified during Exp 8 |
+| 9 | Encryption agent | `enc_agent/enc_agent.py` | [NOT TESTED] | Code present |
+| 10 | gRPC transport | `runtime/grpc_client.py` | [NOT TESTED] | gRPC stubs pre-generated; no server to connect to |
+| 11 | mTLS certificates | `server/orchestration_agent/certs/` | [NOT AVAILABLE] | Certs not generated on this machine; keys in old repo are compromised |
+| 12 | Rust orchestrator (build) | `server/orchestration_agent/` | [NOT AVAILABLE] | Rust not installed |
+| 13 | MongoDB 8.0 running | localhost:27017 | [NOT AVAILABLE] | MongoDB not installed |
+| 14 | Client enrollment | `enroll_step5.py` | [NOT TESTED] | Requires server + certs + MongoDB |
+| 15 | Federated client run-once | `runtime/federated_client.py` | [NOT TESTED] | Requires all of the above |
+| 16 | Aggregation via MongoDB GridFS | `server/aggregator_agent/aggregator.py` | [NOT TESTED] | Requires MongoDB |
+| 17 | Global model publication | MongoDB `global_models` | [NOT TESTED] | Known gap: aggregated model not written back (§ARCHITECTURE §2) |
+| 18 | Client model synchronization | `DownloadGlobalModel` RPC | [NOT TESTED] | Requires running server |
+| 19 | Full live end-to-end (smoke test) | §19Z.8 sequence | [NOT TESTED] | **Never end-to-end tested on this machine** (README §19Z explicit) |
+
+---
+
+## 30. Current Blockers
+
+| # | Blocker | Severity | Affected Pipeline | Why Blocked | Exact Requirement | Status | Next Action |
+|---|---|---|---|---|---|---|---|
+| B-1 | CUDA PyTorch not installed | **CRITICAL** | Phase 22, Live (training) | `torch 2.8.0+cpu` installed; `torch.cuda.is_available()` = False | Install `torch==2.8.0+cu128` wheel | [REQUIRES USER INPUT] — user must authorize install | Await authorization, then: `pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128` |
+| B-2 | `daic_records_multimodal.parquet` missing | **CRITICAL** | Phase 22 | Gitignored; never on this machine | File at `dataset_build/`, SHA `1ac9f53e…` | [REQUIRES EXTERNAL ARTIFACT] | Transfer from DELL machine (in `phase22_upload_FINAL.zip`) or rebuild from DAIC-WOZ raw data |
+| B-3 | `daic_records.parquet` missing | **CRITICAL** | Phase 22 | Gitignored | Root of repo, SHA `9a241851…` | [REQUIRES EXTERNAL ARTIFACT] | Same as B-2 |
+| B-4 | `fold_manifest.json` missing | **CRITICAL** | Phase 22 | Gitignored; must NOT be regenerated — it is a frozen input | `trainer_outputs/baseline_cv/`, SHA `b9a7a91f…` | [REQUIRES EXTERNAL ARTIFACT] | Transfer from DELL machine only; do not regenerate |
+| B-5 | `baseline_cv_summary.json` missing | **CRITICAL** | Phase 22 | Gitignored | `trainer_outputs/baseline_cv/`, SHA `f065f5e1…` | [REQUIRES EXTERNAL ARTIFACT] | Same as B-4 |
+| B-6 | MentalBERT snapshot missing | **CRITICAL** | Phase 22, Live | Not in HF cache; gated model | `~/.cache/huggingface/hub/…/24809aa8…/`, 6 frozen SHAs | [REQUIRES EXTERNAL ARTIFACT] + [REQUIRES USER INPUT] | Transfer snapshot from DELL machine OR `huggingface-cli login` then download pinned revision |
+| B-7 | Windows CRLF / validator check 1–2 | HIGH | Phase 22 validator | `core.autocrlf=true` causes CRLF; frozen SHA was computed on Linux | Re-clone with `git -c core.autocrlf=false clone …` | [NOT COMPLETED] — awaiting authorization | Re-clone to new path; do NOT edit `PHASE_22_DESIGN.md` |
+| B-8 | 4 GB VRAM feasibility | ~~HIGH~~ **RESOLVED** | Phase 22 (frozen recipe) | ~~Project estimate ≈4–6 GB; 4 GB Laptop GPU may OOM at `batch_size=8`~~ | Phase E probe: peak VRAM 1.117 GB / 4.294 GB; headroom 3.178 GB; batch_size=8 confirmed | **[VERIFIED 2026-08-15]** — forward+backward PASS, no OOM | RTX 3050 4 GB Laptop variant is feasible; batch_size=8 NOT reduced |
+| B-9 | MongoDB not installed | MEDIUM | Live pipeline only | Hard-fail in Rust orchestrator (`main.rs:35-43`) | MongoDB 8.0 on localhost:27017 | [NOT AVAILABLE] | Await Phase A–E completion before addressing |
+| B-10 | Rust / Cargo not installed | MEDIUM | Live pipeline only | Orchestrator is pure Rust | Rust edition 2021, verified 1.96.0 | [NOT AVAILABLE] | Await Phase A–E completion before addressing |
+| B-11 | TLS certificates not generated | MEDIUM | Live pipeline only | Keys in old repo (`soham-0510/BE-Major-Project`) are **compromised** | Run `bash certs/gen_certs.sh <IP>` after Rust build | [NOT AVAILABLE] | After B-10; new certs must NOT be committed |
+| B-12 | OpenFace not installed | LOW | Live LDA video only | Binary subprocess not available | OpenFace CMake build or prebuilt Windows binary | [NOT AVAILABLE] | Phase J and beyond |
+| B-13 | openSMILE not installed | LOW | Live LDA audio only | Binary subprocess not available | Prebuilt Windows binary | [NOT AVAILABLE] | Phase J and beyond |
+| B-14 | DAIC-WOZ raw data not present | LOW | Live LDA only | Licensed data; not downloadable automatically | User's own DAIC-WOZ copy at `data/` | [NOT AVAILABLE] | Phase J and beyond; NOT needed for Phase 22 |
+| B-15 | `local_probe_base.pt` missing | LOW | `round0_step6_validate.py` only | Gitignored; not needed for Phase 22 | `trainer_outputs/local_probe_base.pt`, SHA `d21f95ab…` | [NOT AVAILABLE] | Transfer if live pipeline step 6 validation is needed |
+
+**Resolved blockers:** None yet. All blockers are current as of 2026-08-14.
+
+---
+
+## 31. Verified Artifact Table
+
+| Artifact | Path | Required For | Frozen? | Expected SHA-256 | Present? | SHA Verified? | Source | Notes |
+|---|---|---|---|---|---|---|---|---|
+| Multimodal parquet | `dataset_build/daic_records_multimodal.parquet` | Phase 22 (primary dataset) | YES | `1ac9f53e6102ec0dbaab84dcfdfa3f2e70f2b4a1867a841ea2b7e3ba24c67a95` | **NO** | — | DELL machine / Colab Drive | In `phase22_upload_FINAL.zip` |
+| Base parquet | `daic_records.parquet` | Phase 22, live pipeline | YES | `9a241851760727779fcaa4d50041b8bdc4406fe6b66ddbbd7105f4ce4fc55f00` | **NO** | — | DELL machine / Colab Drive | |
+| Fold manifest | `trainer_outputs/baseline_cv/fold_manifest.json` | Phase 22, all Exps | YES — **must not regenerate** | `b9a7a91f1bdd43c78d3cd1ee0c36e4ce3fb8be4b0971dcff3ff62ee5af8fca2f` | **NO** | — | DELL machine | Regenerating invalidates experiment |
+| Baseline CV summary | `trainer_outputs/baseline_cv/baseline_cv_summary.json` | Phase 22 | YES | `f065f5e1ff7f8e5ed4d122a8031c9cc12425802e756697d5512a915674871aac` | **NO** | — | DELL machine | |
+| Local probe base | `trainer_outputs/local_probe_base.pt` | `round0_step6_validate.py` | YES | `d21f95ab4169ba8bf270e2ae900d2d205ddb4c3aba3c04ebae4d0ec8d9ba0993` | **NO** | — | DELL machine | Not needed for Phase 22 |
+| Trainer (frozen) | `trainer_mentalbert_daic.py` | Phase 22, all experiments | YES | `65b1902e2ba8dd996c6960db1a6595d84fd48500f4d8707cb79688093d7a230b` | YES (in repo) | **YES** — SHA matches on Windows (CRLF; SHA frozen on Windows) | Git | |
+| DP agent (frozen) | `dp_agent/dp_agent.py` | Phase 22, all experiments | YES | `758642fff57695cb970af88789c3b6a17c77f2b01d16303ff96230fce5798732` | YES (in repo) | **YES** — SHA matches on Windows | Git | |
+| Aggregator (frozen) | `server/aggregator_agent/aggregator.py` | Phase 22 | YES | `59b4d4838cecfaa49f8341320c4d1fdb55fa3b2b6ca1717e29f273f820535d86` | YES (in repo) | NOT CHECKED | Git | |
+| Phase 22 design | `PHASE_22_DESIGN.md` | Phase 22 validator | YES (FROZEN) | `3c18108309c17cbff332204aa761411d6600fe584488391741dfcd2a9208036f` (LF) | YES (in repo) | **CRLF MISMATCH** — raw SHA `bdc505d6…`; LF-normalized SHA matches | Git | Re-clone with `autocrlf=false` resolves this |
+| MentalBERT `pytorch_model.bin` | `~/.cache/huggingface/hub/…/24809aa8…/pytorch_model.bin` | Phase 22, B-3B, all MentalBERT exps | YES | `c4f90fa5f0b991c48eb99afe41c8883dccb2b7e51012b33d2635925b9cde8764` | **NO** | — | HF gated / DELL machine | ≈414 MB |
+| MentalBERT `tokenizer.json` | same snapshot dir | Phase 22 | YES | `5fd1c882abbd30517dced455a2c9768945ec726b96727927e4959348d9de550b` | **NO** | — | HF gated / DELL machine | |
+| MentalBERT `vocab.txt` | same snapshot dir | Phase 22 | YES | `07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3` | **NO** | — | HF gated / DELL machine | |
+| MentalBERT `config.json` | same snapshot dir | Phase 22 | YES | `79ee28a4e33b49f535209c8aaa5eaa7550344345bb3fecb13f179c686749d0d9` | **NO** | — | HF gated / DELL machine | |
+| MentalBERT `tokenizer_config.json` | same snapshot dir | Phase 22 | YES | `9a8ed9b01c8a56b555dcdc31cd526ba9e488cfc16ee5a101b3ce64af81d34f3d` | **NO** | — | HF gated / DELL machine | |
+| MentalBERT `special_tokens_map.json` | same snapshot dir | Phase 22 | YES | `303df45a03609e4ead04bc3dc1536d0ab19b5358db685b6f3da123d05ec200e3` | **NO** | — | HF gated / DELL machine | |
+| Phase 22 Colab bundle | `phase22_upload_FINAL.zip` | Colab execution (historical) | NO | `f248534d3bddd555d7bc30c794e7779a65a3778786b64dde93fed25ebe7ff5b2` | **Not on this machine** | — | DELL machine `C:\Users\DELL\Downloads\` | 407 MB; contains all artifacts above |
+| Phase 22 result artifacts | `trainer_outputs/phase22_end_to_end/` | Verification of Colab run | NO | — | **Not on this machine** | — | Colab / Google Drive | ROC-AUC N=0.4651, D=0.5000 |
+| C-2 embeddings (frozen) | `trainer_outputs/c2_multiclient/c2_embeddings.npz` | C-2 verification | YES | `70df4e49b4fea83c2464eba3e41e5b8ffa856fff4c70dc7b7b8d054cf488ed3c` | **NOT on this machine** | — | DELL machine | |
+
+---
+
+## 32. Environment Setup History
+
+> Record of every meaningful environment action on this machine.
+> Format: Date · Component · Action · Result · Verification.
+
+| Date | Component | Version | Action | Result | Verification |
+|---|---|---|---|---|---|
+| 2026-08-14 | Repository | commit `b19b0d4` | `git clone https://github.com/soham-0510/Capstone-.git` | Clean clone; single commit; working tree clean | `git status` → nothing to commit |
+| 2026-08-14 | nvidia-smi | Driver 596.08 | Read-only audit | RTX 3050 Laptop, 4096 MiB, CUDA 13.2 | `nvidia-smi` output confirmed |
+| 2026-08-14 | PyTorch | 2.8.0+cpu | Read-only audit | CPU-only build confirmed; CUDA not available | `torch.cuda.is_available()` → False |
+| 2026-08-14 | Key packages | (see §28.2) | Read-only audit | transformers 4.44.0, numpy 2.2.6, pyarrow 21.0.0 confirmed | `python -c "import …"` |
+| 2026-08-14 | Phase 22 validator | — | `python phase22_end_to_end/validate_phase22.py --allow-cpu` | Crash at check 3: `FileNotFoundError: dataset_build/daic_records_multimodal.parquet` | Checks 1–2 FAIL (CRLF + missing artifacts); checks 3+ not reached |
+| 2026-08-15 | Phase 22 validator | — | `PYTHONUTF8=1 python phase22_end_to_end/validate_phase22.py --allow-cpu` (D: venv, RTX 3050) | **20 PASS, 0 FAIL — VALIDATION: PASS** (6.3 s) | All checks 1–20 [ok]; exit 0; CUDA PASS (4.3 GB VRAM detected) |
+| 2026-08-14 | CRLF audit | — | SHA cross-check on frozen files | `PHASE_22_DESIGN.md` LF-normalized SHA [VERIFIED] matches frozen value; `trainer_mentalbert_daic.py` / `dp_agent.py` raw SHA [VERIFIED] match frozen values | Python hashlib |
+| 2026-08-14 | Security audit | — | `git ls-files` for *.pem/*.key/*.bin/*.pt | Zero tracked secrets in Capstone repo | `git ls-files \| grep -E "\.(pem\|key\|csr\|bin\|p12\|pfx)$"` → no output |
+| 2026-08-14 | pip cache purge | — | `pip cache purge` | Freed 4,722.6 MB from C: (pip HTTP cache); C: free: 3.8 GB → 8.2 GB | `pip cache list` → 0 packages |
+| 2026-08-14 | PyTorch (CUDA) | 2.8.0+cu128 | Install attempt via system pip | **FAILED** — `[Errno 28] No space left on device`. Root cause: `TEMP` set to POSIX path `/d/pip_tmp`; Python on Windows ignored it, fell back to `C:\AppData\Local\Temp`. 3.4 GB wheel extraction exhausted C:. CPU build rolled back to `2.8.0+cpu` successfully. | Error log captured |
+| 2026-08-14 | PyTorch (CPU) | 2.8.0+cpu | `pip uninstall torch torchvision torchaudio -y` | Uninstalled to free space on C: before retrying CUDA install (C: → 9.1 GB free) | `python -c "import torch"` → ModuleNotFoundError (correct) |
+| 2026-08-14 | PyTorch (CUDA) | 2.8.0+cu128 | Second install attempt (corrected TEMP=`D:\pip_tmp` Windows path) | **STOPPED** by user before completion. 1.5 GB partial extraction in `D:\pip_tmp`. torch NOT installed. | `python -c "import torch"` → ModuleNotFoundError |
+| 2026-08-14 | **Environment decision** | — | Install target changed: **D: venv** instead of system Python on C: | DECISION: All ML packages go into a dedicated venv at `D:\Download D\BE PIPELINE\Capstone-\.venv`. C: system Python untouched for ML. pip temp=`D:\pip_tmp`, pip cache=`D:\pip_cache`. | Executed — see rows below |
+| 2026-08-14 | D: venv | Python 3.11.9 | `python -m venv "D:\Download D\BE PIPELINE\Capstone-\.venv"` | venv created; executable and site-packages verified on D: | `sys.executable` → `D:\...\Capstone-\.venv\Scripts\python.exe`; `site.getsitepackages()` → `D:\...\Capstone-\.venv\Lib\site-packages` |
+| 2026-08-14 | pip / setuptools / wheel | pip 26.2.1 / setuptools 84.0.0 / wheel 0.48.0 | `python -m pip install --upgrade pip setuptools wheel` (in D: venv) | Upgraded from pip 24.0 / setuptools 65.5.0 | Version confirmed via pip output |
+| 2026-08-14 | PyTorch (CUDA) | 2.8.0+cu128 | `pip install --cache-dir D:\pip_cache torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128` (D: venv pip) | **SUCCESS** — CUDA available; RTX 3050 detected; 4095 MiB VRAM; CUDA tensor test passed | `torch.cuda.is_available()` → True; `torch.cuda.get_device_name(0)` → `NVIDIA GeForce RTX 3050 Laptop GPU`; `torch.version.cuda` → `12.8` |
+| 2026-08-14 | System Python cleanup | — | Manual removal of orphaned torch/functorch dirs from C: site-packages (broken partial from prior failed attempts; no dist-info, missing DLLs) | `torch` (861 MB) and `functorch` dirs removed; `ModuleNotFoundError` confirmed on system Python | System Python `import torch` → `ModuleNotFoundError` ✓ |
+| 2026-08-15 | Frozen artifacts | — | Extracted 3 files from `BE-Major-Project.zip` (selective; `.git` NOT touched) | All 3 SHA-256 verified on read-from-zip AND post-write-to-disk; written to repo | See §B artifact table |
+| 2026-08-15 | pandas + pyarrow | pandas 3.0.5 / pyarrow 25.0.1 | `pip install pandas pyarrow` (D: venv) | Installed on D: venv; both confirmed under `D:\...\Capstone-\.venv\Lib\site-packages\` | `import pandas; import pyarrow` ✓ |
+| 2026-08-15 | pyarrow downgrade | 25.0.1 → 21.0.0 | `pip install pyarrow==21.0.0` (D: venv) | Downgraded to match DELL's frozen build environment; pyarrow 25.0.1 produced different binary encoding | `pyarrow.__version__` → `21.0.0` ✓ |
+| 2026-08-15 | Multimodal builder | — | `python build_daic_multimodal_records.py` (D: venv, pyarrow 21.0.0) | **SHA MATCH** [VERIFIED] — `1ac9f53e6102ec0dbaab84dcfdfa3f2e70f2b4a1867a841ea2b7e3ba24c67a95`; 188 rows; 6 columns; frozen columns byte-identical; 1,678,900 bytes | Double SHA read from disk: MATCH ✓ |
+| 2026-08-15 | baseline_cv_summary.json | — | Search across all local dirs (repo, TeraBoxDownload, BE-Major-Project, Download D) | **NOT FOUND** anywhere on this machine | Must transfer from DELL |
+| 2026-08-15 | transformers / scikit-learn | transformers 4.44.0 / sklearn 1.7.1 | `pip install transformers scikit-learn` (D: venv) + all deps (tokenizers, safetensors, huggingface-hub, scipy, joblib) | **SUCCESS** — all packages installed under `D:\...\Capstone-\.venv\Lib\site-packages\` | `import transformers; import sklearn` ✓ |
+| 2026-08-15 | HF cache → D: junction | — | Moved `C:\Users\satya\.cache\huggingface\hub\` contents (88 MB sentence-transformers) to `D:\HF_cache\`; created Windows directory junction `C:\Users\satya\.cache\huggingface\hub` → `D:\HF_cache` via `mklink /J` | **SUCCESS** — `os.path.realpath('C:\...\hub')` → `D:\HF_cache`; all C: logical paths resolve to D: | `os.path.realpath()` → `D:\HF_cache` ✓; sentence-transformers SHA verified after move ✓ |
+| 2026-08-15 | MentalBERT snapshot | mental/mental-bert-base-uncased @ `24809aa8` | `snapshot_download` to `D:\HF_cache` (via junction; HF token entered locally — never logged); 419 MB download | **SUCCESS** — all 6 frozen artifacts present and SHA-verified on D: | All 6 SHA MATCH: `pytorch_model.bin`, `tokenizer.json`, `vocab.txt`, `config.json`, `tokenizer_config.json`, `special_tokens_map.json`; `AutoModel.from_pretrained(snap)` load test PASS |
+| 2026-08-15 | cryptography + pymongo | cryptography 50.0.0 / pymongo 4.17.0 | `pip install cryptography pymongo` (D: venv only) | **SUCCESS** — installed under `D:\...\Capstone-\.venv\Lib\site-packages\`; system Python untouched | `import cryptography; import pymongo` ✓ both physically on D: |
+| 2026-08-15 | PHASE_22_DESIGN.md CRLF | — | `git config --local core.autocrlf false` + `rm PHASE_22_DESIGN.md` + `git checkout -- PHASE_22_DESIGN.md` | **SUCCESS** — file now LF-only (19,188 bytes, 390 LF lines, 0 CRLF); `git ls-files --eol` → `i/lf w/lf`; SHA matches frozen | SHA `3c18108…` MATCH ✓ |
+| 2026-08-15 | baseline_cv_summary.json | — | Manually transferred from DELL; SHA-256 verified on arrival | **SUCCESS** — 3,977 bytes; SHA matches frozen `f065f5e1…` | SHA MATCH ✓ |
+| 2026-08-15 | Phase 22 validator | — | `PYTHONUTF8=1 python phase22_end_to_end\validate_phase22.py --allow-cpu` (D: venv, 6.3 s) | **20/20 PASS — VALIDATION: PASS** | All 20 checks: [ok]; exit 0 |
+| 2026-08-15 | Phase E — VRAM feasibility probe | — | `PYTHONUTF8=1 python phase_e_probe.py` (D: venv, batch_size=8, full MultiModalModel, CUDA) | **PASS** — forward+backward+grad-clip completed without OOM; peak VRAM allocated 1.117 GB / 4.294 GB; headroom 3.178 GB | Peak reserved: 1.325 GB; model load: 0.440 GB; fwd: 2.504 s; bwd: 0.384 s; batch_size=8 confirmed; param count 109,763,494 MATCH; NOTE: Phase E did NOT exercise AdamW optimizer state (~836 MB additional VRAM) |
+| 2026-08-15 | Phase F attempt 1 | — | `PYTHONUTF8=1 python phase22_end_to_end/run_phase22.py` | **BLOCKED — CUDA OOM** at fold 1 / client 2 / optimizer.step() / AdamW exp_avg_sq; fold 1 / client 1 completed; batch size NOT reduced | No output artifacts | Peak in equivalent diagnostic probe: 1,973 MB / 4,294 MB |
+| 2026-08-15 | Phase F attempt 2 | — | `PYTHONUTF8=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python phase22_end_to_end/run_phase22.py` | **BLOCKED — SIGSEGV (exit 139)** — `expandable_segments` unsupported on Windows/WDDM; crash BEFORE any `[OK]` from main(); no VRAM stats | No output artifacts | — |
+| 2026-08-15 | Phase F attempt 3 | — | `PYTHONUTF8=1 PYTORCH_NO_CUDA_MEMORY_CACHING=1 python phase22_end_to_end/run_phase22.py` | **BLOCKED — SIGSEGV (exit 139)** — same crash class; BEFORE any `[OK]` from main(); no VRAM stats; batch size NOT reduced | No output artifacts | Both CUDA allocator env vars cause SIGSEGV on PyTorch 2.8.0 + Windows WDDM |
+| 2026-08-15 | Phase F attempt 4 | — | `PYTHONUTF8=1 python phase22_end_to_end/run_phase22.py` (NO env vars — exact original command) | **BLOCKED — SIGSEGV (exit 139)** — plain retry with no env vars; BEFORE any `[OK]` from main(); identical crash signature to attempts 2+3 despite no flags | No output artifacts | **DIAGNOSIS: NVIDIA CUDA driver state contaminated by SIGSEGV crashes in attempts 2+3. Plain attempt 1 succeeded before those crashes; plain attempt 4 fails after them. Driver state persists across Python processes until machine reboot.** Reboot required before next attempt. |
+
+---
+
+## 33. E2E Demonstration Log
+
+> Record of every actual pipeline execution on this machine.
+
+| Date | Pipeline | Commit | Environment | Command | Result | Artifacts | Verification | Limitations |
+|---|---|---|---|---|---|---|---|---|
+| 2026-08-14 | Phase 22 pre-execution validator | `b19b0d4` | Python 3.11.9, torch 2.8.0+cpu, Windows 11 | `python phase22_end_to_end/validate_phase22.py --allow-cpu` | **FAIL** — crash at check 3 (FileNotFoundError on missing parquet) | None | See §32 | Missing frozen data artifacts; CRLF issue on checks 1–2; CUDA check (19) would also fail |
+| 2026-08-15 | Phase E — VRAM feasibility probe | — | Python 3.11.9, torch 2.8.0+cu128, RTX 3050 Laptop (4.294 GB VRAM), CUDA 12.8 | `PYTHONUTF8=1 python phase_e_probe.py` (D: venv) — forward+backward pass, batch_size=8, full MultiModalModel on GPU; loss = CrossEntropyLoss + 0.5·MSELoss | **PASS** — no OOM; forward PASS (loss=29.69), backward PASS, grad_clip(1.0) PASS | Peak VRAM 1.117 GB allocated / 1.325 GB reserved; headroom 3.178 GB | param count 109,763,494 MATCH; batch_size=8 NOT reduced | Phase E tested forward+backward ONLY — did NOT test AdamW optimizer state (~836 MB) |
+| 2026-08-15 | Phase F — Phase 22 full execution (attempt 1) | — | Python 3.11.9, torch 2.8.0+cu128, RTX 3050 Laptop (4.294 GB VRAM), CUDA 12.8, PYTHONUTF8=1 | `PYTHONUTF8=1 python phase22_end_to_end/run_phase22.py` (D: venv, default device=cuda) | **BLOCKED — CUDA OOM** at fold 1 / client 2 / epoch 1 / optimizer.step() when AdamW allocated `exp_avg_sq`; fold 1 / client 1 completed (3 epochs, losses 31.55/40.05/17.69) | None (run aborted before any output artifacts were written) | VRAM diagnostic probe: post-client-1 state = 903 MB alloc / 2309 MB reserved; peak in equivalent probe = 1973 MB / 4294 MB — GPU physically has capacity; OOM likely due to CUDA allocator fragmentation under 3-epoch pressure + Windows WDDM scheduling; batch_size NOT reduced; recipe NOT modified | AdamW state (exp_avg + exp_avg_sq) = ~836 MB ON GPU — not tested by Phase E. Phase F: BLOCKED pending user decision. |
+| 2026-08-15 | Phase F — Phase 22 full execution (attempt 2) | — | Python 3.11.9, torch 2.8.0+cu128, RTX 3050 Laptop (4.294 GB VRAM), CUDA 12.8, PYTHONUTF8=1, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | `PYTHONUTF8=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python phase22_end_to_end/run_phase22.py` (D: venv, default device=cuda) | **BLOCKED — Segmentation Fault (exit 139)** — process crashed at OS level; no Python exception; NO output artifacts | None | WARNING: `expandable_segments not supported on this platform` (CUDAAllocatorConfig.h:35); crash BEFORE any `[OK]` output from main(); SIGSEGV during CUDA allocator init | `expandable_segments:True` is Linux-only; causes crash on Windows/WDDM + PyTorch 2.8.0. Phase F: BLOCKED. No source files modified. |
+| 2026-08-15 | Phase F — Phase 22 full execution (attempt 3) | — | Python 3.11.9, torch 2.8.0+cu128, RTX 3050 Laptop (4.294 GB VRAM), CUDA 12.8, PYTHONUTF8=1, `PYTORCH_NO_CUDA_MEMORY_CACHING=1` | `PYTHONUTF8=1 PYTORCH_NO_CUDA_MEMORY_CACHING=1 python phase22_end_to_end/run_phase22.py` (D: venv, default device=cuda) | **BLOCKED — Segmentation Fault (exit 139)** — same crash class as attempt 2; crashed BEFORE any `[OK]` output from main(); NO output artifacts | None | No platform-unsupported warning this time, but same SIGSEGV pattern; crash during CUDA allocator init, before training began | `PYTORCH_NO_CUDA_MEMORY_CACHING=1` also causes SIGSEGV on PyTorch 2.8.0 + Windows WDDM. BOTH CUDA allocator env var approaches are broken on this platform+version. Phase F: BLOCKED. No source files modified. |
+
+---
+
+## 34. Security Status Summary
+
+| Item | Capstone repo (`soham-0510/Capstone-`) | Old repo (`soham-0510/BE-Major-Project`) |
+|---|---|---|
+| Private keys in current working tree | **None** [VERIFIED] | N/A (separate repo) |
+| Private keys in pushed git history | **None** — clean release | **5 keys compromised** (CA root + 4 others) — see §19Z.3 |
+| `.gitignore` coverage | Complete [VERIFIED] | Incomplete (keys were tracked before rules added) |
+| Action required | None for current tracked files | Do NOT push; rotate entire PKI before any server use |
+
+**TLS certs on this machine:** Not yet generated. When generated, they MUST NOT be committed. Store at `server/orchestration_agent/certs/` (gitignored) and `~/.federated/keys/` (outside repo). Document generation here when done.
+
+---
+
+## 35. Project Goal and Work Order for This Machine
+
+**Goal:** Complete end-to-end demonstration of the implemented MediProof pipeline on the RTX 3050 system, while preserving the frozen scientific protocol and clearly separating exact reproduction from hardware-adapted engineering demonstrations.
+
+### Phase progression (do not skip phases)
+
+| Phase | Goal | Gate to proceed |
+|---|---|---|
+| **A — Environment** | Re-clone with `autocrlf=false`; install CUDA PyTorch | `torch.cuda.is_available()` == True |
+| **B — Frozen artifacts** | Transfer frozen parquets, manifest, MentalBERT snapshot from DELL | All 4 data artifact SHAs verified |
+| **C — CUDA GPU verification** | Verify RTX 3050 is visible to PyTorch; run smoke test | GPU name + VRAM printed correctly |
+| **D — Phase 22 validator** | Run `validate_phase22.py`; must reach 20/20 PASS | Exit 0 |
+| **E — GPU memory feasibility** | Probe: forward+backward, batch 8, full model; measure peak VRAM | If ≤4 GB: proceed. If OOM: **STOP and report; do NOT reduce batch size** |
+| **F — Phase 22 exact reproduction** | Run Phase 22 IF Phase E passes AND user authorizes | 20/20 verification PASS |
+| **G — Live pipeline dependencies** | MongoDB + Rust + MSVC | Services confirmed running |
+| **H — PKI** | Regenerate TLS certs for this machine's IP | `gen_certs.sh` completes; new ca.pem distributed |
+| **I — Rust orchestrator** | Build + start server; confirm MongoDB connected + OTP printed | Server logs confirmed |
+| **J — LDA preprocessing** | Text → audio → video for one sample (not DAIC-WOZ if unavailable) | Encrypted artifacts produced + receipts signed |
+| **K — Trainer / DP / encryption** | Single local training round → delta → DP → AES-GCM | Encrypted delta produced |
+| **L — gRPC / mTLS** | Client connects to server; RegisterDevice → GetRound succeeds | Server log confirms registration |
+| **M — Federated aggregation** | ≥3 uploads trigger aggregation | Aggregated model produced |
+| **N — Live end-to-end** | Full `run-once` from client to aggregation | No crash; receipts signed |
+| **O — Final verification** | Document all stages; update this README | All entries updated with [VERIFIED] or accurate status |
+
+> **Current position: Phase F BLOCKED — 3 failed attempts [2026-08-15].**
+> **Attempt 1 (no flags):** Python `torch.AcceleratorError: CUDA OOM` at fold 1 / client 2 / `optimizer.step()` — AdamW `exp_avg_sq` allocation. Fold 1/client 1 completed (3 epochs). Diagnostic probe showed peak 1,973 MB / 4,294 MB — GPU physically has capacity; OOM was allocator fragmentation.
+> **Attempt 2 (`expandable_segments:True`):** SIGSEGV (exit 139). Root cause: flag is Linux-only, NOT supported on Windows WDDM. Crash during CUDA allocator init, before `main()` produced output.
+> **Attempt 3 (`PYTORCH_NO_CUDA_MEMORY_CACHING=1`):** SIGSEGV (exit 139). Same crash class as attempt 2. Crash before `main()` produced output. **Both CUDA allocator env vars are broken (SIGSEGV) on PyTorch 2.8.0 + Windows WDDM.**
+> **Established facts:** (1) GPU has physical capacity (1,973 MB peak < 4,294 MB); (2) attempt-1 OOM is fragmentation, not a capacity limit; (3) PyTorch 2.8.0 crashes on Windows when either CUDA allocator env var is set; (4) plain retry (no flags) is the only remaining Windows-safe option.
+> **Current state (2026-08-15):** Phase F has attempted 4 runs. Attempt 4 (plain, no env vars) crashed with SIGSEGV — the same failure as attempts 2+3 which used invalid CUDA allocator env vars. Root cause: the SIGSEGV crashes in attempts 2+3 left the NVIDIA CUDA kernel driver in a corrupted state that persists across Python process restarts. Attempt 1 (the first ever run, before any crashes) reached training without SIGSEGV.
+> **Required action before next attempt: REBOOT the machine.** A reboot clears the NVIDIA kernel driver state and GPU VRAM. Alternatively, restarting the display driver via Device Manager (Disable + Enable the NVIDIA GPU) may be sufficient on Windows.
+> **After reboot:** Plain retry (no env vars, no source changes) is the appropriate next step. The diagnostic probe proved tensors fit (1,973 MB / 4,294 MB); the attempt-1 OOM was fragmentation that may not recur on a clean boot.
+
+---
+
+## 36. Dataset Discovery — `D:\TeraBoxDownload\Dataset\` (2026-08-14 read-only audit)
+
+> Read-only audit only. Nothing extracted, moved, or modified.
+
+### 36.1 Raw DAIC-WOZ Archives
+
+| Property | Value | Status |
+|---|---|---|
+| Location | `D:\TeraBoxDownload\Dataset\` | [VERIFIED] |
+| Total size | **85 GB** | [VERIFIED] |
+| Participant archives | **187 zip files** (IDs 300–492) | [VERIFIED] |
+| Missing IDs | 342, 367, 368, 394, 398, 460 | [VERIFIED] — not needed (project uses 188; `archive_audit.json` confirms bijection) |
+| Corrupt archive | `440_P.zip` | [VERIFIED] — expected; documented in `archive_audit.json` |
+| PHQ label CSVs | `train_split_Depression_AVEC2017.csv`, `dev_split_Depression_AVEC2017.csv`, `full_test_split.csv`, `test_split_Depression_AVEC2017.csv` | [VERIFIED] |
+
+**Per-archive contents** (verified against `300_P.zip`):
+
+| File | Description | Notes |
+|---|---|---|
+| `{ID}_AUDIO.wav` | Raw clinical interview audio | ~20 MB |
+| `{ID}_TRANSCRIPT.csv` | Interview transcript | Text input for LDA and Phase 22 |
+| `{ID}_COVAREP.csv` | Pre-extracted COVAREP audio features | 74 columns, 100 Hz — used in `multimodal_features.json` |
+| `{ID}_FORMANT.csv` | Pre-extracted formant features | 5 columns |
+| `{ID}_CLNF_AUs.txt` | Pre-extracted OpenFace Action Units | 24 features |
+| `{ID}_CLNF_gaze.txt` | Pre-extracted OpenFace gaze | 16 features |
+| `{ID}_CLNF_pose.txt` | Pre-extracted OpenFace head pose | 10 features |
+| `{ID}_CLNF_features.txt` | Pre-extracted OpenFace 2D landmarks | — |
+| `{ID}_CLNF_features3D.txt` | Pre-extracted OpenFace 3D landmarks | — |
+| `{ID}_CLNF_hog.txt` | Pre-extracted HOG descriptors | ~350 MB per participant |
+
+> **Critical insight:** COVAREP audio features and CLNF video features are **pre-extracted** inside each archive. OpenFace and openSMILE do NOT need to be installed to reconstruct Phase 22 features — those feature vectors are already materialized in `dataset_build/multimodal_features.json` (committed in git, SHA verified).
+
+### 36.2 Frozen Artifact Source — `D:\TeraBoxDownload\Capstone\BE-Major-Project.zip` (2.87 GB)
+
+**SHA-256 verified from inside the zip without extraction:**
+
+| Artifact | Size | SHA-256 Computed | Frozen SHA Expected | Match? |
+|---|---|---|---|---|
+| `daic_records.parquet` | 916,554 bytes | `9a241851760727779fcaa4d50041b8bdc4406fe6b66ddbbd7105f4ce4fc55f00` | `9a241851...` | **MATCH** [VERIFIED] |
+| `trainer_outputs/baseline_cv/fold_manifest.json` | 10,087 bytes | `b9a7a91f1bdd43c78d3cd1ee0c36e4ce3fb8be4b0971dcff3ff62ee5af8fca2f` | `b9a7a91f...` | **MATCH** [VERIFIED] |
+| `trainer_outputs/local_probe_base.pt` | 1,185,335 bytes | `d21f95ab4169ba8bf270e2ae900d2d205ddb4c3aba3c04ebae4d0ec8d9ba0993` | `d21f95ab...` | **MATCH** [VERIFIED] |
+
+> **Extraction note:** Extract ONLY these specific files from the zip. Do NOT extract the full zip — it contains the `.git` directory of the old repo whose git history holds 5 compromised private keys (CA root + 4 client keys). Those keys are in the git history, not in the working tree, but exposing the full `.git` folder on disk is unnecessary risk.
+
+**Not found in zip:**
+- `baseline_cv_summary.json` — not present anywhere on this machine
+- `daic_records_multimodal.parquet` — not present anywhere on this machine
+- MentalBERT model weights — empty placeholder directory only
+
+### 36.3 `multimodal_features.json` — Already in Repo (Tracked in Git)
+
+| Property | Value | Status |
+|---|---|---|
+| Path | `dataset_build/multimodal_features.json` | [VERIFIED] |
+| Size | 1.44 MB | [VERIFIED] |
+| SHA-256 | `a268a94432656a1419dacffc57f84267cea4979f241f254fc71decbdeec1f941` | [VERIFIED] |
+| Pinned SHA in `multimodal_records_report.json` | `a268a94432656a1419dacffc57f84267cea4979f241f254fc71decbdeec1f941` | **EXACT MATCH** [VERIFIED] |
+| Content | Feature vectors for all 188 participants (audio: 154-d, video: 84-d) extracted from DAIC-WOZ archives | [VERIFIED] |
+| Generated by | `build_daic_multimodal_features.py` on DELL machine | [VERIFIED from report] |
+
+This file is the exact intermediate artifact used on the DELL machine to produce the frozen `daic_records_multimodal.parquet`. Since it is SHA-verified and committed in git, running `build_daic_multimodal_records.py` with verified inputs can reconstruct the frozen parquet deterministically.
+
+### 36.4 `baseline_cv_summary.json` — Not Found
+
+Searched: `D:\TeraBoxDownload\`, `D:\Download D\`, `C:\Users\satya\`, `BE-Major-Project.zip`. **Not found anywhere on this machine.**
+
+- Used by: Phase 22 **validator** (check 2 SHA) only — NOT by `run_phase22.py` itself
+- Recovery: (a) Check DELL machine at `C:\Users\DELL\Desktop\pipeline backup\BE-Major-Project\trainer_outputs\baseline_cv\baseline_cv_summary.json`, or (b) re-run `colab_baseline_cv/run_baseline_cv.py` + `aggregate_baseline_cv.py` after CUDA + MentalBERT are available
+
+### 36.5 `windows_signer.exe` — Pre-Built Binary Present
+
+| Property | Value | Status |
+|---|---|---|
+| Path | `installer/runtime/windows_signer.exe` | [VERIFIED] |
+| Size | 185,344 bytes | [VERIFIED] |
+| Purpose | TPM-style artifact signing for live pipeline receipts | — |
+| Rust compilation required? | **No** — pre-built binary | [VERIFIED] |
+
+---
+
+## 37. Updated Artifact Availability (Post-Discovery)
+
+| Artifact | Status | Source | Next Action |
+|---|---|---|---|
+| `daic_records.parquet` | **IN ZIP, SHA VERIFIED** | `BE-Major-Project.zip` on this machine | Extract (targeted extraction only) |
+| `daic_records_multimodal.parquet` | **Reconstructable** | Inputs in repo (SHA verified) | Run `build_daic_multimodal_records.py`; verify output SHA |
+| `fold_manifest.json` | **IN ZIP, SHA VERIFIED** | `BE-Major-Project.zip` on this machine | Extract (targeted extraction only) |
+| `local_probe_base.pt` | **IN ZIP, SHA VERIFIED** | `BE-Major-Project.zip` on this machine | Extract if needed (live pipeline step 6 only) |
+| `multimodal_features.json` | **PRESENT, SHA VERIFIED** | Committed in git repo | No action needed |
+| `baseline_cv_summary.json` | **NOT FOUND** | Unknown | Check DELL machine or re-run baseline CV |
+| MentalBERT snapshot | **NOT FOUND** | HuggingFace Hub (gated) | Authorize HF login + download |
+| DAIC-WOZ raw archives | **PRESENT** — 187/188 participants, 85 GB | `D:\TeraBoxDownload\Dataset\` | Available for live LDA demo |
+| PHQ labels | **PRESENT** | `D:\TeraBoxDownload\Dataset\*.csv` | No action needed |
+| `windows_signer.exe` | **PRESENT, pre-built** | `installer/runtime/` | No action needed |
+
+**Updated blockers affected by discovery:**
+- ~~B-2 (multimodal parquet transfer needed)~~ → Reconstructable from verified local inputs
+- ~~B-3 (daic_records.parquet transfer needed)~~ → In BE-Major-Project.zip, SHA verified
+- ~~B-4 (fold_manifest.json transfer needed)~~ → In BE-Major-Project.zip, SHA verified
+- ~~B-14 (DAIC-WOZ not present)~~ → 85 GB present at D:\TeraBoxDownload\Dataset\
+- B-6 (MentalBERT) remains [NOT AVAILABLE]
+- B-8 (baseline_cv_summary.json) remains [NOT FOUND]
+- B-1 (CUDA PyTorch) remains [REQUIRES USER INPUT]

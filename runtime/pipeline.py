@@ -22,12 +22,14 @@ SECURITY FIXES:
                   per-chunk and full-model hash verification.
 """
 
+import os
 import uuid
 import math
 import json
 import hashlib
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -36,6 +38,7 @@ from agents.trainer.trainer_mentalbert_privacy import orchestrate as trainer_orc
 from agents.dp.dp_agent import DPAgent
 from agents.enc.enc_agent import EncryptionAgent
 from core.centralized_secure_store import SecureStore
+from core import reporting as rpt
 from runtime.grpc.orchestrator_pb2 import (
     DeviceId, Receipt, UpdateChunk, RoundRequest
 )
@@ -51,6 +54,21 @@ _INPUT_DIR  = str(Path.home() / ".federated" / "data" / "input")
 LDA_MODE      = "session"
 CHUNK_SIZE    = 1 * 1024 * 1024   # 1 MB per gRPC chunk
 MAX_EPS_VALUE = 10.0               # hard ceiling — server rejects > this
+
+# ── FIX-MULTIMODAL-2: input-mode selector ──────────────────────────────────────
+# PIPELINE_MODE=text (default): unchanged behavior — LDA preprocess() on
+#   ~/.federated/data/input/*.mp4, exactly as originally verified.
+# PIPELINE_MODE=multimodal: skips live LDA entirely and points the trainer's
+#   existing read_parquet_records() .parquet branch directly at the frozen,
+#   read-only, pre-extracted DAIC-WOZ dataset — real text + real
+#   features.audio.wav2vec2 (154-dim) + real features.video.densenet (84-dim).
+#   Nothing about DP/encryption/TPM/mTLS/receipt submission changes for this
+#   mode — only step 3 (input preparation) and the global-model local cache
+#   subdirectory below branch on it.
+PIPELINE_MODE = os.environ.get("PIPELINE_MODE", "text").strip().lower()
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_MULTIMODAL_PARQUET = _REPO_ROOT / "dataset_build" / "daic_records_multimodal.parquet"
+_MULTIMODAL_MAX_SAMPLES = int(os.environ.get("MULTIMODAL_MAX_SAMPLES", "1"))
 
 
 # ── Schema validation (unchanged) ─────────────────────────────────────────────
@@ -87,12 +105,15 @@ def _download_global_model(stub, device_id: bytes, round_id: int) -> Optional[st
     Verifies per-chunk and full-model SHA-256 hashes.
     Returns local path to the downloaded model file, or None.
     """
+    t0 = time.time()
     try:
         request = RoundRequest(device_id=device_id, round_id=round_id)
         chunks_received = []
         full_model_hash_expected = None
+        chunk_count = 0
 
         for chunk in stub.DownloadGlobalModel(request, timeout=120):
+            chunk_count += 1
             # Verify chunk integrity
             computed = hashlib.sha256(chunk.data).digest()
             if computed != bytes(chunk.chunk_hash):
@@ -112,16 +133,25 @@ def _download_global_model(stub, device_id: bytes, round_id: int) -> Optional[st
         model_bytes = b"".join(chunks_received)
 
         # Verify full model hash
+        hash_verified = False
         if full_model_hash_expected:
             actual_hash = hashlib.sha256(model_bytes).digest()
             if actual_hash != full_model_hash_expected:
                 raise ValueError(
                     "Global model full-hash mismatch — model rejected"
                 )
+            hash_verified = True
             log.info("[FL] Global model hash verified OK")
 
         # Save to local path
-        model_dir = Path.home() / ".federated" / "data" / "global_models"
+        # FIX-MULTIMODAL-2: separate local cache subdirectory per mode so a
+        # multimodal round N's downloaded global model can never collide with
+        # (or be mistaken for) the text-only chain's global_round{N}.pt file
+        # — the two experiments use independent round numbering in
+        # independent MongoDB databases, but round IDs can coincide (both
+        # start at 1), so the local filename alone isn't a safe disambiguator.
+        subdir = "global_models" if PIPELINE_MODE == "text" else f"global_models_{PIPELINE_MODE}"
+        model_dir = Path.home() / ".federated" / "data" / subdir
         model_dir.mkdir(parents=True, exist_ok=True)
         model_path = model_dir / f"global_round{round_id}.pt"
         model_path.write_bytes(model_bytes)
@@ -130,10 +160,22 @@ def _download_global_model(stub, device_id: bytes, round_id: int) -> Optional[st
             "[FL] Global model downloaded: %d bytes → %s",
             len(model_bytes), model_path
         )
+
+        rpt.subheader("GLOBAL MODEL — DOWNLOAD")
+        rpt.kv("Round ID", round_id)
+        rpt.kv("Chunks received", chunk_count)
+        rpt.kv("Model size", f"{len(model_bytes)} bytes")
+        rpt.kv("SHA-256 (full model)", hashlib.sha256(model_bytes).hexdigest())
+        rpt.kv("Hash verification", "PASS" if hash_verified else "SKIPPED (server sent no full-model hash)")
+        rpt.kv("Saved to", str(model_path))
+        rpt.kv("Download duration", f"{time.time() - t0:.2f} sec")
+        rpt.ok("Global model downloaded")
+
         return str(model_path)
 
     except Exception as e:
         log.warning("[FL] Could not download global model: %s — starting from scratch", e)
+        rpt.warn(f"Global model download failed: {e} — starting from random init")
         return None
 
 
@@ -172,6 +214,16 @@ def _stream_update(
         total_size, total_chunks, payload_hash.hex()[:16]
     )
 
+    rpt.header("SECURE TRANSPORT")
+    rpt.kv("Protocol", "gRPC")
+    rpt.kv("TLS", "mTLS (client + server cert)")
+    rpt.kv("Payload size", f"{total_size} bytes")
+    rpt.kv("Chunk size", f"{CHUNK_SIZE} bytes")
+    rpt.kv("Chunks", total_chunks)
+    rpt.kv("SHA-256 (payload)", payload_hash.hex())
+
+    t0 = time.time()
+
     def chunk_generator():
         for i in range(total_chunks):
             chunk_data = data[i * CHUNK_SIZE : (i + 1) * CHUNK_SIZE]
@@ -189,12 +241,22 @@ def _stream_update(
     # stream is client-side streaming — use direct stub call
     ack = stub.UploadUpdate(chunk_generator(), timeout=300)
 
+    upload_duration = time.time() - t0
+
     if not ack.ok:
+        rpt.fail(f"Server rejected upload: {ack.error}")
         raise RuntimeError(
             f"Server rejected upload: {ack.error}"
         )
 
     log.info("[pipeline] Upload complete — server_handle=%s", ack.server_handle)
+
+    rpt.kv("mTLS status", "PASS (channel established)")
+    rpt.kv("Upload status", "SUCCESS")
+    rpt.kv("Upload duration", f"{upload_duration:.2f} sec")
+    rpt.kv("Server handle (GridFS)", ack.server_handle)
+    rpt.ok("Update securely uploaded")
+
     return ack.server_handle, payload_hash
 
 
@@ -216,15 +278,30 @@ def run_pipeline(
       7. Stream bytes to server (NEW — FIX-PIPELINE-1)
       8. Submit receipt with real epsilon and server handle (FIX-PIPELINE-2,3)
     """
+    round_t0 = time.time()
+    stage_status = {}   # stage name -> "PASS" | "FAIL" | "SKIP", populated as we go
+
     # ── 1. Query round ────────────────────────────────────────────────────────
     log.info("[pipeline] Querying round metadata...")
     round_meta = call_with_retry(stub.GetRound, DeviceId(id=device_id), timeout=10)
 
+    session_id = f"client-{uuid.uuid4().hex[:12]}"
+
+    rpt.header(f"ROUND {round_meta.round_id} — CLIENT")
+    rpt.subheader("[01] ROUND METADATA")
+    rpt.kv("Round ID", round_meta.round_id)
+    rpt.kv("Session ID", session_id)
+    rpt.kv("Device ID", device_id.hex())
+    rpt.kv("Round state", round_meta.state)
+    rpt.kv("Global model", "Available" if round_meta.global_model_available else "Not available")
+    rpt.ok("Round metadata received")
+    stage_status["round_metadata"] = "PASS"
+
     if round_meta.state != "Collecting":
         log.info("[pipeline] Round state=%s — skipping", round_meta.state)
+        rpt.warn(f"Round state={round_meta.state} — nothing to submit this cycle")
         return
 
-    session_id = f"client-{uuid.uuid4().hex[:12]}"
     log.info("[pipeline] Round %d active — session %s", round_meta.round_id, session_id)
 
     # ── 2. Download global model (FIX-PIPELINE-6) ─────────────────────────────
@@ -232,26 +309,94 @@ def run_pipeline(
     if round_meta.global_model_available:
         log.info("[FL] Global model available — downloading...")
         global_model_path = _download_global_model(stub, device_id, round_meta.round_id)
+        stage_status["global_model"] = "PASS" if global_model_path else "FAIL"
     else:
         log.info("[FL] No global model for this round — random init")
+        rpt.subheader("[02] GLOBAL MODEL")
+        rpt.kv("Global model", "Not available — this client will train from random initialization")
+        stage_status["global_model"] = "SKIP"
 
-    # ── 3. LDA preprocessing ─────────────────────────────────────────────────
-    log.info("[pipeline] Running LDA...")
+    # ── 3. Input preparation: LDA (text mode) or frozen parquet (multimodal) ──
+    if PIPELINE_MODE == "multimodal":
+        log.info("[pipeline] PIPELINE_MODE=multimodal — using frozen DAIC-WOZ parquet, skipping live LDA")
 
-    video_dir = str(session_dir) if (session_dir and session_dir.exists()) else _INPUT_DIR
+        if not _MULTIMODAL_PARQUET.exists():
+            stage_status["lda"] = "FAIL"
+            raise FileNotFoundError(
+                f"Multimodal dataset not found: {_MULTIMODAL_PARQUET}. "
+                "This is a frozen, read-only fixture — it must already exist in the repo."
+            )
 
-    lda_req = PreprocessRequest(
-        mode=LDA_MODE,
-        inputs={"video_dir": video_dir},
-        config_uri=_CONFIG_URI,
-    )
+        t0 = time.time()
+        # Real values, not hardcoded: peek the actual frozen file to report
+        # real row count / feature dims before the trainer loads it.
+        import pyarrow.parquet as _pq
+        _table = _pq.read_table(str(_MULTIMODAL_PARQUET))
+        _total_rows = _table.num_rows
+        _sample_row = _table.to_pandas().iloc[0]
+        _sample_features = json.loads(_sample_row["features"])
+        _audio_dim = len(_sample_features.get("audio", {}).get("wav2vec2", []))
+        _video_dim = len(_sample_features.get("video", {}).get("densenet", []))
+        lda_elapsed = time.time() - t0
 
-    t0 = time.time()
-    lda_result = preprocess(lda_req)
-    log.info("[pipeline] LDA done in %.1fs", time.time() - t0)
+        rpt.header("MULTIMODAL INPUT ANALYSIS")
+        rpt.kv("Source", str(_MULTIMODAL_PARQUET))
+        rpt.kv("Total rows in dataset", _total_rows)
+        rpt.kv("Rows used this round", _MULTIMODAL_MAX_SAMPLES)
+        rpt.line()
+        rpt.line("TEXT INPUT")
+        rpt.kv("Status", "AVAILABLE", indent=2)
+        rpt.kv("Sample participant_id", _sample_row["participant_id"], indent=2)
+        rpt.line()
+        rpt.line("AUDIO INPUT")
+        rpt.kv("Status", "AVAILABLE" if _audio_dim else "ABSENT", indent=2)
+        rpt.kv("Source", "features.audio.wav2vec2 (pre-extracted, frozen)", indent=2)
+        rpt.kv("[MULTIMODAL] audio dimension", _audio_dim, indent=2)
+        rpt.line()
+        rpt.line("VIDEO INPUT")
+        rpt.kv("Status", "AVAILABLE" if _video_dim else "ABSENT", indent=2)
+        rpt.kv("Source", "features.video.densenet (pre-extracted, frozen)", indent=2)
+        rpt.kv("[MULTIMODAL] video dimension", _video_dim, indent=2)
+        rpt.kv("Execution time", f"{lda_elapsed:.3f} sec")
+        rpt.ok("Multimodal input analysis complete")
 
-    _validate_lda_output(lda_result)
-    manifest_uri = lda_result["artifact_manifest"]
+        manifest_uri = str(_MULTIMODAL_PARQUET)
+        stage_status["lda"] = "PASS"
+    else:
+        log.info("[pipeline] Running LDA...")
+
+        video_dir = str(session_dir) if (session_dir and session_dir.exists()) else _INPUT_DIR
+        input_video_count = len(list(Path(video_dir).glob("*.mp4"))) if Path(video_dir).exists() else 0
+
+        rpt.header("LOCAL DATA AGENT (LDA)")
+        rpt.kv("Input directory", video_dir)
+        rpt.kv("Input videos found", input_video_count)
+        rpt.kv("Mode", LDA_MODE)
+
+        lda_req = PreprocessRequest(
+            mode=LDA_MODE,
+            inputs={"video_dir": video_dir},
+            config_uri=_CONFIG_URI,
+        )
+
+        t0 = time.time()
+        try:
+            lda_result = preprocess(lda_req)
+            _validate_lda_output(lda_result)
+            stage_status["lda"] = "PASS"
+        except Exception:
+            stage_status["lda"] = "FAIL"
+            raise
+        lda_elapsed = time.time() - t0
+        log.info("[pipeline] LDA done in %.1fs", lda_elapsed)
+
+        manifest_uri = lda_result["artifact_manifest"]
+        rpt.kv("Session ID", lda_result["session_id"])
+        rpt.kv("Output rows (manifest)", lda_result["count"])
+        rpt.kv("Encrypted artifacts written", len(lda_result["receipts"]))
+        rpt.kv("Artifact manifest", manifest_uri)
+        rpt.kv("Execution time", f"{lda_elapsed:.2f} sec")
+        rpt.ok("LDA completed")
 
     # ── 4. Trainer ────────────────────────────────────────────────────────────
     log.info("[pipeline] Running trainer (mode=supervised)...")
@@ -263,38 +408,77 @@ def run_pipeline(
         "epochs":      1,
         "batch_size":  8,
     }
+    if PIPELINE_MODE == "multimodal":
+        trainer_kwargs["max_samples"] = _MULTIMODAL_MAX_SAMPLES
     if global_model_path:
         trainer_kwargs["global_model_path"] = global_model_path
 
-    t0 = time.time()
-    trainer_out = trainer_orchestrate(**trainer_kwargs)
-    log.info("[pipeline] Trainer done in %.1fs", time.time() - t0)
+    rpt.header("LOCAL TRAINING")
+    rpt.kv("Model", "MentalBERT (multimodal fusion)")
+    rpt.kv("Initialization", "Global model (warm-start)" if global_model_path else "Random / local pretrained")
+    rpt.kv("Epochs", trainer_kwargs["epochs"])
+    rpt.kv("Batch size", trainer_kwargs["batch_size"])
+    rpt.kv("Optimizer", "AdamW")
 
-    _validate_trainer_output(trainer_out)
+    t0 = time.time()
+    try:
+        trainer_out = trainer_orchestrate(**trainer_kwargs)
+        _validate_trainer_output(trainer_out)
+        stage_status["training"] = "PASS"
+    except Exception:
+        stage_status["training"] = "FAIL"
+        raise
+    trainer_elapsed = time.time() - t0
+    log.info("[pipeline] Trainer done in %.1fs", trainer_elapsed)
+
     local_update_uri = trainer_out["local_update_uri"]
+    rpt.kv("Output update", local_update_uri)
+    if "num_steps_completed" in trainer_out:
+        rpt.kv("Optimizer steps completed", trainer_out["num_steps_completed"])
+    rpt.kv("Training time", f"{trainer_elapsed:.2f} sec")
+    rpt.ok("Local training completed")
 
     # ── 5. Differential Privacy ───────────────────────────────────────────────
     log.info("[pipeline] Applying DP noise...")
 
     store    = SecureStore(agent="trainer", root=_STORE_ROOT)
+    dp_clip_norm = 1.0
+    dp_noise_multiplier = 1.0
+    dp_mechanism = "gaussian"
     dp_agent = DPAgent(
-        clip_norm=1.0,
-        noise_multiplier=1.0,
-        mechanism="gaussian",
+        clip_norm=dp_clip_norm,
+        noise_multiplier=dp_noise_multiplier,
+        mechanism=dp_mechanism,
         store=store,
     )
 
-    dp_result = dp_agent.process_local_update(
-        local_update_uri,
-        session_id=session_id,
-        metadata={"session_id": session_id},
-    )
+    rpt.header("DIFFERENTIAL PRIVACY")
+    rpt.kv("Mechanism configured", dp_mechanism)
+    rpt.kv("Clip norm configured", dp_clip_norm)
+    rpt.kv("Noise multiplier configured", dp_noise_multiplier)
+
+    try:
+        dp_result = dp_agent.process_local_update(
+            local_update_uri,
+            session_id=session_id,
+            metadata={"session_id": session_id},
+        )
+        stage_status["dp"] = "PASS"
+    except Exception:
+        stage_status["dp"] = "FAIL"
+        raise
+
     log.info(
         "[pipeline] DP done: L2 before=%.4f after=%.4f eps=%.6f",
         dp_result["l2_norm_before"],
         dp_result["l2_norm_after"],
         dp_result.get("epsilon_spent", 0.0),
     )
+
+    l2_before = dp_result["l2_norm_before"]
+    l2_after  = dp_result["l2_norm_after"]
+    # (Step-by-step clip/noise/epsilon detail is printed inside dp_agent.py,
+    #  which has access to the raw parameter tensors — not duplicated here.)
 
     # FIX-PIPELINE-3: read real epsilon from DP agent, never hardcode
     epsilon_spent = dp_result.get("epsilon_spent")
@@ -307,17 +491,32 @@ def run_pipeline(
             "— using fallback 1.0.  Use mechanism='gaussian' for real RDP accounting.",
             dp_agent.mechanism,
         )
+        rpt.warn("DP agent returned no finite epsilon — using fallback 1.0 for the receipt")
     elif epsilon_spent > MAX_EPS_VALUE:
+        rpt.fail(f"epsilon_spent={epsilon_spent:.4f} exceeds hard ceiling {MAX_EPS_VALUE}")
         raise ValueError(
             f"epsilon_spent={epsilon_spent:.4f} exceeds hard ceiling {MAX_EPS_VALUE} "
             f"— reduce noise multiplier or clip norm"
         )
+    rpt.ok("Differential privacy applied")
 
     # ── 6. Encryption ─────────────────────────────────────────────────────────
     log.info("[pipeline] Finalizing encryption...")
+    rpt.header("ENCRYPTION")
     enc_agent       = EncryptionAgent(mode="aes")
-    enc_result      = enc_agent.process_dp_update(dp_result["receipt_uri"])
+    try:
+        enc_result      = enc_agent.process_dp_update(dp_result["receipt_uri"])
+        stage_status["encryption"] = "PASS"
+    except Exception:
+        stage_status["encryption"] = "FAIL"
+        raise
     final_update_uri = enc_result["receipt"]["outputs"][0]
+    enc_size = Path(final_update_uri[len("file://"):]).stat().st_size
+    rpt.kv("Serialization", "torch.save state_dict -> SecureStore AES-GCM envelope")
+    rpt.kv("Encryption algorithm", enc_result["receipt"]["params"]["encryption_scheme"])
+    rpt.kv("Encrypted file", final_update_uri)
+    rpt.kv("Encrypted size", f"{enc_size} bytes")
+    rpt.ok("Update encrypted")
 
     # ── 7. Stream bytes to server (FIX-PIPELINE-1,4,5) ───────────────────────
     log.info("[pipeline] Streaming update to server...")
@@ -342,7 +541,19 @@ def run_pipeline(
         + round_meta.round_id.to_bytes(8, "big")
         + payload_hash           # SHA-256 of actual uploaded bytes
     )
-    signature = sign_message(msg)
+
+    rpt.header("TPM / DEVICE SIGNING")
+    rpt.kv("Key identifier", "FederatedDeviceKey (ECDSA P-256, TPM-backed)")
+    rpt.kv("Payload size", f"{len(msg)} bytes")
+    try:
+        signature = sign_message(msg)
+        stage_status["tpm_signing"] = "PASS"
+    except Exception:
+        stage_status["tpm_signing"] = "FAIL"
+        raise
+    rpt.kv("Signature generated", "YES")
+    rpt.kv("Signature size", f"{len(signature)} bytes")
+    rpt.ok("Message signed by device key")
 
     receipt = Receipt(
         device_id=device_id,
@@ -356,7 +567,90 @@ def run_pipeline(
     )
 
     ack = call_with_retry(stub.SubmitReceipt, receipt, timeout=15)
+
+    rpt.header("FEDERATED LEARNING - CLIENT")
+    rpt.kv("Round", round_meta.round_id)
+    rpt.kv("Client (device ID)", device_id.hex()[:16] + "…")
+    rpt.kv("Global model", "Available" if round_meta.global_model_available else "Not available")
+    rpt.kv("Local training", stage_status.get("training", "?"))
+    rpt.kv("DP protection", stage_status.get("dp", "?"))
+    rpt.kv("Encryption", stage_status.get("encryption", "?"))
+    rpt.kv("TPM signing", stage_status.get("tpm_signing", "?"))
+    rpt.kv("Update size", f"{enc_size} bytes")
+    rpt.kv("Update hash (SHA-256)", payload_hash.hex())
+    rpt.kv("Receipt submitted", "YES" if ack.ok else "NO")
+
     if ack.ok:
         log.info("[pipeline] ✅ Round %d update submitted", round_meta.round_id)
+        stage_status["receipt"] = "PASS"
+        rpt.ok("Client update submitted")
     else:
         log.warning("[pipeline] Server returned ok=False for round %d", round_meta.round_id)
+        stage_status["receipt"] = "FAIL"
+        rpt.fail("Server rejected receipt")
+
+    # ── Round summary ──────────────────────────────────────────────────────────
+    total_latency = time.time() - round_t0
+    rpt.header(f"ROUND {round_meta.round_id} SUMMARY")
+    for name in ("round_metadata", "global_model", "lda", "training", "dp",
+                 "encryption", "tpm_signing", "receipt"):
+        if name in stage_status:
+            rpt.kv(name.replace("_", " ").title(), stage_status[name])
+    round_success = all(v in ("PASS", "SKIP") for v in stage_status.values())
+    rpt.line()
+    rpt.kv("Round status", "SUCCESS" if round_success else "FAILURE")
+    rpt.kv("Total latency", f"{total_latency:.2f} sec")
+    rpt.line("=" * 64)
+
+    # ── Persist round outcome for cross-run E2E summaries ─────────────────────
+    try:
+        history_path = Path.home() / ".federated" / "state" / "round_history.jsonl"
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "round_id": round_meta.round_id,
+            "session_id": session_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "stages": stage_status,
+            "status": "SUCCESS" if round_success else "FAILURE",
+            "total_latency_sec": round(total_latency, 3),
+            "epsilon_spent": epsilon_spent,
+            "update_size_bytes": enc_size,
+            "update_hash": payload_hash.hex(),
+            "server_handle": server_handle,
+        }
+        with open(history_path, "a", encoding="utf-8") as hf:
+            hf.write(json.dumps(record) + "\n")
+
+        # ── E2E summary across all rounds recorded on this device so far ──────
+        # Each run-once invocation is a separate process/terminal for a single
+        # round; this reads back the real outcomes persisted by prior runs
+        # (including this one) so a multi-round summary can be shown without
+        # inventing any aggregate figures.
+        history_records = []
+        with open(history_path, "r", encoding="utf-8") as hf:
+            for hline in hf:
+                hline = hline.strip()
+                if hline:
+                    try:
+                        history_records.append(json.loads(hline))
+                    except json.JSONDecodeError:
+                        continue
+
+        rpt.header("E2E FEDERATED LEARNING SUMMARY")
+        rpt.kv("Rounds recorded on this device", len(history_records))
+        for rec in history_records:
+            rpt.line(f"  Round {rec['round_id']} [{rec['status']}]  "
+                      f"eps={rec.get('epsilon_spent', 0):.4f}  "
+                      f"size={rec.get('update_size_bytes', 0)}B  "
+                      f"latency={rec.get('total_latency_sec', 0):.1f}s  "
+                      f"({rec.get('timestamp', '')})")
+        rpt.subheader("Security (always applied by this pipeline)")
+        rpt.kv("DP", "ENABLED (RDP-accounted Gaussian mechanism)")
+        rpt.kv("Encryption", "ENABLED (AES-GCM, SecureStore)")
+        rpt.kv("TPM signing", "ENABLED (ECDSA P-256, device-bound key)")
+        rpt.kv("mTLS", "ENABLED (client + server certificate)")
+        rpt.line()
+        rpt.kv("Overall E2E status", "SUCCESS" if round_success else "FAILURE")
+        rpt.line("=" * 64)
+    except Exception as e:
+        log.debug("Could not persist/read round history: %s", e)

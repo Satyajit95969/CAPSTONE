@@ -110,3 +110,14 @@ installer/runtime/keys/
 .mypy_cache/
 .idea/
 *.swp
+
+############################
+# Encrypted update payloads (SecureStore / DP output) - never commit
+############################
+*.enc
+*.pt.enc
+
+############################
+# Immutable local backup of the frozen dataset - never commit, never delete
+############################
+dataset_build/daic_records_multimodal.parquet.ORIGINAL.bak

@@ -1,6 +1,8 @@
-import os, json, time, base64
+import os, json, time, base64, hashlib
 from typing import Optional, Dict, Any
 from pathlib import Path
+
+from core import reporting as rpt
 
 # Optional libs
 try:
@@ -62,6 +64,7 @@ class EncryptionAgent:
 
     # ---------------- main entry ----------------
     def process_dp_update(self, dp_receipt_path: str) -> Dict[str, Any]:
+        t0 = time.time()
         if dp_receipt_path.startswith("file://"):
             dp_receipt_path = dp_receipt_path[len("file://"):]
 
@@ -76,6 +79,14 @@ class EncryptionAgent:
             "scheme": "AES-GCM-SecureStore",
             "note": "DP update already encrypted at rest"
         }
+
+        enc_path = dp_update_uri[len("file://"):]
+        enc_bytes = Path(enc_path).read_bytes()
+        rpt.kv("Note", "This stage finalizes/attests the DP stage's AES-GCM output — no second encryption pass")
+        rpt.kv("Encrypted update file", dp_update_uri)
+        rpt.kv("Encrypted size", f"{len(enc_bytes)} bytes")
+        rpt.kv("SHA-256 (encrypted bytes)", hashlib.sha256(enc_bytes).hexdigest())
+        rpt.kv("Encryption duration", f"{time.time() - t0:.4f} sec")
 
         receipt = self.rm.create_receipt(
             agent="enc-agent",

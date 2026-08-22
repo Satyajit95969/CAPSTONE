@@ -56,10 +56,17 @@ import base64
 import os
 import io
 import json
+import sys
 import numpy as np
 import torch
 from pathlib import Path
 from typing import Dict, List, Optional, Union
+
+from server.aggregator_agent.core import reporting as rpt
+# CRITICAL: this process's stdout is a machine-parsed contract — the Rust
+# orchestrator reads exactly one JSON line from it (serde_json::from_slice).
+# All structured reporting below must go to stderr, never stdout.
+rpt.set_default_stream(sys.stderr)
 
 # Canonical paths — must match _CANONICAL_ROOT in centralized_secure_store.py
 _FEDERATED_BASE  = Path.home() / ".federated"
@@ -68,6 +75,14 @@ _GLOBAL_KEY_PATH = _CANONICAL_ROOT / "master.key"   # shared master key
 
 # MongoDB connection string — set via environment variable, never hardcoded
 _MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
+# FIX-MULTIMODAL-3: database name, from MONGO_DATABASE env var (defaults to
+# "federated" — matches the Rust orchestrator's own default in main.rs).
+# The Rust orchestrator spawns this subprocess inheriting its own process
+# environment, so whatever MONGO_DATABASE it was started with is already
+# visible here — this was the missing half of the database-isolation fix;
+# the Rust side alone was not enough because this file independently
+# hardcoded "federated" in two places (GridFS read + GridFS write).
+_MONGO_DATABASE = os.environ.get("MONGO_DATABASE", "federated")
 
 
 class AggregatorAgent:
@@ -238,7 +253,7 @@ class AggregatorAgent:
         import gridfs
 
         client = MongoClient(_MONGO_URI)
-        db     = client["federated"]
+        db     = client[_MONGO_DATABASE]
         fs     = gridfs.GridFS(db)
 
         try:
@@ -385,6 +400,10 @@ class AggregatorAgent:
         """
         state_dicts: List[Dict[str, torch.Tensor]] = []
 
+        rpt.header("FEDERATED SERVER — AGGREGATION")
+        rpt.kv("Updates received", len(updates))
+        rpt.subheader("CLIENT UPDATES")
+
         for idx, u in enumerate(updates):
             # FIX-AGG-3: prefer gridfs_id over local enc_uri
             gridfs_id = u.get("gridfs_id")
@@ -392,10 +411,24 @@ class AggregatorAgent:
             scheme    = u.get("scheme", "AES-GCM-SecureStore")
             nonce     = u.get("nonce")
 
-            result = self._decrypt_cb(gridfs_id, enc_path, scheme, nonce)
+            rpt.line(f"Client {idx}")
+            rpt.kv("gridfs_id", gridfs_id or "(none)", indent=2)
+            rpt.kv("scheme", scheme, indent=2)
+
+            try:
+                result = self._decrypt_cb(gridfs_id, enc_path, scheme, nonce)
+                rpt.kv("Hash/decrypt", "PASS", indent=2)
+            except Exception as e:
+                rpt.kv("Hash/decrypt", f"FAIL ({e})", indent=2)
+                raise
 
             if isinstance(result, dict):
                 state_dicts.append(result)
+                n_tensors = len(result)
+                total_numel = sum(v.numel() for v in result.values())
+                rpt.kv("Accepted", "YES", indent=2)
+                rpt.kv("Parameter tensors", n_tensors, indent=2)
+                rpt.kv("Total parameters", f"{total_numel:,}", indent=2)
             elif isinstance(result, (np.ndarray, torch.Tensor)):
                 shape = tuple(getattr(result, "shape", ()))
                 raise TypeError(
@@ -458,6 +491,24 @@ class AggregatorAgent:
                     "(same bert_name, audio_dim, vision_dim)."
                 )
 
+        rpt.subheader("AGGREGATION")
+        algo_names = {
+            "mean": "Unweighted federated averaging (mean)",
+            "trimmed_mean": "Coordinate-wise trimmed mean (robust FedAvg)",
+            "median": "Coordinate-wise median (robust)",
+            "coordinate_median": "Coordinate-wise median (robust)",
+        }
+        rpt.kv("Algorithm", algo_names.get(self.mode, self.mode))
+        rpt.kv("Number of clients", n_clients)
+        if self.mode == "trimmed_mean":
+            rpt.kv("Trim ratio", self.trim_ratio)
+        rpt.kv("Parameter tensors (keys)", len(reference_keys))
+
+        # Pick up to 2 small representative parameters to show a concrete,
+        # per-client -> aggregated worked example (never the full model).
+        _shown = 0
+        _MAX_SHOWN = 2
+
         # ── 2. Per-key shape validation and aggregation ───────────────────────
         aggregated: Dict[str, torch.Tensor] = {}
 
@@ -488,6 +539,13 @@ class AggregatorAgent:
                 agg_f32  = self._aggregate_tensor(stacked)
                 aggregated[key] = agg_f32.to(ref.dtype)
 
+                if _shown < _MAX_SHOWN:
+                    rpt.line(f"Parameter '{key}':")
+                    for ci, t in enumerate(tensors):
+                        rpt.tensor_summary(f"  Client {ci}", t, indent=2)
+                    rpt.tensor_summary("  Aggregated", agg_f32, indent=2)
+                    _shown += 1
+
             else:
                 # ── Non-floating buffers (int64, bool, …) ────────────────────
                 # Averaging integer indices is semantically meaningless.
@@ -503,6 +561,13 @@ class AggregatorAgent:
                             "the client model instances."
                         )
                 aggregated[key] = ref.clone()
+
+        total_params = sum(t.numel() for t in aggregated.values())
+        rpt.line()
+        rpt.kv("Total parameter tensors processed", len(aggregated))
+        rpt.kv("Total scalar parameters aggregated", f"{total_params:,}")
+        rpt.kv("Failed", 0)  # fail-loud design: reaching here means zero failures
+        rpt.ok("Round aggregation complete")
 
         return aggregated
 
@@ -603,22 +668,41 @@ class AggregatorAgent:
         # Upload to MongoDB GridFS so the Rust orchestrator can serve the model
         # via DownloadGlobalModel without touching the local filesystem.
         _client = _MongoClient(_MONGO_URI)
-        _db     = _client["federated"]
+        _db     = _client[_MONGO_DATABASE]
         _fs     = _gridfs.GridFS(_db)
         file_id = _fs.put(
             model_bytes,
             filename=f"global_model_round_{job['round_id']}.pt",
         )
+
+        rpt.subheader("GLOBAL MODEL")
+        rpt.kv("Round ID", job["round_id"])
+        rpt.kv("Aggregation mode", self.mode)
+        rpt.kv("Model size", f"{len(model_bytes)} bytes")
+        rpt.kv("Model hash (SHA-256)", model_hash)
+        rpt.kv("Parameter tensors (keys)", len(aggregated))
+        rpt.kv("Stored in GridFS", f"YES (file_id={file_id})")
+
+        try:
+            coll_names = _db.list_collection_names()
+            rpt.subheader("MONGODB")
+            for cname in coll_names:
+                rpt.kv(cname, _db[cname].count_documents({}), indent=2)
+        except Exception as e:
+            rpt.warn(f"Could not enumerate MongoDB collections: {e}")
+
         _client.close()
+        rpt.ok("Global model generated")
 
         return {
-            "round_id":       job["round_id"],
-            "aggregated_uri": "file://" + os.path.abspath(out_path),
-            "num_updates":    len(job["updates"]),
-            "mode":           self.mode,
-            "gridfs_file_id": str(file_id),
-            "model_hash":     model_hash,
-            "num_keys":       len(aggregated),
+            "round_id":         job["round_id"],
+            "aggregated_uri":   "file://" + os.path.abspath(out_path),
+            "num_updates":      len(job["updates"]),
+            "mode":             self.mode,
+            "gridfs_file_id":   str(file_id),
+            "model_hash":       model_hash,
+            "num_keys":         len(aggregated),
+            "total_parameters": sum(t.numel() for t in aggregated.values()),
         }
 
 

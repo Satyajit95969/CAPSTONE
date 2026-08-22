@@ -38,6 +38,7 @@ import pyarrow.parquet as pq
 
 from core.centralized_secure_store import SecureStore
 from core.centralised_receipts import CentralReceiptManager
+from core import reporting as rpt
 
 from installer.security.integrity import integrity_guard
 integrity_guard()
@@ -462,11 +463,25 @@ def train_model(dataset: MultiModalDataset, model: MultiModalModel,
     cls_loss_fn = nn.CrossEntropyLoss()
     reg_loss_fn = nn.MSELoss()
 
+    rpt.subheader(f"TRAINING LOOP ({epochs} epoch(s))")
     model.train()
+    final_avg_loss = None
+    _shapes_printed = False
     for epoch in range(epochs):
         total_loss = 0.0
         for b in loader:
             b = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in b.items()}
+            if not _shapes_printed:
+                print(f"[MULTIMODAL] text batch shape  = {tuple(b['input_ids'].shape)}")
+                if b.get("audio_vec") is not None:
+                    print(f"[MULTIMODAL] audio batch shape = {tuple(b['audio_vec'].shape)}")
+                else:
+                    print("[MULTIMODAL] audio batch shape = None (no audio in this batch)")
+                if b.get("video_vec") is not None:
+                    print(f"[MULTIMODAL] video batch shape = {tuple(b['video_vec'].shape)}")
+                else:
+                    print("[MULTIMODAL] video batch shape = None (no video in this batch)")
+                _shapes_printed = True
             optimizer.zero_grad()
             logits, reg_pred, _ = model(b["input_ids"], b["attention_mask"],
                                         audio_vec=b.get("audio_vec"), vision_vec=b.get("video_vec"))
@@ -477,7 +492,9 @@ def train_model(dataset: MultiModalDataset, model: MultiModalModel,
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             total_loss += loss.item()
-        print(f"[train_model] epoch {epoch+1}/{epochs} avg_loss={total_loss/len(loader):.4f}")
+        final_avg_loss = total_loss / len(loader)
+        print(f"[train_model] epoch {epoch+1}/{epochs} avg_loss={final_avg_loss:.4f}")
+        rpt.kv(f"Epoch {epoch+1}/{epochs} average loss", f"{final_avg_loss:.4f}", indent=2)
 
     # ---------- Evaluation ----------
     model.eval()
@@ -546,7 +563,8 @@ def train_model(dataset: MultiModalDataset, model: MultiModalModel,
         "model_path": model_path,
         "metrics_path": metrics_json_path,
         "explain_path": explain_path,
-        "metrics": metrics
+        "metrics": metrics,
+        "final_avg_loss": final_avg_loss,
     }
 
 # ---------- RL Update (REINFORCE) ----------
@@ -719,22 +737,39 @@ def modality_ablation_importance(model: MultiModalModel, sample_batch: Dict[str,
 
 
 # ---------- Physician CLI for supervised correction ----------
+PHQ_POSITIVE_THRESHOLD = 10.0  # matches label = 1 if phq_val >= 10.0 in MultiModalDataset
+
 def physician_feedback_cli(preds: List[Dict[str, Any]], texts: List[str]) -> List[float]:
     corrected = []
-    print("\n-- Physician feedback loop --")
+    rpt.header("PHYSICIAN FEEDBACK LOOP")
     for i, (p, t) in enumerate(zip(preds, texts)):
         snippet = (t or "")[:260].replace("\n", " ")
-        print(f"\nSample {i+1}: {snippet} ...")
-        print(f"Model PHQ: {p['pred_phq']:.2f}  (class prob positive: {p['pred_class_probs'][1]:.3f})")
+        probs = p["pred_class_probs"]
+        predicted_class = 1 if probs[1] >= 0.5 else 0
+        rpt.subheader(f"Sample {i+1}")
+        print(f"  Text (truncated) : {snippet} ...")
+        rpt.kv("Raw model output (PHQ)", f"{p['pred_phq']:.2f}", indent=2)
+        rpt.kv("Negative probability", f"{probs[0]:.3f}", indent=2)
+        rpt.kv("Positive probability", f"{probs[1]:.3f}", indent=2)
+        rpt.kv("Classification threshold", "0.5 (class prob) / PHQ>=10.0 (label)", indent=2)
+        rpt.kv("Predicted class", predicted_class, indent=2)
         val = input("Enter corrected PHQ (or Enter to keep): ").strip()
         if val:
             try:
-                corrected.append(float(val))
+                corrected_val = float(val)
+                corrected.append(corrected_val)
+                applied = corrected_val != p["pred_phq"]
+                rpt.kv("Physician correction", f"{corrected_val:.2f}", indent=2)
             except:
                 print("invalid -> keeping model value")
                 corrected.append(float(p["pred_phq"]))
+                applied = False
+                rpt.kv("Physician correction", "invalid input, discarded", indent=2)
         else:
             corrected.append(float(p["pred_phq"]))
+            applied = False
+            rpt.kv("Physician correction", "Not provided", indent=2)
+        rpt.kv("Correction applied", "YES" if applied else "NO", indent=2)
     return corrected
 
 
@@ -840,15 +875,31 @@ def orchestrate(
             break
  
     print(f"[info] inferred audio_dim={audio_dim}, vision_dim={vision_dim}")
- 
+
+    rpt.subheader("MODEL CONFIGURATION")
+    rpt.kv("Architecture", "MentalBERT + audio/vision fusion head")
+    rpt.kv("Records loaded", len(records))
+    rpt.kv("Audio dim", audio_dim)
+    rpt.kv("Vision dim", vision_dim)
+
     model = MultiModalModel(
         MENTALBERT_PRETRAIN,
         audio_dim=audio_dim,
         vision_dim=vision_dim,
         device=device
     )
- 
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    rpt.kv("Total parameters", f"{total_params:,}")
+    rpt.kv("Trainable parameters", f"{trainable_params:,}")
+    rpt.kv("Frozen parameters", f"{total_params - trainable_params:,}")
+    print(f"[MULTIMODAL] audio encoder = {'ACTIVE' if model.has_audio else 'INACTIVE'}")
+    print(f"[MULTIMODAL] video encoder = {'ACTIVE' if model.has_vision else 'INACTIVE'}")
+    print(f"[MULTIMODAL] fusion input dimension = {model.fusion.fc1.in_features}")
+    print(f"[MULTIMODAL] total parameters = {total_params:,}")
+
     # ── Phase 10: warm-start from global model ────────────────────────────────
+    rpt.subheader("WARM-START")
     if global_model_path and Path(global_model_path).exists():
         try:
             global_state = torch.load(global_model_path, map_location=device)
@@ -860,12 +911,20 @@ def orchestrate(
                 f"[FL] Warm-started from global model: "
                 f"{len(missing)} missing keys, {len(unexpected)} unexpected keys"
             )
+            rpt.kv("Initialization", "Global model (warm-start)")
+            rpt.kv("Global model path", global_model_path)
+            rpt.kv("Missing keys", len(missing))
+            rpt.kv("Unexpected keys", len(unexpected))
+            rpt.ok("Model loaded successfully")
         except Exception as e:
             print(f"[FL] Warning: could not load global model ({e}) — starting from scratch")
+            rpt.warn(f"Could not load global model ({e}) — starting from scratch")
     else:
         if global_model_path:
             print(f"[FL] global_model_path provided but file not found: {global_model_path}")
+            rpt.warn(f"global_model_path provided but file not found: {global_model_path}")
         print("[FL] No global model — using random initialisation")
+        rpt.kv("Initialization", "Random / local pretrained (no global model)")
     # ─────────────────────────────────────────────────────────────────────────
  
     model.to(device)
@@ -900,20 +959,48 @@ def orchestrate(
         corrected_phq = physician_feedback_cli(preds, texts)
         for r, cp in zip(records, corrected_phq):
             r["phq_score"] = float(cp)
+        rpt.subheader("SUPERVISED FINE-TUNING")
+        rpt.kv("Epochs", epochs)
+        rpt.kv("Batch size", batch_size)
+        rpt.kv("Learning rate", lr)
+        rpt.kv("Optimizer", "AdamW")
+        t_train0 = time.time()
         ds_sup = MultiModalDataset(records, tokenizer)
         result = train_model(ds_sup, model, output_dir=str(LOCAL_SAVE_DIR),
                              epochs=epochs, batch_size=batch_size, lr=lr, device=device)
+        train_elapsed = time.time() - t_train0
         model.load_state_dict(torch.load(result["model_path"], map_location=device))
         after  = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         delta  = compute_state_delta(base_state, after)
+
+        delta_norm_before = math.sqrt(sum((v.float().norm() ** 2).item() for v in delta.values()))
+
         sparams = safety_params or {}
+        max_param_change = sparams.get("max_param_change", DEFAULT_MAX_PARAM_CHANGE)
+        max_global_norm  = sparams.get("max_global_norm", DEFAULT_MAX_GLOBAL_DELTA_NORM)
         delta_safe = apply_safety_to_delta(
             delta,
-            max_param_change=sparams.get("max_param_change", DEFAULT_MAX_PARAM_CHANGE),
-            max_global_norm=sparams.get("max_global_norm", DEFAULT_MAX_GLOBAL_DELTA_NORM),
+            max_param_change=max_param_change,
+            max_global_norm=max_global_norm,
         )
+        delta_norm_after = math.sqrt(sum((v.float().norm() ** 2).item() for v in delta_safe.values()))
+
+        rpt.subheader("EVALUATION METRICS (post-training, on local data)")
+        if result.get("final_avg_loss") is not None:
+            rpt.kv("final_avg_loss", f"{result['final_avg_loss']:.4f}", indent=2)
+        for mk, mv in result["metrics"].items():
+            rpt.kv(mk, f"{mv:.4f}", indent=2)
+
+        rpt.subheader("DELTA / SAFETY CLAMP")
+        rpt.kv("Per-parameter clamp", f"±{max_param_change}")
+        rpt.kv("Max global delta norm", max_global_norm)
+        rpt.kv("Delta L2 norm before clamp", f"{delta_norm_before:.6f}")
+        rpt.kv("Delta L2 norm after clamp", f"{delta_norm_after:.6f}")
+        rpt.kv("Training time", f"{train_elapsed:.2f} sec")
+
         update_uri, receipt_uri = save_encrypted_delta(delta_safe, store, session_id, rm)
         print(f"[done] supervised training -> delta saved {update_uri}")
+        rpt.ok(f"Local update saved: {update_uri}")
         return {"local_update_uri": update_uri, "update_receipt_uri": receipt_uri}
  
     elif mode == "rl":

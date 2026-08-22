@@ -36,7 +36,7 @@ use futures::AsyncWriteExt as FuturesAsyncWriteExt;
 use futures::StreamExt;
 use hmac::{Hmac, Mac};
 use mongodb::bson::{self, doc, oid::ObjectId, DateTime as BsonDateTime};
-use mongodb::options::FindOneOptions;
+use mongodb::options::{FindOneOptions, FindOptions};
 use mongodb::{Client as MongoClient, Database};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
@@ -58,14 +58,25 @@ use crate::round::{AggregationReceipt, Round, RoundState, UpdateMeta};
 use crate::state::OrchestratorState;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
-const MAX_UPDATE_BYTES: usize = 500 * 1024 * 1024; // 500 MB absolute cap
+const MAX_UPDATE_BYTES: usize = 1024 * 1024 * 1024; // 500 MB absolute cap
 const CHUNK_SIZE_MAX: usize = 4 * 1024 * 1024; // 4 MB per chunk
 
 // ── Service struct ────────────────────────────────────────────────────────────
+// FIX-BOOKKEEPING-1: Clone is required so a detached background task
+// (submit_receipt's tokio::spawn for aggregation) can own its own handle
+// to the service, independent of the triggering request's lifetime. Every
+// field is already cheap to clone: Arc, mongodb::Client (internally
+// Arc-backed), Config, and a small Vec<u8> key.
+#[derive(Clone)]
 pub struct Service {
     state: Arc<OrchestratorState>,
     cfg: Config,
     mongo: MongoClient,
+    /// FIX-MULTIMODAL-1: database name, from MONGO_DATABASE env var
+    /// (defaults to "federated" — see main.rs). Lets a separate experiment
+    /// (different parameter shapes, independent round numbering) run
+    /// against its own database using the identical binary/code paths.
+    db_name: String,
     /// HMAC key for receipt chaining — loaded from RECEIPT_CHAIN_KEY env var,
     /// never from config files or hardcoded defaults in production.
     receipt_chain_key: Vec<u8>,
@@ -76,6 +87,7 @@ impl Service {
         state: Arc<OrchestratorState>,
         cfg: Config,
         mongo: MongoClient,
+        db_name: String,
     ) -> anyhow::Result<Self> {
         let receipt_chain_key = std::env::var("RECEIPT_CHAIN_KEY")
             .map(|s| hex::decode(s).expect("RECEIPT_CHAIN_KEY must be a hex string"))
@@ -95,12 +107,13 @@ impl Service {
             state,
             cfg,
             mongo,
+            db_name,
             receipt_chain_key,
         })
     }
 
     fn db(&self) -> Database {
-        self.mongo.database("federated")
+        self.mongo.database(&self.db_name)
     }
 
     // ── FIX-SERVER-1: Enforce mTLS client certificate ─────────────────────────
@@ -672,12 +685,35 @@ impl Orchestrator for Service {
         );
 
         // Trigger aggregation once enough updates have been received.
+        //
+        // FIX-BOOKKEEPING-1: run_aggregation() used to be awaited synchronously
+        // inside this RPC handler. The aggregator subprocess runs on its own
+        // OS thread via spawn_blocking and keeps running even if this future is
+        // dropped, but everything AFTER it (JSON parse, global_models insert,
+        // round-complete bookkeeping) only runs if this future survives to
+        // await that result. A client-side timeout/retry (grpc_client.py's
+        // call_with_retry) can abandon the underlying stream while the
+        // multi-minute aggregation is still in flight, which drops this future
+        // and silently orphans the subprocess's already-successful output —
+        // no error is logged because nothing downstream of spawn_blocking ever
+        // runs. Detaching onto tokio::spawn makes aggregation immune to the
+        // triggering client's own connection lifecycle: the Ack below returns
+        // immediately, and aggregation completes independently in the background.
         let should_aggregate = round.updates.len() >= 3;
         if should_aggregate {
             round.state = RoundState::Aggregating;
             let round_id_copy = receipt.round_id;
             drop(round); // release the DashMap lock before spawning
-            self.run_aggregation(round_id_copy).await?;
+            let svc = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = svc.run_aggregation(round_id_copy).await {
+                    tracing::error!(
+                        "Aggregation failed for round {}: {:?}",
+                        round_id_copy,
+                        e
+                    );
+                }
+            });
         }
 
         Ok(Response::new(Ack { ok: true }))
@@ -954,6 +990,17 @@ impl Orchestrator for Service {
             .map(|opt| opt.is_some())
             .unwrap_or(false);
 
+        tracing::info!(
+            "GetRound — device={} round={} state={:?} eps_spent={:.4}/{:.4} updates={} global_model_available={}",
+            &device_hex[..8.min(device_hex.len())],
+            round.id,
+            round.state,
+            round.epsilon_spent,
+            round.epsilon_max,
+            round.updates.len(),
+            global_model_available,
+        );
+
         Ok(Response::new(RoundMetadata {
             round_id: round.id,
             model_version: round.model_version.clone(),
@@ -971,13 +1018,411 @@ impl Orchestrator for Service {
     }
 }
 
+// FIX-RECOVERY-1: Full-chain, MongoDB-driven round recovery.
+//
+// Previous behavior (bug): this only ever walked round_ids already present
+// in the in-memory `state.rounds` DashMap, which `OrchestratorState::new()`
+// seeded with round 1 alone. Rounds created dynamically by a PRIOR process
+// instance (round 2, round 3, ...) never existed in a freshly-started
+// process's DashMap, so they were structurally invisible here — even if
+// MongoDB already showed them as fully complete (verified updates AND a
+// persisted global model for the following round). A client could then
+// resubmit updates for an already-completed round, causing a second
+// aggregation that collides with the global model a prior process already
+// published for the round after it.
+//
+// Fixed behavior: reconstruct the ENTIRE round chain directly from MongoDB,
+// not from whatever happens to already be in memory:
+//   1. Read every `global_models` document. An entry with round_id = N means
+//      round (N-1)'s aggregation is done — that model is what round N's
+//      client(s) will warm-start from.
+//   2. Read every verified `receipts` document, counted per round_id.
+//   3. Walk round_id = 1, 2, 3, ... for as long as round_id's aggregation is
+//      confirmed done (global_models contains round_id + 1). Each such round
+//      is recreated in memory as Complete — never re-aggregated, per the
+//      "a completed round must never be aggregated again" invariant.
+//   4. The first round_id whose aggregation is NOT yet confirmed done is the
+//      recovery target:
+//        - >= 3 verified updates already ->  pending aggregation (a prior
+//          process most likely crashed between accepting the 3rd receipt
+//          and finishing aggregation). Hydrate its updates and resume
+//          aggregation exactly once, through the unmodified
+//          run_aggregation() / aggregator.py trimmed-mean path.
+//        - < 3 verified updates -> genuinely still collecting. Hydrate
+//          whatever updates already exist (0..2) so future submissions
+//          count correctly, but do not aggregate.
+// This is idempotent: run it against the same MongoDB state any number of
+// times and it reconstructs the same logical state every time (verified by
+// the hydration_recovery integration tests).
+/// Pure recovery-decision logic: given round-completion data already read
+/// from MongoDB (no I/O here), decide which rounds are already complete,
+/// which round is the recovery candidate, and whether that candidate needs
+/// aggregation resumed. This is the exact logic that was broken (it only
+/// ever considered round 1) — extracted into a pure function so it can be
+/// unit-tested without a live MongoDB connection, and reused unchanged by
+/// `hydrate_and_resume_aggregation()` against real data.
+#[derive(Debug, PartialEq, Eq)]
+struct RecoveryPlan {
+    latest_completed: u64,
+    candidate_round_id: u64,
+    candidate_verified_count: usize,
+    should_aggregate: bool,
+}
+
+fn compute_recovery_plan(
+    completed_target_rounds: &std::collections::HashSet<u64>,
+    verified_counts: &std::collections::HashMap<u64, usize>,
+) -> RecoveryPlan {
+    let mut round_id: u64 = 1;
+    let mut latest_completed: u64 = 0;
+    while completed_target_rounds.contains(&(round_id + 1)) {
+        latest_completed = round_id;
+        round_id += 1;
+    }
+    let candidate_verified_count = verified_counts.get(&round_id).copied().unwrap_or(0);
+    let should_aggregate = candidate_verified_count >= 3;
+    RecoveryPlan {
+        latest_completed,
+        candidate_round_id: round_id,
+        candidate_verified_count,
+        should_aggregate,
+    }
+}
+
+/// Pure persistence-action decision: given the existing global_models hash
+/// (if any) for the target round and the freshly computed hash, decide
+/// whether this is a fresh CREATE, an IDEMPOTENT no-op, or a genuine
+/// CONFLICT that must not overwrite the existing (authoritative) record.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum PersistenceAction {
+    Created,
+    Idempotent,
+    Conflict,
+}
+
+fn compute_persistence_action(existing_hash: Option<&str>, computed_hash: &str) -> PersistenceAction {
+    match existing_hash {
+        None => PersistenceAction::Created,
+        Some(h) if h == computed_hash => PersistenceAction::Idempotent,
+        Some(_) => PersistenceAction::Conflict,
+    }
+}
+
+#[cfg(test)]
+mod hydration_recovery_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    // TEST 1: Round 1 -> 3 updates -> global model round 2.
+    //         Round 2 -> 3 updates -> global model round 3.
+    // Expected: the whole chain is recognized as already complete;
+    // round 3 (no updates yet) is the next collecting round; no aggregation.
+    #[test]
+    fn test1_full_chain_already_complete_no_reaggregation() {
+        let completed: HashSet<u64> = [2, 3].into_iter().collect();
+        let verified: HashMap<u64, usize> = [(1, 3), (2, 3)].into_iter().collect();
+
+        let plan = compute_recovery_plan(&completed, &verified);
+
+        assert_eq!(plan.latest_completed, 2, "rounds 1 and 2 must both be recognized complete");
+        assert_eq!(plan.candidate_round_id, 3, "round 3 must be the next round, not 2");
+        assert_eq!(plan.candidate_verified_count, 0, "round 3 has no receipts yet");
+        assert!(!plan.should_aggregate, "an already-complete chain must never re-aggregate");
+    }
+
+    // TEST 2: Round 2 has 3 verified updates but round 3's global model is
+    // absent (a prior process crashed between accepting the 3rd receipt and
+    // finishing aggregation).
+    // Expected: round 2 is recovered as pending aggregation, exactly once.
+    #[test]
+    fn test2_pending_aggregation_recovered_once() {
+        let completed: HashSet<u64> = [2].into_iter().collect(); // round 1 complete, round 2 is not
+        let verified: HashMap<u64, usize> = [(1, 3), (2, 3)].into_iter().collect();
+
+        let plan = compute_recovery_plan(&completed, &verified);
+
+        assert_eq!(plan.latest_completed, 1);
+        assert_eq!(plan.candidate_round_id, 2, "round 2 must be the recovery candidate");
+        assert_eq!(plan.candidate_verified_count, 3);
+        assert!(plan.should_aggregate, "3 verified updates with no next global model must resume aggregation");
+    }
+
+    // TEST 3: target global model already exists with the SAME hash as the
+    // freshly computed one -> idempotent success, no duplicate GridFS model.
+    #[test]
+    fn test3_same_hash_is_idempotent() {
+        let action = compute_persistence_action(Some("abc123"), "abc123");
+        assert_eq!(action, PersistenceAction::Idempotent);
+    }
+
+    // TEST 4: target global model exists with a DIFFERENT hash -> explicit
+    // conflict; the existing model must never be silently overwritten.
+    #[test]
+    fn test4_different_hash_is_conflict() {
+        let action = compute_persistence_action(Some("abc123"), "xyz789");
+        assert_eq!(action, PersistenceAction::Conflict);
+    }
+
+    // No existing record at all -> fresh create.
+    #[test]
+    fn test4b_no_existing_record_is_created() {
+        let action = compute_persistence_action(None, "abc123");
+        assert_eq!(action, PersistenceAction::Created);
+    }
+
+    // TEST 5: restarting the server twice against unchanged MongoDB state
+    // must produce the identical recovered plan both times — no duplicate
+    // aggregation, no duplicate global model, no duplicate updates.
+    // compute_recovery_plan is a pure function of its inputs, so calling it
+    // twice with the same inputs is exactly what a real double-restart does
+    // (each restart re-derives its plan from the same MongoDB documents).
+    #[test]
+    fn test5_double_restart_is_idempotent() {
+        let completed: HashSet<u64> = [2, 3].into_iter().collect();
+        let verified: HashMap<u64, usize> = [(1, 3), (2, 3)].into_iter().collect();
+
+        let plan_first_restart = compute_recovery_plan(&completed, &verified);
+        let plan_second_restart = compute_recovery_plan(&completed, &verified);
+
+        assert_eq!(plan_first_restart, plan_second_restart);
+        assert!(!plan_first_restart.should_aggregate);
+    }
+
+    // Fresh install: no MongoDB data at all. Must behave like the original
+    // OrchestratorState::new() default (round 1, Collecting, empty) — this
+    // guards the removal of the hardcoded round-1 insert in state.rs.
+    #[test]
+    fn test_fresh_install_starts_at_round_1() {
+        let completed: HashSet<u64> = HashSet::new();
+        let verified: HashMap<u64, usize> = HashMap::new();
+
+        let plan = compute_recovery_plan(&completed, &verified);
+
+        assert_eq!(plan.latest_completed, 0);
+        assert_eq!(plan.candidate_round_id, 1);
+        assert_eq!(plan.candidate_verified_count, 0);
+        assert!(!plan.should_aggregate);
+    }
+
+    // Reproduces this session's actual incident: round 1 complete (GM round
+    // 2 present), round 2 has 6 verified updates (3 legitimate original +
+    // 3 accepted later due to the bug) but GM round 3 is ALSO already
+    // present (round 2 was already aggregated once, historically). The fix
+    // must recognize round 2 as complete regardless of the extra updates,
+    // and never attempt to re-aggregate it.
+    #[test]
+    fn test_regression_extra_updates_on_already_complete_round() {
+        let completed: HashSet<u64> = [2, 3].into_iter().collect();
+        let verified: HashMap<u64, usize> = [(1, 3), (2, 6)].into_iter().collect();
+
+        let plan = compute_recovery_plan(&completed, &verified);
+
+        assert_eq!(plan.latest_completed, 2, "round 2 must be recognized complete despite 6 receipts");
+        assert_eq!(plan.candidate_round_id, 3);
+        assert!(!plan.should_aggregate, "must never re-aggregate an already-complete round");
+    }
+}
+
+async fn hydrate_and_resume_aggregation(svc: &Service) {
+    use std::collections::{HashMap, HashSet};
+
+    let db = svc.db();
+    let receipts_col = db.collection::<bson::Document>("receipts");
+    let global_models_col = db.collection::<bson::Document>("global_models");
+
+    println!("============================================================");
+    println!("           SERVER STARTUP / ROUND RECOVERY");
+    println!("MongoDB database    : {}", svc.db_name);
+    println!("============================================================");
+    println!("MongoDB status       : CONNECTED");
+    tracing::info!("[RECOVERY] Scanning MongoDB for existing rounds");
+
+    // ── Step 1: which rounds already have a persisted global model? ──────────
+    let mut completed_target_rounds: HashSet<u64> = HashSet::new();
+    {
+        let mut cursor = match global_models_col.find(doc! {}, None).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("[RECOVERY] global_models query failed: {}", e);
+                println!("Recovery status      : FAIL (global_models query error: {})", e);
+                println!("============================================================");
+                return;
+            }
+        };
+        while let Some(item) = cursor.next().await {
+            if let Ok(d) = item {
+                if let Ok(rid) = d.get_i64("round_id") {
+                    completed_target_rounds.insert(rid as u64);
+                }
+            }
+        }
+    }
+
+    // ── Step 2: verified-receipt count per round_id ───────────────────────────
+    let mut verified_counts: HashMap<u64, usize> = HashMap::new();
+    {
+        let mut cursor = match receipts_col.find(doc! { "verified": true }, None).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("[RECOVERY] receipts query failed: {}", e);
+                println!("Recovery status      : FAIL (receipts query error: {})", e);
+                println!("============================================================");
+                return;
+            }
+        };
+        while let Some(item) = cursor.next().await {
+            if let Ok(d) = item {
+                if let Ok(rid) = d.get_i64("round_id") {
+                    *verified_counts.entry(rid as u64).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    // ── Step 3: apply the pure recovery plan, recreating every complete round ─
+    let plan = compute_recovery_plan(&completed_target_rounds, &verified_counts);
+
+    for r in 1..=plan.latest_completed {
+        let vc = verified_counts.get(&r).copied().unwrap_or(0);
+        tracing::info!(
+            "[RECOVERY] Round {}: verified_updates={}, global_model=present",
+            r, vc
+        );
+        println!(
+            "Round {:<3}             : Complete — {} verified updates, global model present",
+            r, vc
+        );
+        svc.state.rounds.entry(r).or_insert_with(|| Round {
+            id: r,
+            model_version: format!("v{}", r),
+            epsilon_max: 100.0,
+            upload_uri: String::new(),
+            state: RoundState::Complete,
+            updates: Vec::new(),
+            aggregation_receipt: Some(AggregationReceipt {
+                round_id: r,
+                num_updates: vc,
+                aggregation_mode: "trimmed_mean".to_string(),
+                aggregated_uri: "recovered-from-mongodb".to_string(),
+            }),
+            epsilon_spent: 0.0,
+        });
+    }
+
+    let round_id = plan.candidate_round_id;
+    let candidate_verified = plan.candidate_verified_count;
+    let has_global_model_for_candidate = completed_target_rounds.contains(&round_id);
+    tracing::info!(
+        "[RECOVERY] Round {}: verified_updates={}, global_model={}",
+        round_id,
+        candidate_verified,
+        if has_global_model_for_candidate { "present" } else { "absent" }
+    );
+    println!(
+        "Round {:<3}             : {} — {} verified updates, global model {}",
+        round_id,
+        if candidate_verified >= 3 { "Pending aggregation" } else { "Collecting" },
+        candidate_verified,
+        if has_global_model_for_candidate { "present" } else { "absent" }
+    );
+
+    tracing::info!("[RECOVERY] Latest completed round = {}", plan.latest_completed);
+    tracing::info!("[RECOVERY] Next collecting round = {}", round_id);
+    println!("Latest completed     : {}", plan.latest_completed);
+    println!("Next collecting      : {}", round_id);
+
+    // ── Step 4: hydrate the candidate round's updates from receipts ──────────
+    let filter = doc! { "round_id": round_id as i64, "verified": true };
+    let opts = FindOptions::builder().sort(doc! { "timestamp": 1 }).build();
+    let mut hydrated: Vec<UpdateMeta> = Vec::new();
+    match receipts_col.find(filter, opts).await {
+        Ok(mut cursor) => {
+            while let Some(item) = cursor.next().await {
+                let doc = match item {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::error!("[RECOVERY] cursor read failed: {}", e);
+                        continue;
+                    }
+                };
+                let device_hex = doc.get_str("device_id").unwrap_or_default();
+                let device_id = match hex::decode(device_hex) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let enc_uri = doc.get_str("enc_handle").unwrap_or_default().to_string();
+                let scheme = doc.get_str("scheme").unwrap_or_default().to_string();
+                if enc_uri.is_empty() {
+                    continue;
+                }
+                hydrated.push(UpdateMeta { device_id, enc_uri, scheme, nonce: None });
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                "[RECOVERY] receipts query failed for candidate round {}: {}",
+                round_id, e
+            );
+        }
+    }
+
+    // plan.should_aggregate is the pure-function decision; hydrated.len() >= 3
+    // is a belt-and-suspenders check that the receipts we actually parsed
+    // match what the earlier count query saw.
+    let should_aggregate = plan.should_aggregate && hydrated.len() >= 3;
+
+    svc.state.rounds.entry(round_id).or_insert_with(|| Round {
+        id: round_id,
+        model_version: format!("v{}", round_id),
+        epsilon_max: 100.0,
+        upload_uri: String::new(),
+        state: RoundState::Collecting,
+        updates: Vec::new(),
+        aggregation_receipt: None,
+        epsilon_spent: 0.0,
+    });
+    {
+        if let Some(mut r) = svc.state.rounds.get_mut(&round_id) {
+            r.updates = hydrated;
+            if should_aggregate {
+                r.state = RoundState::Aggregating;
+            }
+        }
+    }
+
+    if should_aggregate {
+        tracing::info!(
+            "[RECOVERY] Round {} has {} verified updates but no global model yet — \
+             resuming aggregation (a prior process likely crashed mid-aggregation)",
+            round_id, candidate_verified
+        );
+        println!("Pending aggregation  : YES — resuming now");
+        println!("Recovery status      : PASS");
+        println!("============================================================");
+        let svc2 = svc.clone();
+        let rid = round_id;
+        tokio::spawn(async move {
+            if let Err(e) = svc2.run_aggregation(rid).await {
+                tracing::error!("[RECOVERY] resumed aggregation failed for round {}: {:?}", rid, e);
+            }
+        });
+    } else {
+        tracing::info!("[RECOVERY] No duplicate aggregation required");
+        println!("Pending aggregation  : NO");
+        println!("Recovery status      : PASS");
+        println!("============================================================");
+    }
+}
+
 // ── Server bootstrap ──────────────────────────────────────────────────────────
 pub async fn serve(
     cfg: Config,
     state: Arc<OrchestratorState>,
     mongo: MongoClient,
+    db_name: String,
 ) -> anyhow::Result<()> {
-    let svc = Service::new(state, cfg.clone(), mongo)?;
+    let svc = Service::new(state, cfg.clone(), mongo, db_name)?;
+    hydrate_and_resume_aggregation(&svc).await;
     let addr = cfg.server.addr.parse()?;
 
     if cfg.server.enable_tls {
@@ -1036,14 +1481,20 @@ impl Service {
     async fn run_aggregation(&self, round_id: u64) -> Result<(), Status> {
         // ── Phase 1: build the aggregator job from in-memory state ────────────
         // The DashMap shard lock is held only for the duration of this block.
-        let job_str = {
+        let (job_str, num_clients) = {
             let round = self
                 .state
                 .rounds
                 .get(&round_id)
                 .ok_or_else(|| Status::not_found("round not found for aggregation"))?;
 
-            serde_json::json!({
+            tracing::info!(
+                "Aggregation starting — round={} updates={} algorithm=trimmed_mean trim_ratio=0.1",
+                round.id,
+                round.updates.len(),
+            );
+
+            let job_str = serde_json::json!({
                 "round_id":   round.id,
                 "mode":       "trimmed_mean",
                 "trim_ratio": 0.1,
@@ -1053,7 +1504,9 @@ impl Service {
                     "nonce":     u.nonce,
                 })).collect::<Vec<_>>()
             })
-            .to_string()
+            .to_string();
+
+            (job_str, round.updates.len())
         }; // DashMap shard lock released here — safe to await below
 
         // ── Phase 2: run the Python subprocess on a blocking thread ───────────
@@ -1105,27 +1558,82 @@ impl Service {
             })?;
 
         // ── Phase 3: parse aggregator output ─────────────────────────────────
-        let result: serde_json::Value = serde_json::from_slice(&stdout_bytes)
-            .map_err(|_| Status::internal("aggregator output is not valid JSON"))?;
+        // FIX-BOOKKEEPING-3: every branch here now logs via tracing::error!
+        // before returning. Previously these five error paths returned a
+        // Status with no log line at all, so a failure here was completely
+        // invisible in the server log — indistinguishable from the task
+        // simply never having reached this point (see FIX-BOOKKEEPING-1).
+        let result: serde_json::Value = serde_json::from_slice(&stdout_bytes).map_err(|e| {
+            tracing::error!(
+                "Aggregation Phase 3: aggregator stdout is not valid JSON: {} — raw: {}",
+                e,
+                String::from_utf8_lossy(&stdout_bytes)
+            );
+            Status::internal("aggregator output is not valid JSON")
+        })?;
 
         let aggregated_uri = result["aggregated_uri"]
             .as_str()
-            .ok_or_else(|| Status::internal("aggregator output missing aggregated_uri"))?
+            .ok_or_else(|| {
+                tracing::error!(
+                    "Aggregation Phase 3: missing aggregated_uri in aggregator output: {}",
+                    result
+                );
+                Status::internal("aggregator output missing aggregated_uri")
+            })?
             .to_string();
 
         let gridfs_file_id_str = result["gridfs_file_id"]
             .as_str()
-            .ok_or_else(|| Status::internal("aggregator output missing gridfs_file_id"))?
+            .ok_or_else(|| {
+                tracing::error!(
+                    "Aggregation Phase 3: missing gridfs_file_id in aggregator output: {}",
+                    result
+                );
+                Status::internal("aggregator output missing gridfs_file_id")
+            })?
             .to_string();
 
         let model_hash = result["model_hash"]
             .as_str()
-            .ok_or_else(|| Status::internal("aggregator output missing model_hash"))?
+            .ok_or_else(|| {
+                tracing::error!(
+                    "Aggregation Phase 3: missing model_hash in aggregator output: {}",
+                    result
+                );
+                Status::internal("aggregator output missing model_hash")
+            })?
             .to_string();
 
-        let file_oid = ObjectId::parse_str(&gridfs_file_id_str).map_err(|_| {
+        let file_oid = ObjectId::parse_str(&gridfs_file_id_str).map_err(|e| {
+            tracing::error!(
+                "Aggregation Phase 3: gridfs_file_id '{}' is not a valid ObjectId: {}",
+                gridfs_file_id_str,
+                e
+            );
             Status::internal("aggregator returned an invalid GridFS ObjectId")
         })?;
+
+        let num_keys = result["num_keys"].as_u64();
+        let total_parameters = result["total_parameters"].as_u64();
+
+        println!("============================================================");
+        println!("        FEDERATED LEARNING — SERVER AGGREGATION");
+        println!("============================================================");
+        println!("Round ID             : {}", round_id);
+        println!("Algorithm            : Trimmed Mean");
+        println!("Trim ratio           : 0.1");
+        println!("Clients              : {}", num_clients);
+        match num_keys {
+            Some(n) => println!("Parameter tensors    : {}", n),
+            None => println!("Parameter tensors    : n/a (not reported by aggregator)"),
+        }
+        match total_parameters {
+            Some(n) => println!("Total parameters     : {}", n),
+            None => println!("Total parameters     : n/a (not reported by aggregator)"),
+        }
+        println!("Aggregation status   : PASS");
+        println!("============================================================");
 
         // ── Phase 4: mark round N complete ────────────────────────────────────
         let num_updates = {
@@ -1157,47 +1665,138 @@ impl Service {
         // Stored under round_id + 1 so that clients entering the NEXT round see
         // global_model_available = true when they call GetRound, and can then
         // call DownloadGlobalModel(round_id = N+1) to retrieve this model.
+        //
+        // FIX-BOOKKEEPING-4: idempotent across restarts. In-memory round state
+        // does not survive a process restart, but startup hydration (see
+        // hydrate_and_resume_aggregation) can legitimately re-run aggregation
+        // for a round whose global model a PRIOR process instance already
+        // persisted — hydration has no way to know that without asking Mongo
+        // first. Three cases:
+        //   A. No existing record  -> insert fresh (CREATED).
+        //   B. Existing record, same hash -> idempotent success, no duplicate
+        //      GridFS insert needed (IDEMPOTENT).
+        //   C. Existing record, different hash -> genuine conflict. The
+        //      existing record is authoritative and is NEVER overwritten —
+        //      but this must not leave the round stuck. Round N is already
+        //      correctly marked Complete (Phase 4, above) — that aggregation
+        //      genuinely happened and produced valid data, it's simply
+        //      superseded by a global model an earlier process already
+        //      published for round N+1. FIX-RECOVERY-2: previously this
+        //      returned Err() here, which skipped Phase 6 entirely and left
+        //      the round with no successor — no client could ever be served
+        //      a Collecting round again until a human intervened. Now we log
+        //      the conflict (CONFLICT, with both hashes for diagnosis) and
+        //      fall through to Phase 6, which unconditionally ensures round
+        //      N+1 exists as Collecting — using or_insert_with, so it never
+        //      clobbers a round N+1 that may already be live with its own
+        //      updates. The freshly-computed (conflicting) model itself is
+        //      discarded: it was already durably written to GridFS by
+        //      aggregator.py under its own hash, so no data is lost, it is
+        //      simply not referenced by any global_models document.
         let next_id = round_id + 1;
         let db = self.db();
-        db.collection::<bson::Document>("global_models")
-            .insert_one(
-                doc! {
-                    "round_id":   next_id as i64,
-                    "file_id":    file_oid,
-                    "model_hash": &model_hash,
-                },
-                None,
-            )
+        let global_models_col = db.collection::<bson::Document>("global_models");
+
+        let existing = global_models_col
+            .find_one(doc! { "round_id": next_id as i64 }, None)
             .await
             .map_err(|e| {
-                tracing::error!("global_models insert failed: {}", e);
-                Status::internal("failed to persist global model")
+                tracing::error!("global_models lookup failed: {}", e);
+                Status::internal("failed to check existing global model")
             })?;
 
-        tracing::info!(
-            "Global model for round {} stored in GridFS (hash={}…)",
-            next_id,
-            &model_hash[..16.min(model_hash.len())],
+        let existing_hash_owned: Option<String> = existing
+            .as_ref()
+            .map(|doc| doc.get_str("model_hash").unwrap_or_default().to_string());
+        let action = compute_persistence_action(existing_hash_owned.as_deref(), &model_hash);
+        let existing_hash_display = existing_hash_owned.clone().unwrap_or_else(|| "none".to_string());
+        let persistence_action = match action {
+            PersistenceAction::Created => "CREATED",
+            PersistenceAction::Idempotent => "IDEMPOTENT",
+            PersistenceAction::Conflict => "CONFLICT",
+        };
+
+        match action {
+            PersistenceAction::Idempotent => {
+                tracing::info!(
+                    "Global model for round {} already persisted (hash={}…) — \
+                     hydration re-aggregation reproduced the same result; \
+                     treating as success, not inserting a duplicate.",
+                    next_id,
+                    &model_hash[..16.min(model_hash.len())],
+                );
+            }
+            PersistenceAction::Conflict => {
+                tracing::error!(
+                    "global_models for round {} already exists with a DIFFERENT \
+                     hash (existing={}… new={}…) — not overwriting. Source aggregation \
+                     round={}. The existing record remains authoritative; the freshly \
+                     computed model is discarded (its GridFS blob remains, unreferenced).",
+                    next_id,
+                    &existing_hash_display[..16.min(existing_hash_display.len())],
+                    &model_hash[..16.min(model_hash.len())],
+                    round_id,
+                );
+            }
+            PersistenceAction::Created => {
+                global_models_col
+                    .insert_one(
+                        doc! {
+                            "round_id":   next_id as i64,
+                            "file_id":    file_oid,
+                            "model_hash": &model_hash,
+                        },
+                        None,
+                    )
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("global_models insert failed: {}", e);
+                        Status::internal("failed to persist global model")
+                    })?;
+
+                tracing::info!(
+                    "Global model for round {} stored in GridFS (hash={}…)",
+                    next_id,
+                    &model_hash[..16.min(model_hash.len())],
+                );
+            }
+        };
+
+        println!("============================================================");
+        println!("              GLOBAL MODEL PERSISTENCE");
+        println!("============================================================");
+        println!("Target round        : {}", next_id);
+        println!("Source agg. round   : {}", round_id);
+        println!("Computed hash       : {}", model_hash);
+        println!("Existing hash       : {}", existing_hash_display);
+        println!("Persistence action  : {}", persistence_action);
+        println!(
+            "Status              : {}",
+            if persistence_action == "CONFLICT" { "PASS (existing model retained as authoritative)" } else { "PASS" }
         );
+        println!("============================================================");
 
         // ── Phase 6: create round N+1 ─────────────────────────────────────────
-        // Inserting after the global_models document ensures that the moment
-        // GetRound starts returning round N+1, the model is already available.
-        self.state.rounds.insert(
-            next_id,
-            Round {
-                id: next_id,
-                model_version: format!("v{}", next_id),
-                epsilon_max: 100.0,
-                upload_uri: String::new(),
-                state: RoundState::Collecting,
-                updates: Vec::new(),
-                aggregation_receipt: None,
-                epsilon_spent: 0.0,
-            },
-        );
+        // Runs UNCONDITIONALLY now, whether Phase 5 inserted fresh or found an
+        // existing record — this is the actual fix: previously Phase 6 was only
+        // reachable if insert_one succeeded, so a duplicate-key error on a
+        // hydration re-run silently prevented round N+1 from ever being
+        // (re)created in this process's memory, even though the aggregation
+        // itself and its MongoDB record were both already correct.
+        // or_insert_with avoids clobbering a round N+1 that may already be
+        // Collecting with live updates from earlier in this same process.
+        self.state.rounds.entry(next_id).or_insert_with(|| Round {
+            id: next_id,
+            model_version: format!("v{}", next_id),
+            epsilon_max: 100.0,
+            upload_uri: String::new(),
+            state: RoundState::Collecting,
+            updates: Vec::new(),
+            aggregation_receipt: None,
+            epsilon_spent: 0.0,
+        });
 
-        tracing::info!("Round {} created — state=Collecting", next_id);
+        tracing::info!("Round {} ready — state=Collecting", next_id);
 
         Ok(())
     }

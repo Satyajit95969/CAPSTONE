@@ -22,6 +22,7 @@ from typing import Optional, Dict, Any
 
 from core.centralised_receipts import CentralReceiptManager
 from core.centralized_secure_store import SecureStore
+from core import reporting as rpt
 
 from installer.security.integrity import integrity_guard
 integrity_guard()
@@ -151,6 +152,7 @@ class DPAgent:
         parent_receipt_uri: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ):
+        ts_start = time.time()
         metadata = metadata or {}
         assert local_update_uri.startswith("file://"), "Expected file:// URI"
         path = local_update_uri[len("file://"):]
@@ -174,14 +176,39 @@ class DPAgent:
 
         flat, meta = self.flatten_state_dict(state_dict)
         l2_before  = float(torch.norm(flat, p=2).item()) if flat.numel() > 0 else 0.0
+        param_count = flat.numel()
 
+        rpt.subheader("DP INPUT UPDATE")
+        rpt.kv("Parameter count", f"{param_count:,}", indent=2)
+        rpt.kv("L2 norm before DP", f"{l2_before:.6f}", indent=2)
+
+        clip_factor = 1.0
         clipped = False
         if flat.numel() > 0 and l2_before > self.clip:
-            flat    = flat * (self.clip / (l2_before + 1e-12))
+            clip_factor = self.clip / (l2_before + 1e-12)
+            flat    = flat * clip_factor
             clipped = True
+
+        rpt.subheader("STEP 1 - CLIPPING")
+        rpt.kv("Clipping threshold", self.clip, indent=2)
+        rpt.kv("Clipping applied", clipped, indent=2)
+        rpt.kv("Clipping factor", f"{clip_factor:.6f}", indent=2)
+        l2_post_clip = float(torch.norm(flat, p=2).item()) if flat.numel() > 0 else 0.0
+        rpt.kv("L2 norm after clip", f"{l2_post_clip:.6f}", indent=2)
 
         noisy    = self.add_noise(flat, sensitivity=1.0)
         l2_after = float(torch.norm(noisy, p=2).item()) if noisy.numel() > 0 else 0.0
+        noise_norm = float(torch.norm(noisy - flat, p=2).item()) if noisy.numel() > 0 else 0.0
+
+        rpt.subheader("STEP 2 - NOISE")
+        rpt.kv("Mechanism", self.mechanism, indent=2)
+        rpt.kv("Noise multiplier (sigma)", self.noise_multiplier, indent=2)
+        rpt.kv("Noise dimension", f"{param_count:,}", indent=2)
+        rpt.kv("Noise norm (added)", f"{noise_norm:.6f}", indent=2)
+
+        rpt.subheader("STEP 3 - NOISE ADDITION")
+        rpt.kv("Original norm (pre-clip)", f"{l2_before:.6f}", indent=2)
+        rpt.kv("Private update norm (post clip+noise)", f"{l2_after:.6f}", indent=2)
 
         noisy_sd = self.unflatten_state_dict(noisy, meta)
         out_buf  = io.BytesIO()
@@ -201,6 +228,13 @@ class DPAgent:
         else:
             # Non-Gaussian mechanisms: use a conservative upper bound
             epsilon_spent = float("inf") if self.mechanism == "none" else 10.0
+
+        rpt.subheader("STEP 4 - PRIVACY ACCOUNTING")
+        rpt.kv("Delta (δ)", self.delta, indent=2)
+        rpt.kv("Epsilon (ε)", f"{epsilon_spent:.6f}" if math.isfinite(epsilon_spent) else "inf", indent=2)
+        rpt.kv("Accounting method", "RDP (Mironov 2017), single composition T=1", indent=2)
+        rpt.kv("DP execution time", f"{(time.time() - ts_start):.4f} sec", indent=2)
+        rpt.ok("Differential privacy applied")
 
         receipt = self.rm.create_receipt(
             agent="dp-agent",
