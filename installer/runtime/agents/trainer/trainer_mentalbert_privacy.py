@@ -58,6 +58,15 @@ LOCAL_SAVE_DIR.mkdir(parents=True, exist_ok=True)
 # generic fallback for any other caller that doesn't pass max_len explicitly.
 MULTIMODAL_MAX_LEN = int(os.environ.get("MULTIMODAL_MAX_LEN", "512"))
 
+# Fix B (CLAUDE.md defect #1): the text encoder (109,482,240 of 109,763,494
+# params, 99.76%) is frozen so it is never trained, never diffed, never
+# DP-noised, and never transmitted. DP noise grows as sqrt(param count); this
+# cuts the noised surface from ~110M to 281,254 params (audio_encoder +
+# vision_encoder + fusion), without touching noise_multiplier or the RDP
+# accounting - the privacy guarantee is unchanged. Default true; set to
+# "0"/"false" for an unfrozen A/B comparison run.
+FREEZE_TEXT_ENCODER = os.environ.get("FREEZE_TEXT_ENCODER", "true").strip().lower() not in ("0", "false", "no", "")
+
 # Safety hyperparameters (tunable)
 DEFAULT_MAX_PARAM_CHANGE = 1e-3        # per-parameter absolute clamp on delta
 DEFAULT_MAX_GLOBAL_DELTA_NORM = 1.0   # max L2 norm of delta state (after per-param clamp will be scaled down to this)
@@ -428,7 +437,11 @@ def run_inference(model: MultiModalModel, dataloader: DataLoader, device: str = 
 def fine_tune_supervised(model: MultiModalModel, dataset: MultiModalDataset, epochs: int = 1, batch_size: int = 8, lr: float = 2e-5, device: str = DEFAULT_DEVICE):
     model.to(device)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_batch)
-    optimizer = AdamW(model.parameters(), lr=lr)
+    # Fix B: only trainable (requires_grad=True) params get an optimizer slot.
+    # Frozen params (the text encoder, when FREEZE_TEXT_ENCODER=true) never
+    # receive gradients anyway, but excluding them here is explicit rather
+    # than relying on AdamW silently no-op'ing on grad=None params.
+    optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=lr)
     cls_loss_fn = nn.CrossEntropyLoss()
     reg_loss_fn = nn.MSELoss()
 
@@ -468,7 +481,11 @@ def train_model(dataset: MultiModalDataset, model: MultiModalModel,
     model.to(device)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_batch)
 
-    optimizer = AdamW(model.parameters(), lr=lr)
+    # Fix B: only trainable (requires_grad=True) params get an optimizer slot.
+    # Frozen params (the text encoder, when FREEZE_TEXT_ENCODER=true) never
+    # receive gradients anyway, but excluding them here is explicit rather
+    # than relying on AdamW silently no-op'ing on grad=None params.
+    optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=lr)
     cls_loss_fn = nn.CrossEntropyLoss()
     reg_loss_fn = nn.MSELoss()
 
@@ -598,7 +615,11 @@ def rl_update_reinforce(model: MultiModalModel, dataset: MultiModalDataset, epoc
     """
     model.to(device)
     loader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=collate_batch)  # sample-level for RL
-    optimizer = AdamW(model.parameters(), lr=lr)
+    # Fix B: only trainable (requires_grad=True) params get an optimizer slot.
+    # Frozen params (the text encoder, when FREEZE_TEXT_ENCODER=true) never
+    # receive gradients anyway, but excluding them here is explicit rather
+    # than relying on AdamW silently no-op'ing on grad=None params.
+    optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=lr)
     baseline = MovingBaseline(momentum=0.9)
     model.train()
 
@@ -651,6 +672,76 @@ def compute_state_delta(before: Dict[str, torch.Tensor], after: Dict[str, torch.
             delta[k] = (after[k].detach().cpu() - before[k].detach().cpu()).clone()
         else:
             delta[k] = after[k].detach().cpu().clone()
+    return delta
+
+
+# Fix B: sanity ceiling for the trainable-delta param count. Real ceiling is
+# audio_encoder + vision_encoder + fusion = 281,254 params (measured); this
+# constant is intentionally looser so it doesn't need updating for small
+# architecture tweaks, while still catching the failure mode that matters -
+# the text encoder (109,482,240 params) ending up in the delta because the
+# freeze or the filter silently stopped working.
+_TRAINABLE_DELTA_PARAM_CEILING = 1_000_000
+
+
+def compute_filtered_delta(
+    base_state: Dict[str, torch.Tensor],
+    after: Dict[str, torch.Tensor],
+    model: "MultiModalModel",
+) -> Dict[str, torch.Tensor]:
+    """
+    Fix B: restrict the delta to trainable parameters only.
+
+    state_dict() always returns every parameter regardless of requires_grad -
+    setting requires_grad_(False) on the text encoder does NOT by itself
+    shrink the delta, the DP noise surface, or the upload payload. This is
+    the actual filter: the trainable key set is derived fresh from
+    model.named_parameters() (never a hardcoded key list or string-prefix
+    match), so it automatically tracks whatever is actually frozen right now.
+
+    Fails loudly (AssertionError) rather than silently drifting if:
+      - the resulting delta contains any key outside the trainable set, or
+      - the resulting delta is missing any trainable key, or
+      - the delta's total param count exceeds a sanity ceiling while
+        FREEZE_TEXT_ENCODER is enabled (the text encoder ending up in the
+        delta despite the freeze being "on").
+
+    model.state_dict() has zero non-parameter buffers in this architecture
+    (verified empirically: state_dict().keys() == named_parameters() keys,
+    215 == 215 for the full model) - audio_encoder/vision_encoder/fusion are
+    plain Linear/ReLU/Dropout stacks with no BatchNorm/LayerNorm running
+    stats and no registered buffers, so named_parameters()-based filtering
+    captures 100% of what these submodules need. If a future architecture
+    change adds a buffer to a trainable submodule, it would silently NOT
+    appear in this delta - there is no buffer-aware fallback here by design,
+    since none is currently needed.
+    """
+    trainable_keys = {n for n, p in model.named_parameters() if p.requires_grad}
+    base_trainable  = {k: v for k, v in base_state.items() if k in trainable_keys}
+    after_trainable = {k: v for k, v in after.items()      if k in trainable_keys}
+
+    delta = compute_state_delta(base_trainable, after_trainable)
+
+    delta_keys = set(delta.keys())
+    extra   = delta_keys - trainable_keys
+    missing = trainable_keys - delta_keys
+    assert not extra, (
+        f"delta contains {len(extra)} key(s) outside the trainable set - "
+        f"the trainable-key filter is broken: {sorted(extra)[:5]}"
+    )
+    assert not missing, (
+        f"delta is missing {len(missing)} trainable key(s) - a trainable "
+        f"parameter silently vanished from the delta: {sorted(missing)[:5]}"
+    )
+
+    delta_param_count = sum(v.numel() for v in delta.values())
+    if FREEZE_TEXT_ENCODER:
+        assert delta_param_count < _TRAINABLE_DELTA_PARAM_CEILING, (
+            f"delta has {delta_param_count:,} trainable params - expected "
+            f"< {_TRAINABLE_DELTA_PARAM_CEILING:,} with FREEZE_TEXT_ENCODER=true. "
+            f"The text encoder is likely not frozen."
+        )
+
     return delta
 
 def apply_safety_to_delta(delta: Dict[str, torch.Tensor], max_param_change: float = DEFAULT_MAX_PARAM_CHANGE, max_global_norm: float = DEFAULT_MAX_GLOBAL_DELTA_NORM) -> Dict[str, torch.Tensor]:
@@ -935,7 +1026,23 @@ def orchestrate(
         print("[FL] No global model — using random initialisation")
         rpt.kv("Initialization", "Random / local pretrained (no global model)")
     # ─────────────────────────────────────────────────────────────────────────
- 
+
+    # ── Fix B: freeze the text encoder ──────────────────────────────────────
+    # Applied unconditionally (independent of whether warm-start ran) so
+    # behaviour is identical on the very first round and every round after.
+    # audio_encoder + vision_encoder + fusion (281,254 params) stay trainable.
+    rpt.subheader("FIX B — TEXT ENCODER FREEZE")
+    if FREEZE_TEXT_ENCODER:
+        for p in model.bert.parameters():
+            p.requires_grad_(False)
+        frozen_now = sum(p.numel() for p in model.bert.parameters())
+        print(f"[FIX-B] Text encoder frozen: {frozen_now:,} params (FREEZE_TEXT_ENCODER=true)")
+        rpt.kv("Text encoder frozen", f"YES ({frozen_now:,} params)")
+    else:
+        print("[FIX-B] FREEZE_TEXT_ENCODER=false — full model left trainable (comparison mode)")
+        rpt.kv("Text encoder frozen", "NO (FREEZE_TEXT_ENCODER=false)")
+    # ─────────────────────────────────────────────────────────────────────────
+
     model.to(device)
     base_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
  
@@ -980,7 +1087,7 @@ def orchestrate(
         train_elapsed = time.time() - t_train0
         model.load_state_dict(torch.load(result["model_path"], map_location=device))
         after  = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-        delta  = compute_state_delta(base_state, after)
+        delta  = compute_filtered_delta(base_state, after, model)
 
         delta_norm_before = math.sqrt(sum((v.float().norm() ** 2).item() for v in delta.values()))
 
@@ -1000,7 +1107,16 @@ def orchestrate(
         for mk, mv in result["metrics"].items():
             rpt.kv(mk, f"{mv:.4f}", indent=2)
 
+        trainable_param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        frozen_param_count    = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+        delta_param_count     = sum(v.numel() for v in delta.values())
+
         rpt.subheader("DELTA / SAFETY CLAMP")
+        rpt.kv("Trainable params", f"{trainable_param_count:,}")
+        rpt.kv("Frozen params", f"{frozen_param_count:,}")
+        rpt.kv("Delta key count", len(delta))
+        rpt.kv("Delta tensor count", len(delta))
+        rpt.kv("Delta param count", f"{delta_param_count:,}")
         rpt.kv("Per-parameter clamp", f"±{max_param_change}")
         rpt.kv("Max global delta norm", max_global_norm)
         rpt.kv("Delta L2 norm before clamp", f"{delta_norm_before:.6f}")
@@ -1027,7 +1143,7 @@ def orchestrate(
                                     lr=lr, device=device,
                                     supervised_lambda=rl_supervised_lambda)
         after  = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-        delta  = compute_state_delta(base_state, after)
+        delta  = compute_filtered_delta(base_state, after, model)
         sparams = safety_params or {}
         delta_safe = apply_safety_to_delta(
             delta,
