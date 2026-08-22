@@ -68,6 +68,32 @@ MULTIMODAL_MAX_LEN = int(os.environ.get("MULTIMODAL_MAX_LEN", "512"))
 # "0"/"false" for an unfrozen A/B comparison run.
 FREEZE_TEXT_ENCODER = os.environ.get("FREEZE_TEXT_ENCODER", "true").strip().lower() not in ("0", "false", "no", "")
 
+# Fix E3, loss rebalance ONLY (lr/epochs/init untouched this step - see
+# docs/IMPLEMENTATION_NOTES.md). Two problems, measured in Step 9a:
+#   1. loss_cls vs loss_reg: unweighted CrossEntropyLoss on a 30/70 imbalance
+#      plus an MSE regression term on raw PHQ (0-23) produced a combined loss
+#      where loss_reg was 5-40x loss_cls at every step - the regression term
+#      structurally dominates the shared trunk's gradient (fc1 grad norm was
+#      5-27x more driven by phq_mu than by classifier).
+#   2. torch.nn.utils.clip_grad_norm_(..., 1.0) saturates every step (raw
+#      norms measured 1163-3291), and clipping preserves direction - so the
+#      regression-dominated direction wasn't a lr problem, it was a loss-
+#      balance problem. Fixed here; lr is Fix E4's problem, not this one.
+CLASS_WEIGHT_ENABLED = os.environ.get("CLASS_WEIGHT_ENABLED", "true").strip().lower() not in ("0", "false", "no", "")
+REG_LOSS_WEIGHT = float(os.environ.get("REG_LOSS_WEIGHT", "0.5"))
+# PHQ-8's own fixed clinical scale (8 items x 0-3 each), NOT derived from this
+# corpus's observed max (23) - using the clinical ceiling keeps the
+# normalization stable across different datasets, and gives loss_reg a
+# principled 0-1 target scale instead of raw 0-23 MSE, whose squared-error
+# magnitude was the actual cause of point 1 above. This is a scale constant,
+# not a hyperparameter meant to be swept - no env override.
+PHQ_SCALE_MAX = 24.0
+# How often (in optimizer steps) to log the loss-component and gradient-norm
+# breakdown below. This is a standing diagnostic capability now, not a one-off
+# ad hoc script - Step 9a's numbers were gathered by hand; this makes them
+# visible on every run.
+TRAIN_LOG_INTERVAL = int(os.environ.get("TRAIN_LOG_INTERVAL", "5"))
+
 # Safety hyperparameters (tunable)
 DEFAULT_MAX_PARAM_CHANGE = 1e-3        # per-parameter absolute clamp on delta
 # Fix C: recalibrated from the old dead 1.0 (never fired - observed delta L2
@@ -514,13 +540,37 @@ def train_model(dataset: MultiModalDataset, model: MultiModalModel,
     # receive gradients anyway, but excluding them here is explicit rather
     # than relying on AdamW silently no-op'ing on grad=None params.
     optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=lr)
-    cls_loss_fn = nn.CrossEntropyLoss()
+
+    # Fix E3, point 1: class weights derived from the ACTUAL dataset passed
+    # in (never hardcoded), so they stay correct if the split ever changes.
+    # Standard inverse-frequency ("balanced") scheme: weight[c] = N / (K *
+    # count[c]) - makes each class contribute equally to the expected loss,
+    # the standard correction for CrossEntropyLoss under class imbalance.
+    train_labels = [
+        1 if float((r.get("phq_score") or r.get("phq") or 0.0)) >= PHQ_POSITIVE_THRESHOLD else 0
+        for r in dataset.records
+    ]
+    n_total = len(train_labels)
+    n_pos = sum(train_labels)
+    n_neg = n_total - n_pos
+    if CLASS_WEIGHT_ENABLED and n_pos > 0 and n_neg > 0:
+        w_neg = n_total / (2.0 * n_neg)
+        w_pos = n_total / (2.0 * n_pos)
+        class_weights = torch.tensor([w_neg, w_pos], dtype=torch.float32, device=device)
+        rpt.kv("Class weights (neg, pos)", f"({w_neg:.4f}, {w_pos:.4f})  from train n_neg={n_neg} n_pos={n_pos}")
+    else:
+        class_weights = None
+        rpt.kv("Class weights", "disabled (CLASS_WEIGHT_ENABLED=false or single-class split)")
+    cls_loss_fn = nn.CrossEntropyLoss(weight=class_weights)
     reg_loss_fn = nn.MSELoss()
 
     rpt.subheader(f"TRAINING LOOP ({epochs} epoch(s))")
+    rpt.kv("Regression loss weight (REG_LOSS_WEIGHT)", REG_LOSS_WEIGHT)
+    rpt.kv("PHQ normalization scale", PHQ_SCALE_MAX)
     model.train()
     final_avg_loss = None
     _shapes_printed = False
+    global_step = 0
     for epoch in range(epochs):
         total_loss = 0.0
         for b in loader:
@@ -540,12 +590,45 @@ def train_model(dataset: MultiModalDataset, model: MultiModalModel,
             logits, reg_pred, _ = model(b["input_ids"], b["attention_mask"],
                                         audio_vec=b.get("audio_vec"), vision_vec=b.get("video_vec"))
             loss_cls = cls_loss_fn(logits, b["label"])
-            loss_reg = reg_loss_fn(reg_pred, b["phq"])
-            loss = loss_cls + 0.5 * loss_reg
+            # Fix E3, point 2: MSE computed in normalized (phq/24) space, not
+            # raw 0-23 PHQ units - raw-scale MSE is what produced the 5-40x
+            # dominance measured in Step 9a. Normalizing by the fixed clinical
+            # scale (not this corpus's observed max) is the principled fix
+            # the coefficient below no longer has to compensate for a unit
+            # mismatch, only for genuine task-importance weighting.
+            loss_reg = reg_loss_fn(reg_pred / PHQ_SCALE_MAX, b["phq"] / PHQ_SCALE_MAX)
+            loss_reg_weighted = REG_LOSS_WEIGHT * loss_reg
+            loss = loss_cls + loss_reg_weighted
             loss.backward()
+
+            # Fix E3, point 4: standing instrumentation (was ad hoc in Step
+            # 9a). Gradient norms captured BEFORE clip_grad_norm_ - post-clip
+            # they are uniformly rescaled to 1.0 and uninformative.
+            if global_step == 0 or global_step % TRAIN_LOG_INTERVAL == 0:
+                fc1_grad_norm = model.fusion.fc1.weight.grad.norm().item() if model.fusion.fc1.weight.grad is not None else float("nan")
+                classifier_grad_norm = model.fusion.classifier.weight.grad.norm().item() if model.fusion.classifier.weight.grad is not None else float("nan")
+                phq_mu_grad_norm = model.fusion.phq_mu.weight.grad.norm().item() if model.fusion.phq_mu.weight.grad is not None else float("nan")
+                print(
+                    f"[train_model] step={global_step} "
+                    f"loss_cls={loss_cls.item():.4f} "
+                    f"loss_reg(unweighted,norm)={loss_reg.item():.4f} "
+                    f"loss_reg(weighted)={loss_reg_weighted.item():.4f} "
+                    f"fc1_grad_norm={fc1_grad_norm:.4f} "
+                    f"classifier_grad_norm={classifier_grad_norm:.4f} "
+                    f"phq_mu_grad_norm={phq_mu_grad_norm:.4f}"
+                )
+                rpt.kv(
+                    f"step {global_step}",
+                    f"loss_cls={loss_cls.item():.4f} loss_reg(unweighted)={loss_reg.item():.4f} "
+                    f"loss_reg(weighted)={loss_reg_weighted.item():.4f} "
+                    f"fc1_grad={fc1_grad_norm:.4f} cls_grad={classifier_grad_norm:.4f} phq_mu_grad={phq_mu_grad_norm:.4f}",
+                    indent=2,
+                )
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             total_loss += loss.item()
+            global_step += 1
         final_avg_loss = total_loss / len(loader)
         print(f"[train_model] epoch {epoch+1}/{epochs} avg_loss={final_avg_loss:.4f}")
         rpt.kv(f"Epoch {epoch+1}/{epochs} average loss", f"{final_avg_loss:.4f}", indent=2)
