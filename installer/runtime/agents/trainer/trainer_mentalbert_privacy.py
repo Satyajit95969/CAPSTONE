@@ -23,6 +23,7 @@ import sys
 import json
 import argparse
 import math
+import random
 import time
 import tempfile
 from pathlib import Path
@@ -484,14 +485,29 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support, mea
 def train_model(dataset: MultiModalDataset, model: MultiModalModel,
                 output_dir: str = "./trainer_outputs",
                 epochs: int = 5, batch_size: int = 8, lr: float = 2e-5,
-                device: str = DEFAULT_DEVICE):
+                device: str = DEFAULT_DEVICE,
+                eval_dataset: Optional[MultiModalDataset] = None):
     """
     Complete supervised fine-tuning on labeled PHQ data + evaluation + explainability.
     Produces model weights, metrics.json, and explain.txt.
+
+    Fix E2: `dataset` is the TRAINING split only. If `eval_dataset` is given,
+    metrics (accuracy/precision/recall/F1/MAE) are computed on it instead of
+    on `dataset` - evaluating on training data is not a defensible measurement
+    of anything. `eval_dataset=None` is a backward-compatible fallback for any
+    other caller (there is currently exactly one call site, in orchestrate(),
+    which always passes eval_dataset - see the stratified split below).
     """
     os.makedirs(output_dir, exist_ok=True)
     model.to(device)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_batch)
+    # Fix E2: separate, non-shuffled loader over the held-out split. Falls
+    # back to the training loader only if no eval split was provided at all
+    # (keeps this function usable standalone without forcing a split).
+    eval_loader = (
+        DataLoader(eval_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_batch)
+        if eval_dataset is not None else loader
+    )
 
     # Fix B: only trainable (requires_grad=True) params get an optimizer slot.
     # Frozen params (the text encoder, when FREEZE_TEXT_ENCODER=true) never
@@ -534,12 +550,12 @@ def train_model(dataset: MultiModalDataset, model: MultiModalModel,
         print(f"[train_model] epoch {epoch+1}/{epochs} avg_loss={final_avg_loss:.4f}")
         rpt.kv(f"Epoch {epoch+1}/{epochs} average loss", f"{final_avg_loss:.4f}", indent=2)
 
-    # ---------- Evaluation ----------
+    # ---------- Evaluation (Fix E2: on the held-out split, never on `loader`) ----------
     model.eval()
     y_true_cls, y_pred_cls = [], []
     y_true_phq, y_pred_phq = [], []
     with torch.no_grad():
-        for b in loader:
+        for b in eval_loader:
             b = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in b.items()}
             logits, reg_pred, _ = model(b["input_ids"], b["attention_mask"],
                                         audio_vec=b.get("audio_vec"), vision_vec=b.get("video_vec"))
@@ -755,6 +771,56 @@ def compute_filtered_delta(
         )
 
     return delta
+
+
+# Fix E2: fraction of each class held out for evaluation, and the fixed seed
+# that makes the split reproducible. Both intentionally module-level
+# constants rather than buried literals, so they're visible and overridable
+# the same way the other Fix A/B/C/D knobs are.
+EVAL_SPLIT_FRACTION = 0.2
+EVAL_SPLIT_SEED = 42
+
+
+def stratified_split(
+    records: List[Dict[str, Any]],
+    test_frac: float = EVAL_SPLIT_FRACTION,
+    seed: int = EVAL_SPLIT_SEED,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Fix E2: deterministic, seeded, stratified train/eval split.
+
+    Splits `records` into (train_records, eval_records), preserving the
+    positive/negative ratio (label = phq_score >= PHQ_POSITIVE_THRESHOLD) in
+    BOTH splits independently - each class's indices are shuffled separately
+    under the same fixed seed before slicing, so the minority (positive)
+    class isn't at the mercy of a single global shuffle landing badly.
+
+    Deterministic by construction: same records + same seed always produces
+    the identical split. This is required, not incidental - every client
+    currently loads the same shared parquet (see orchestrate()'s docstring
+    disclosures elsewhere in this project), so a non-deterministic split
+    would make one run's numbers incomparable to the next, and in any future
+    genuinely-partitioned multi-client scenario would risk different clients
+    drawing different train/eval boundaries over data they happen to share.
+
+    Must be called AFTER label assembly (every record needs a real, final
+    phq_score already set) - never before.
+    """
+    pos_idx = [i for i, r in enumerate(records) if float(r["phq_score"]) >= PHQ_POSITIVE_THRESHOLD]
+    neg_idx = [i for i, r in enumerate(records) if float(r["phq_score"]) < PHQ_POSITIVE_THRESHOLD]
+
+    rng = random.Random(seed)
+    rng.shuffle(pos_idx)
+    rng.shuffle(neg_idx)
+
+    n_pos_eval = max(1, round(len(pos_idx) * test_frac)) if pos_idx else 0
+    n_neg_eval = max(1, round(len(neg_idx) * test_frac)) if neg_idx else 0
+
+    eval_idx = set(pos_idx[:n_pos_eval]) | set(neg_idx[:n_neg_eval])
+    train_records = [r for i, r in enumerate(records) if i not in eval_idx]
+    eval_records  = [r for i, r in enumerate(records) if i in eval_idx]
+    return train_records, eval_records
+
 
 def apply_safety_to_delta(delta: Dict[str, torch.Tensor], max_param_change: float = DEFAULT_MAX_PARAM_CHANGE, max_global_norm: float = DEFAULT_MAX_GLOBAL_DELTA_NORM) -> Dict[str, torch.Tensor]:
     # per-parameter clamp
@@ -1175,15 +1241,46 @@ def orchestrate(
                 f"explicit physician correction."
             )
 
+        # Fix E2: stratified, seeded, deterministic train/eval split. Must run
+        # after label assembly (above) so it splits on final, real labels.
+        train_records, eval_records = stratified_split(records)
+        train_pos = sum(1 for r in train_records if float(r["phq_score"]) >= PHQ_POSITIVE_THRESHOLD)
+        train_neg = len(train_records) - train_pos
+        eval_pos  = sum(1 for r in eval_records if float(r["phq_score"]) >= PHQ_POSITIVE_THRESHOLD)
+        eval_neg  = len(eval_records) - eval_pos
+
+        rpt.subheader("TRAIN/EVAL SPLIT (Fix E2)")
+        rpt.kv("Split fraction (eval)", EVAL_SPLIT_FRACTION)
+        rpt.kv("Split seed", EVAL_SPLIT_SEED)
+        rpt.kv("Train size", f"{len(train_records)}  (positive={train_pos}, negative={train_neg})")
+        rpt.kv("Eval size", f"{len(eval_records)}  (positive={eval_pos}, negative={eval_neg})")
+
+        # Fix E2: fail loudly rather than silently evaluate (or train) on a
+        # single-class split - this is a real risk on a small, imbalanced
+        # corpus and must be caught before it can produce another
+        # undefined-metric collapse.
+        assert train_pos > 0 and train_neg > 0, (
+            f"Train split has collapsed to a single class "
+            f"(positive={train_pos}, negative={train_neg}, n={len(train_records)}) - "
+            f"stratified_split() failed to preserve both classes."
+        )
+        assert eval_pos > 0 and eval_neg > 0, (
+            f"Eval split has collapsed to a single class "
+            f"(positive={eval_pos}, negative={eval_neg}, n={len(eval_records)}) - "
+            f"stratified_split() failed to preserve both classes."
+        )
+
         rpt.subheader("SUPERVISED FINE-TUNING")
         rpt.kv("Epochs", epochs)
         rpt.kv("Batch size", batch_size)
         rpt.kv("Learning rate", lr)
         rpt.kv("Optimizer", "AdamW")
         t_train0 = time.time()
-        ds_sup = MultiModalDataset(records, tokenizer, max_len=MULTIMODAL_MAX_LEN)
+        ds_sup  = MultiModalDataset(train_records, tokenizer, max_len=MULTIMODAL_MAX_LEN)
+        ds_eval = MultiModalDataset(eval_records, tokenizer, max_len=MULTIMODAL_MAX_LEN)
         result = train_model(ds_sup, model, output_dir=str(LOCAL_SAVE_DIR),
-                             epochs=epochs, batch_size=batch_size, lr=lr, device=device)
+                             epochs=epochs, batch_size=batch_size, lr=lr, device=device,
+                             eval_dataset=ds_eval)
         train_elapsed = time.time() - t_train0
         model.load_state_dict(torch.load(result["model_path"], map_location=device))
         after  = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
