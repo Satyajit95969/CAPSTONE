@@ -851,8 +851,24 @@ def modality_ablation_importance(model: MultiModalModel, sample_batch: Dict[str,
 # ---------- Physician CLI for supervised correction ----------
 PHQ_POSITIVE_THRESHOLD = 10.0  # matches label = 1 if phq_val >= 10.0 in MultiModalDataset
 
-def physician_feedback_cli(preds: List[Dict[str, Any]], texts: List[str]) -> List[float]:
+def physician_feedback_cli(preds: List[Dict[str, Any]], texts: List[str]) -> Tuple[List[float], List[bool]]:
+    """
+    Returns (corrected, provided_by_physician) - two parallel lists.
+
+    corrected[i] is the value to use if the caller decides to apply it:
+    the physician's typed number when they entered one, otherwise the
+    model's own pre-training prediction (the only sane value to show/log,
+    NOT a claim about ground truth).
+
+    provided_by_physician[i] is True only when the physician typed a value
+    that parsed as a float - i.e. an explicit, real correction. It is False
+    for blank input AND for invalid/unparseable input. Fix E1: this flag is
+    what the caller (orchestrate()) uses to distinguish "a human actually
+    corrected this" from "nothing was entered" - the caller must never treat
+    the fallback corrected[i] value (model's own guess) as a real label.
+    """
     corrected = []
+    provided_by_physician = []
     rpt.header("PHYSICIAN FEEDBACK LOOP")
     for i, (p, t) in enumerate(zip(preds, texts)):
         snippet = (t or "")[:260].replace("\n", " ")
@@ -870,19 +886,21 @@ def physician_feedback_cli(preds: List[Dict[str, Any]], texts: List[str]) -> Lis
             try:
                 corrected_val = float(val)
                 corrected.append(corrected_val)
-                applied = corrected_val != p["pred_phq"]
+                provided_by_physician.append(True)
                 rpt.kv("Physician correction", f"{corrected_val:.2f}", indent=2)
+                rpt.kv("Correction applied", "YES", indent=2)
             except:
                 print("invalid -> keeping model value")
                 corrected.append(float(p["pred_phq"]))
-                applied = False
+                provided_by_physician.append(False)
                 rpt.kv("Physician correction", "invalid input, discarded", indent=2)
+                rpt.kv("Correction applied", "NO", indent=2)
         else:
             corrected.append(float(p["pred_phq"]))
-            applied = False
+            provided_by_physician.append(False)
             rpt.kv("Physician correction", "Not provided", indent=2)
-        rpt.kv("Correction applied", "YES" if applied else "NO", indent=2)
-    return corrected
+            rpt.kv("Correction applied", "NO", indent=2)
+    return corrected, provided_by_physician
 
 
 # ---------- Orchestrator ----------
@@ -1083,10 +1101,80 @@ def orchestrate(
         return {"inference_uri": out_uri, "receipt_uri": ruri, "explainability": explanations}
  
     elif mode == "supervised":
-        texts         = [r.get("transcript") or r.get("text") or "" for r in records]
-        corrected_phq = physician_feedback_cli(preds, texts)
-        for r, cp in zip(records, corrected_phq):
-            r["phq_score"] = float(cp)
+        texts = [r.get("transcript") or r.get("text") or "" for r in records]
+
+        # Fix E1: snapshot ground-truth presence and the parquet's real
+        # label distribution BEFORE anything can be mutated, so the
+        # assertion below has an independent baseline to check against.
+        had_ground_truth = [r.get("phq_score") is not None for r in records]
+        parquet_snapshot = [float(r["phq_score"]) if r.get("phq_score") is not None else None for r in records]
+        parquet_positive_count = sum(1 for v in parquet_snapshot if v is not None and v >= PHQ_POSITIVE_THRESHOLD)
+        parquet_negative_count = sum(1 for v in parquet_snapshot if v is not None and v < PHQ_POSITIVE_THRESHOLD)
+
+        corrected_phq, provided_by_physician = physician_feedback_cli(preds, texts)
+
+        # Fix E1: this loop is the actual bug fix. The old code unconditionally
+        # did `r["phq_score"] = float(cp)` for every record, and cp defaults to
+        # the model's own pre-training prediction whenever the physician left
+        # the prompt blank (physician_feedback_cli's fallback) - which silently
+        # replaced the real PHQ-8 label with the model's untrained guess on
+        # every automated run (there is no human in this loop). Every metric
+        # this project has reported to date was measured against those
+        # self-referential fabricated labels, not the corpus.
+        #
+        # Fix: apply cp only when it represents a genuine input - either an
+        # explicit physician correction (always respected, even overriding
+        # real ground truth - this preserves the correction feature), or the
+        # model's own fallback ONLY when there was no ground truth to begin
+        # with (mirrors the RL branch's need_cli guard a few dozen lines
+        # down). A record that already has a real label and gets blank
+        # physician input keeps its real label, full stop.
+        label_source = []   # "parquet" | "physician" | "model-fallback", per record
+        n_physician_corrections = 0
+        for i, r in enumerate(records):
+            if provided_by_physician[i]:
+                r["phq_score"] = float(corrected_phq[i])
+                label_source.append("physician")
+                n_physician_corrections += 1
+            elif had_ground_truth[i]:
+                label_source.append("parquet")   # untouched - this is the fix
+            else:
+                r["phq_score"] = float(corrected_phq[i])
+                label_source.append("model-fallback")
+
+        rpt.subheader("LABEL SOURCE (Fix E1)")
+        rpt.kv("From parquet (ground truth preserved)", label_source.count("parquet"))
+        rpt.kv("From physician (explicit correction)", label_source.count("physician"))
+        rpt.kv("From model fallback (no ground truth, no correction)", label_source.count("model-fallback"))
+        rpt.kv("Physician corrections applied", n_physician_corrections)
+
+        final_positive = sum(1 for r in records if float(r["phq_score"]) >= PHQ_POSITIVE_THRESHOLD)
+        final_negative = len(records) - final_positive
+        rpt.kv("Final label distribution: positive", final_positive)
+        rpt.kv("Final label distribution: negative", final_negative)
+
+        # Fix E1: fail loudly, before training, if labels have collapsed to a
+        # single class - this must never again be able to happen silently.
+        assert final_positive > 0 and final_negative > 0, (
+            f"Label set has collapsed to a single class going into training "
+            f"(positive={final_positive}, negative={final_negative}, "
+            f"n={len(records)}) - this is exactly the Fix E1 regression this "
+            f"assertion exists to catch."
+        )
+        # When nothing legitimately altered the labels (no physician
+        # corrections, no model-fallback records - i.e. every record had
+        # real ground truth and kept it), the final distribution must match
+        # the parquet's own distribution exactly.
+        if n_physician_corrections == 0 and label_source.count("model-fallback") == 0:
+            assert final_positive == parquet_positive_count and final_negative == parquet_negative_count, (
+                f"Label distribution drifted from the parquet with zero "
+                f"physician corrections and zero model-fallback labels "
+                f"applied: final=({final_positive} pos / {final_negative} neg), "
+                f"parquet=({parquet_positive_count} pos / {parquet_negative_count} neg). "
+                f"Real ground truth is being altered somewhere other than an "
+                f"explicit physician correction."
+            )
+
         rpt.subheader("SUPERVISED FINE-TUNING")
         rpt.kv("Epochs", epochs)
         rpt.kv("Batch size", batch_size)
@@ -1144,7 +1232,12 @@ def orchestrate(
         texts    = [r.get("transcript") or r.get("text") or "" for r in records]
         need_cli = not any(r.get("phq_score") is not None for r in records)
         if need_cli:
-            corrected_phq = physician_feedback_cli(preds, texts)
+            # Fix E1 changed physician_feedback_cli()'s return signature to a
+            # (values, provided_by_physician) tuple; this branch only runs
+            # when NO record has ground truth (need_cli guard above), so
+            # there is nothing to protect and the second element is unused
+            # here - unlike the supervised branch below.
+            corrected_phq, _provided_by_physician = physician_feedback_cli(preds, texts)
             for r, cp in zip(records, corrected_phq):
                 r["phq_score"] = float(cp)
         else:
