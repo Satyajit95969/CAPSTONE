@@ -49,6 +49,15 @@ DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 LOCAL_SAVE_DIR = Path.home() / ".federated" / "data" / "secure_store"
 LOCAL_SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
+# Fix A: tokenizer truncation window. Was hardcoded to MultiModalDataset's
+# class default of 128 (see class below), which - even after removing
+# interviewer text - discarded ~95% of participant speech (median session is
+# ~1,460 tokens). 512 is BERT/MentalBERT's absolute positional-embedding
+# ceiling, not a full fix, but the largest value this architecture supports.
+# Overridable per-run; MultiModalDataset's own default is left at 128 as a
+# generic fallback for any other caller that doesn't pass max_len explicitly.
+MULTIMODAL_MAX_LEN = int(os.environ.get("MULTIMODAL_MAX_LEN", "512"))
+
 # Safety hyperparameters (tunable)
 DEFAULT_MAX_PARAM_CHANGE = 1e-3        # per-parameter absolute clamp on delta
 DEFAULT_MAX_GLOBAL_DELTA_NORM = 1.0   # max L2 norm of delta state (after per-param clamp will be scaled down to this)
@@ -847,7 +856,7 @@ def orchestrate(
     print(f"[info] loaded {len(records)} records")
  
     tokenizer = AutoTokenizer.from_pretrained(MENTALBERT_PRETRAIN)
-    ds        = MultiModalDataset(records, tokenizer)
+    ds        = MultiModalDataset(records, tokenizer, max_len=MULTIMODAL_MAX_LEN)
  
     # infer modality dims
     audio_dim  = None
@@ -965,7 +974,7 @@ def orchestrate(
         rpt.kv("Learning rate", lr)
         rpt.kv("Optimizer", "AdamW")
         t_train0 = time.time()
-        ds_sup = MultiModalDataset(records, tokenizer)
+        ds_sup = MultiModalDataset(records, tokenizer, max_len=MULTIMODAL_MAX_LEN)
         result = train_model(ds_sup, model, output_dir=str(LOCAL_SAVE_DIR),
                              epochs=epochs, batch_size=batch_size, lr=lr, device=device)
         train_elapsed = time.time() - t_train0
@@ -1013,7 +1022,7 @@ def orchestrate(
         else:
             for r in records:
                 r["phq_score"] = float(r.get("phq_score") or r.get("phq") or 0.0)
-        ds_rl = MultiModalDataset(records, tokenizer)
+        ds_rl = MultiModalDataset(records, tokenizer, max_len=MULTIMODAL_MAX_LEN)
         model = rl_update_reinforce(model, ds_rl, epochs=epochs, batch_size=1,
                                     lr=lr, device=device,
                                     supervised_lambda=rl_supervised_lambda)

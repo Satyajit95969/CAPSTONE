@@ -67,8 +67,14 @@ MAX_EPS_VALUE = 10.0               # hard ceiling — server rejects > this
 #   subdirectory below branch on it.
 PIPELINE_MODE = os.environ.get("PIPELINE_MODE", "text").strip().lower()
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_MULTIMODAL_PARQUET = _REPO_ROOT / "dataset_build" / "daic_records_multimodal.parquet"
-_MULTIMODAL_MAX_SAMPLES = int(os.environ.get("MULTIMODAL_MAX_SAMPLES", "1"))
+# Fix A: participant-only text (Ellie's interviewer script filtered out at
+# source - see scripts/rebuild_participant_only_parquet.py). The original
+# dataset_build/daic_records_multimodal.parquet is left untouched.
+_MULTIMODAL_PARQUET = _REPO_ROOT / "dataset_build" / "daic_records_multimodal_participant_only.parquet"
+# Fix D: "0" (or unset) is an explicit no-limit sentinel - load the full local
+# partition. Truncation is opt-in (set MULTIMODAL_MAX_SAMPLES to a positive
+# int) rather than opt-out, so a smoke test has to ask for it explicitly.
+_MULTIMODAL_MAX_SAMPLES = int(os.environ.get("MULTIMODAL_MAX_SAMPLES", "0"))
 
 
 # ── Schema validation (unchanged) ─────────────────────────────────────────────
@@ -342,7 +348,8 @@ def run_pipeline(
         rpt.header("MULTIMODAL INPUT ANALYSIS")
         rpt.kv("Source", str(_MULTIMODAL_PARQUET))
         rpt.kv("Total rows in dataset", _total_rows)
-        rpt.kv("Rows used this round", _MULTIMODAL_MAX_SAMPLES)
+        _rows_used = _total_rows if not _MULTIMODAL_MAX_SAMPLES else min(_MULTIMODAL_MAX_SAMPLES, _total_rows)
+        rpt.kv("Rows used this round", _rows_used)
         rpt.line()
         rpt.line("TEXT INPUT")
         rpt.kv("Status", "AVAILABLE", indent=2)
