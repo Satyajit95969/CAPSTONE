@@ -579,3 +579,76 @@ growing. Classification stability here was bought at a measurable, growing
 cost to PHQ regression accuracy. `REG_LOSS_WEIGHT` (env, default 0.5) is the
 existing knob if regression performance is ever prioritised - not changed
 here, recorded only.
+
+---
+
+## Step 17 — ARM 2 with LR decay: DP utility does not recover, and the
+## noise/signal ratio gets WORSE, not better (2026-08-23)
+
+Re-ran the Step 14 ARM 2 trajectory (DP, noise_multiplier=1.0, mean
+aggregation, seed=303) with `LR_DECAY=0.7` (Step 16's default), identical to
+Step 14 in every other respect - no tuning, no code changes for this step.
+
+| round | eff. lr | Step 14 F1 (no decay) | Step 17 F1 (decay) | pred+/37 | this-round delta L2 | cumulative delta L2 | per-round eps | cumulative eps (naive bound) |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 1.00e-4 | 0 | 0 | 0/37 | 260.36 | 260.36 | 5.302585 | 5.302585 |
+| 2 | 7.00e-5 | 0 | 0.4583 | 37/37 | 260.76 | 368.65 | 5.302585 | 10.605170 |
+| 3 | 4.90e-5 | 0 | 0 | 0/37 | 260.58 | 451.45 | 5.302585 | 15.907755 |
+| 4 | 3.43e-5 | 0 | 0 | 0/37 | 259.72 | 520.89 | 5.302585 | 21.210340 |
+| 5 | 2.40e-5 | 0 | 0 | 0/37 | 259.99 | 582.32 | 5.302585 | 26.512925 |
+
+Every round: `prob_positive_distribution.stdev = 0.0`, min=max (exactly 0.0
+in 4 rounds, exactly 1.0 in round 2) - full saturation every round, never
+genuine discrimination. Round 2's F1=0.4583 is the SAME "predict everyone
+positive" collapse mode seen throughout this investigation whenever DP noise
+dominates - not recovered utility. Which of the two degenerate modes
+(all-positive vs all-negative) the saturated noise lands on a given round is
+effectively arbitrary.
+
+**Headline finding - a structural tension, not merely an explanation for why
+utility didn't recover.** The fix that stabilises multi-round training
+(Step 16's LR decay - shrink the step size every round so the model stops
+overwriting a good solution) and what DP-SGD viability requires under this
+project's round-decayed FedAvg (signal growing, or at least holding steady,
+relative to a fixed per-round noise floor) **point in opposite directions.**
+LR decay is not incidental to this tension - it is the mechanism that
+creates it: decaying lr is precisely shrinking the local training movement
+each round, and DP noise is added downstream of training at a scale
+(`noise_multiplier x clip_norm`) that has no dependence on lr, training
+movement, or round number whatsoever. Any fix for training-side divergence
+that works by damping local movement over rounds - decay is the most
+standard, but the same argument applies to shorter per-round training,
+smaller batch counts, or anything else that shrinks the per-round delta -
+will, by construction, widen the noise-to-signal gap a fixed-scale DP
+mechanism has to overcome, at exactly the low client counts (n=3, mean
+aggregation's only real denoising lever) this project runs at. This is a
+structural property of combining round-decayed FedAvg convergence fixes with
+a fixed-scale per-round DP mechanism at low client counts, not an artifact
+of this session's specific numbers - it would recur with any other decay
+schedule, and is worth stating as its own, independent finding.
+
+**The expected interaction, quantified**: this-round delta L2 stays flat at
+~260 every round (260.36, 260.76, 260.58, 259.72, 259.99) - DP noise scale
+(`noise_multiplier x clip_norm = 0.85`) is entirely independent of the raw
+signal's magnitude (the pre-noise delta, ~0.6, never approaches the
+clip_norm=0.85 threshold regardless of lr, so clipping stays inert and lr
+has zero effect on the noised output's scale). Meanwhile ARM 1 with the same
+decay shrank its this-round delta from 0.576 to 0.173 (Step 15/16 section).
+The per-round noise-to-signal ratio, using ARM 1-with-decay's this-round
+delta as the signal proxy: 452.0x (round 1) -> 622.3x -> 822.1x -> 1114.7x
+-> 1503.4x (round 5) - **the ratio gets WORSE, not better**, the opposite
+direction from Step 14's no-decay trend (447.7x -> 217.9x, improving via
+sqrt(r) noise accumulation vs linear signal accumulation - see Step 14's
+section). Cumulative delta L2 still matches `sqrt(r) x 260.36` to within
+0.3% at every round, confirming the random-walk noise-accumulation mechanism
+is unaffected by LR decay, exactly as expected since decay only touches the
+signal component.
+
+**Answer**: with the multi-round divergence fixed (Step 16), DP utility does
+NOT recover across 5 rounds at noise_multiplier=1.0. Worse: the mechanism
+that might have helped it recover (noise/signal ratio improving with
+rounds, established in Step 14) is actively defeated by the same fix that
+stabilised the no-privacy baseline - LR decay shrinks signal every round
+while the DP noise floor stays fixed, so the ratio moves in the wrong
+direction. This is a null result. Nothing was tuned to change it, per
+instruction.
