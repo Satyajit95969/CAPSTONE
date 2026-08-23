@@ -141,6 +141,28 @@ Verify the cert if you want a second, independent check:
 & "C:\Program Files\Git\mingw64\bin\openssl.exe" verify -CAfile "server\orchestration_agent\certs\ca.pem" "$env:USERPROFILE\.federated\keys\client.pem"
 ```
 
+**Troubleshooting: enrollment OTP timeout.** `enroll_step5.py` reads the OTP
+from whichever orchestrator log PATH is passed to it as an argument, and
+gives up after 15 seconds if the OTP doesn't appear AFTER the file position
+it recorded the moment it started (so it never matches a stale OTP already
+sitting earlier in the file). Three common causes, in order of likelihood:
+1. **Terminal 2 is writing to a different log filename than the one you
+   passed to `enroll_step5.py`** — check the path in both commands character
+   for character; a typo or a leftover path from a previous session is the
+   usual culprit.
+2. **The orchestrator has been running for more than 10 minutes** — the OTP
+   it printed at startup has expired. Restart Terminal 2's orchestrator to
+   get a fresh one, then enroll immediately.
+3. **A database reset happened without the mandatory orchestrator restart**
+   (see Terminal 1's warning above) — the orchestrator's in-memory OTP may
+   no longer correspond to what `RequestEnrollment` expects.
+
+Fix, every time: stop the orchestrator (Terminal 2, Ctrl+C or
+`Stop-Process`), reset (Terminal 1), restart the orchestrator (Terminal 2),
+**watch the log for the `[DEV] Enrollment OTP` line to actually appear**
+before doing anything else, confirm it's the same log path you're about to
+pass to `enroll_step5.py`, then enroll promptly.
+
 ---
 
 ## TERMINAL 4 — client 1 run, client 2 run, client 3 run
@@ -149,15 +171,32 @@ Aggregation requires **3 accepted updates** (`round.updates.len() >= 3`). Run al
 sequentially, in this same terminal, waiting for each to print
 `Run-once pipeline complete` before starting the next.
 
-**Physician-feedback prompt — read before running.** The supervised training path
-prompts once per record for an optional physician correction (`PHYSICIAN FEEDBACK
-LOOP`), and it does this for **all 186 records in the parquet, every client run** —
-not just ones missing a label. Every record in this corpus already carries a real
-PHQ-8 ground-truth label (Fix E1), so a blank response at every prompt is exactly
-correct — it keeps the real label. Piping a single blank line (as the old runbook
-did with `"" | ...`) is **not enough** and will crash with an `EOFError` partway
-through the first client's run. Create a file with enough blank lines once, then pipe
-it into all three client runs:
+**Three modes, pick one before you start** (Step 20/21 added modes B and C —
+sharding stays **default OFF** in the code itself; these are runbook-level env
+vars only, nothing in `trainer_mentalbert_privacy.py` changed):
+
+| | What it demonstrates | Trade-off |
+|---|---|---|
+| **A — Full** (default, no env vars) | The pipeline mechanics end-to-end | Higher F1, but all 3 "clients" train on the identical 149-record split — **not federation**, one dataset submitted three times |
+| **B — Sharded** | Genuine federation — each client gets its own disjoint data | Lower F1 (~15 positive examples per client) — see the honest disclosure below before you show this |
+| **C — Non-IID** | Genuine client heterogeneity, the precondition for testing FedProx | Same data-volume cost as B, plus a deliberately skewed split |
+
+Run **all three clients in the SAME mode** — mixing modes within one round
+produces a meaningless aggregate (the clients wouldn't even agree on how the
+data was supposed to be divided). Start with Mode A — it matches every prior
+measurement in this project and is the safer default to walk through first.
+
+**Physician-feedback prompt — read before running, applies to every mode.** The
+supervised training path prompts once per record for an optional physician
+correction (`PHYSICIAN FEEDBACK LOOP`), and it does this for **all 186 records
+in the parquet, every client run** — not just ones missing a label (sharding
+only changes which of those 186 get *trained on*; the prompt loop itself
+always runs over all 186). Every record in this corpus already carries a real
+PHQ-8 ground-truth label (Fix E1), so a blank response at every prompt is
+exactly correct — it keeps the real label. Piping a single blank line (as the
+old runbook did with `"" | ...`) is **not enough** and will crash with an
+`EOFError` partway through the first client's run. Create the blank-stdin file
+once, before whichever mode you run:
 ```powershell
 Set-Location "D:\Download D\BE PIPELINE\Capstone-"
 $env:PATH = "C:\Program Files\Git\mingw64\bin;" + $env:PATH
@@ -167,7 +206,11 @@ $env:PYTHONUTF8 = "1"
 if (-not (Test-Path "trainer_outputs\demo_blank_stdin.txt")) {
     1..260 | ForEach-Object { "" } | Out-File -FilePath "trainer_outputs\demo_blank_stdin.txt" -Encoding utf8
 }
+```
 
+### MODE A — Full (default, no env vars)
+
+```powershell
 # Client 1
 Get-Content "trainer_outputs\demo_blank_stdin.txt" | & ".venv\Scripts\python.exe" "run_client_multimodal.py" *>&1 | Tee-Object -FilePath "trainer_outputs\demo_client_run1.log"
 
@@ -178,7 +221,7 @@ Get-Content "trainer_outputs\demo_blank_stdin.txt" | & ".venv\Scripts\python.exe
 Get-Content "trainer_outputs\demo_blank_stdin.txt" | & ".venv\Scripts\python.exe" "run_client_multimodal.py" *>&1 | Tee-Object -FilePath "trainer_outputs\demo_client_run3.log"
 ```
 
-**Expected values — use these to tell a good run from a bad one:**
+**Expected values (Mode A) — use these to tell a good run from a bad one:**
 
 | Quantity | Expected value | Where it appears in the log |
 |---|---|---|
@@ -188,7 +231,8 @@ Get-Content "trainer_outputs\demo_blank_stdin.txt" | & ".venv\Scripts\python.exe
 | **Trainable** parameters | **281,254** | `FIX B — TEXT ENCODER FREEZE` (the number that actually gets trained/DP-noised/uploaded — not the 109.7M total) |
 | Frozen parameters | 109,482,240 | same section |
 | Round-1 effective learning rate | 1e-4 (0.0001) | `STEP 16 — ROUND-AWARE LR DECAY` (round_id=1 → decay factor 1.0, unaffected) |
-| Delta L2 norm (pre-clip, pre-DP) | ~0.55 – 0.68 | `DELTA / SAFETY CLAMP` → "Delta L2 norm before clamp" |
+| Partition mode | `full` (`CLIENT_SHARD_ID`/`CLIENT_N_SHARDS` unset — every client trains on all 149) | `STEP 20 — CLIENT DATA PARTITION` |
+| Delta L2 norm (pre-clip, pre-DP) | ~0.55 – 0.68 (measured: ~0.63) | `DELTA / SAFETY CLAMP` → "Delta L2 norm before clamp" |
 | Safety clamp engagement | should NOT engage | no `[SAFETY-CLAMP] ... ENGAGED` line anywhere in the log |
 | DP clipping applied | **False** (0.55–0.68 is below the 0.85 clip threshold) | `STEP 1 - CLIPPING` |
 | DP noise norm (added) | ~450 | `STEP 2 - NOISE` |
@@ -202,6 +246,128 @@ If trainable params show 109M+ instead of 281,254, `FREEZE_TEXT_ENCODER` isn't
 active — check the environment. If delta L2 is near 0 or the run trains in a handful
 of steps, `epochs`/`lr` fell back to old defaults — check `SUPERVISED_EPOCHS` /
 `SUPERVISED_LR` aren't being overridden to something stale in your shell.
+
+### MODE B — Sharded (genuine federation)
+
+Each client trains on its own disjoint, class-balanced ~50-record shard —
+`CLIENT_SHARD_ID` (0, 1, or 2) selects which shard; `CLIENT_N_SHARDS=3` and
+`CLIENT_SHARD_SEED=20240` must be identical across all three so they compute
+the same partition and each takes a genuinely different, non-overlapping
+piece of it (`stratified_shard()`, `trainer_mentalbert_privacy.py`).
+
+**⚠ PowerShell env vars persist for the rest of the session.** `$env:CLIENT_SHARD_ID
+= "0"` stays set until you change it or close the terminal — it does **not**
+reset between commands. You must set `CLIENT_SHARD_ID` again, explicitly,
+**immediately before each client's invocation**. If you forget to update it
+before client 2, client 2 will silently reuse client 1's shard — both will
+train on the same ~50 records, the third client will get a different shard,
+and the round will not be a genuine 3-way partition even though it looks
+identical to one in the logs.
+
+```powershell
+# Client 1 — shard 0
+$env:CLIENT_SHARD_ID = "0"
+$env:CLIENT_N_SHARDS = "3"
+$env:CLIENT_SHARD_SEED = "20240"
+Get-Content "trainer_outputs\demo_blank_stdin.txt" | & ".venv\Scripts\python.exe" "run_client_multimodal.py" *>&1 | Tee-Object -FilePath "trainer_outputs\demo_client_run1.log"
+
+# Client 2 — shard 1 (CLIENT_SHARD_ID MUST be changed here, every time)
+$env:CLIENT_SHARD_ID = "1"
+Get-Content "trainer_outputs\demo_blank_stdin.txt" | & ".venv\Scripts\python.exe" "run_client_multimodal.py" *>&1 | Tee-Object -FilePath "trainer_outputs\demo_client_run2.log"
+
+# Client 3 — shard 2 (CLIENT_SHARD_ID MUST be changed here, every time)
+$env:CLIENT_SHARD_ID = "2"
+Get-Content "trainer_outputs\demo_blank_stdin.txt" | & ".venv\Scripts\python.exe" "run_client_multimodal.py" *>&1 | Tee-Object -FilePath "trainer_outputs\demo_client_run3.log"
+```
+
+**Expected values (Mode B)** — measured in Step 20 Run A
+(`docs/IMPLEMENTATION_NOTES.md`, "Step 20" section), reproduced exactly by
+this seed/n_shards combination:
+
+| Client (shard) | Shard size | Class counts (pos/neg) | Achieved positive ratio | Delta L2 |
+|---|---|---|---|---|
+| 0 | 50 | 15 / 35 | 0.3000 | ~0.33 |
+| 1 | 50 | 15 / 35 | 0.3000 | ~0.37 |
+| 2 | 49 | 14 / 35 | 0.2857 | ~0.34 |
+
+Look for `STEP 20 — CLIENT DATA PARTITION` in each client's log — `Partition
+mode: iid`, and the shard/size/ratio matching its row above. **The three delta
+L2 values should DIFFER from each other** (unlike Mode A, where all three
+clients see the same 149 records) — that difference is the check that
+sharding actually took effect, not just that the env vars were accepted.
+
+### MODE C — Non-IID (optional, for showing genuine client drift)
+
+Same as Mode B, plus `CLIENT_NONIID_ALPHA=0.5` set alongside the other three
+vars for all three clients. Instead of each shard tracking the corpus's own
+~30% positive ratio, each shard's share of each class is drawn from a
+Dirichlet(alpha) distribution — a low alpha concentrates a class into fewer
+shards, producing genuinely different client distributions rather than three
+same-ratio samples of the same data. This is, as of this session, **the only
+path to genuine client heterogeneity anywhere in this system** — and the
+precondition for FedProx (its proximal term has nothing to correct without
+real non-IID divergence between clients) to ever be meaningfully testable
+here, not just mechanically runnable.
+
+```powershell
+# Client 1 — shard 0, non-IID
+$env:CLIENT_SHARD_ID = "0"
+$env:CLIENT_N_SHARDS = "3"
+$env:CLIENT_SHARD_SEED = "20240"
+$env:CLIENT_NONIID_ALPHA = "0.5"
+Get-Content "trainer_outputs\demo_blank_stdin.txt" | & ".venv\Scripts\python.exe" "run_client_multimodal.py" *>&1 | Tee-Object -FilePath "trainer_outputs\demo_client_run1.log"
+
+# Client 2 — shard 1 (CLIENT_SHARD_ID MUST be changed here, every time)
+$env:CLIENT_SHARD_ID = "1"
+Get-Content "trainer_outputs\demo_blank_stdin.txt" | & ".venv\Scripts\python.exe" "run_client_multimodal.py" *>&1 | Tee-Object -FilePath "trainer_outputs\demo_client_run2.log"
+
+# Client 3 — shard 2 (CLIENT_SHARD_ID MUST be changed here, every time)
+$env:CLIENT_SHARD_ID = "2"
+Get-Content "trainer_outputs\demo_blank_stdin.txt" | & ".venv\Scripts\python.exe" "run_client_multimodal.py" *>&1 | Tee-Object -FilePath "trainer_outputs\demo_client_run3.log"
+```
+
+**Expected values (Mode C, alpha=0.5)** — measured in Step 20 Run B
+(`docs/IMPLEMENTATION_NOTES.md`, "Step 20" section). **The exact split depends
+on the alpha and seed** — this table is what `alpha=0.5, seed=20240` produces;
+a different alpha or seed will produce a different (still deterministic,
+still reproducible) skew:
+
+| Client (shard) | Shard size | Class counts (pos/neg) | Achieved positive ratio | Delta L2 |
+|---|---|---|---|---|
+| 0 | 73 | 11 / 62 | 0.1507 | ~0.374 |
+| 1 | 40 | 1 / 39 | 0.0250 | ~0.265 |
+| 2 | 36 | 32 / 4 | 0.8889 | ~0.275 |
+
+Client 1 here is nearly all-negative, client 2 nearly all-positive — genuinely
+different distributions, not three samples of the same ~30/70 mix. Look for
+`Partition mode: non-iid` and `Dirichlet alpha: 0.5` in each client's log.
+
+**Switching modes in the same terminal**: these env vars persist. Either open
+a fresh terminal for a different mode, or explicitly clear them first:
+```powershell
+Remove-Item Env:CLIENT_SHARD_ID, Env:CLIENT_N_SHARDS, Env:CLIENT_SHARD_SEED, Env:CLIENT_NONIID_ALPHA -ErrorAction SilentlyContinue
+```
+
+**Honest disclosure — read this before demonstrating Mode B or C.** Modes B
+and C produce a **lower** F1 than Mode A, not a higher or comparable one:
+Step 20's measured aggregated F1 was **0.0000** (Mode B/C) vs. **0.6667**
+(Mode A, the identical-partition baseline, Step 14 ARM 1 round 1) — because
+each client gets only ~15 positive examples instead of 44. Step 21's offline
+epoch sweep tested epochs in {10, 20, 30, 50} on a single shard and found
+**no epoch count recovers non-degenerate F1** — this is a **corpus-size
+floor, not a tuning problem**. The arithmetic: 55 positive participants in
+the whole 186-row corpus, 44 of them land in the 149-record train split (11
+held out in the global eval 37), leaving ~15 positives per client once split
+three ways — no architecture or training-schedule choice changes that.
+**Therefore: Mode A is the better demo of the pipeline; Mode B/C is the
+honest demonstration of federation. They show different things, and both are
+worth running** — just don't present Mode B/C's F1 as a regression to be
+explained away, or Mode A's F1 as evidence of genuine federated learning.
+Also expected, not a fault: **every per-client delta L2 in Mode B and C falls
+outside the Fix E4 calibration range [0.625, 0.729]** (`clip_norm=0.85` was
+calibrated against 149-record training; ~50-record shards produce
+systematically smaller deltas) — documented in
+`docs/IMPLEMENTATION_NOTES.md`'s Step 20 section, not retuned.
 
 ---
 
