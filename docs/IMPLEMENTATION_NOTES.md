@@ -975,3 +975,114 @@ errors. Clipping was not re-confirmed from a saved log line for these
 specific runs (driver display truncation) but is inferred with high
 confidence to be inert - every delta measured is well under
 `clip_norm=0.85`, consistent with every prior measurement at this scale.
+
+---
+
+## Step 21 — epoch sweep for the sharded regime: a data-volume floor, not
+## undertraining (2026-08-23)
+
+Step 20's Run A (IID, 3 shards) collapsed to F1=0.0 at ~50 records/client,
+epochs=10 (tuned for 149 records, Step 10a). Two plausible causes: (a) ~50
+records with ~15 positives is too little data regardless of training length,
+or (b) epochs=10 is undertrained at 50 records (~7 steps/epoch vs ~19 at
+149). `scripts/sweep_epochs_sharded.py` (offline, no gRPC/Mongo/DP/upload)
+swept epochs in {10,20,30,50} at lr=1e-4 (unchanged), 3 seeds/cell, training
+on shard 0/3 (seed=20240) - confirmed to reproduce Run A client 0's exact
+shard (n=50, 15 pos/35 neg) before trusting any result - evaluated on the
+same global held-out 37. Completed in 14.2 minutes.
+
+| epochs | degenerate | mean F1 | per-seed F1 | mean delta L2 |
+|---|---|---|---|---|
+| 10 | 3/3 | 0.3056 | 0.0000, 0.4583, 0.4583 | 0.328 |
+| 20 | 2/3 | 0.3568 | 0.4583, 0.4583, 0.1538 | 0.581 |
+| 30 | 1/3 | 0.2917 | 0.3750, 0.0000, 0.5000 | 0.842 |
+| 50 | 1/3 | 0.3654 | 0.0000, 0.5405, 0.5556 | 1.367 |
+
+**Full-149 baseline, epochs=10** (single-client context, not the aggregated
+Step 14 number): degenerate=0/3, mean F1=0.5729 (matches Fix E4's historical
+value exactly - the sweep script reproduces a known-correct number, not a
+new one), delta L2 0.623/0.719/0.697 - inside the Fix E4 range.
+
+**Findings:**
+
+1. **No epoch count recovers full non-degenerate F1 on the shard.**
+   Degeneracy drops 3/3 -> 2/3 -> 1/3 -> 1/3 as epochs increase, but never
+   reaches 0/3 in the tested range. Best mean F1 (epochs=50, 0.3654) stays
+   far below the full-149 baseline (0.5729) - not converging toward it.
+
+2. **Delta L2 passes through the Fix E4 range [0.625, 0.729] but doesn't
+   stabilise there, and matching it doesn't mean better F1.** Grows
+   monotonically with epochs (0.328 -> 0.581 -> 0.842 -> 1.367), crossing
+   the range around epochs~25-27. epochs=30 (delta L2~0.84, past the range)
+   has the WORST mean F1 (0.2917) of all four cells - worse than epochs=20,
+   which is still below the range. Delta magnitude recovering the
+   "expected" scale is not a proxy for a more reliable model here.
+
+3. **Read: predominantly a data-volume floor (cause a), not primarily
+   undertraining (cause b).** If training length were the main bottleneck,
+   F1 should climb toward 0.57 as epochs increase; instead it plateaus and
+   wobbles non-monotonically between 0.29 and 0.37 for epochs 20-50 (a real
+   dip at 30), with high seed-to-seed variance at every cell (epochs=30:
+   0.375/0.000/0.500 - the SAME epoch count landing anywhere from collapse
+   to moderate performance depending purely on init/dropout draw). That's
+   the signature of too little signal (15 positives) for a stable decision
+   boundary, not insufficient optimization - more epochs on too little data
+   mostly lets the model overfit in a different, seed-dependent direction
+   each time rather than converge. Training length is not irrelevant either
+   - degeneracy frequency does measurably drop (3/3 -> 1/3) - so this is not
+   a *pure* data floor with zero training-length interaction, but data
+   volume is the dominant factor, and no epoch count tested closes the gap
+   to the full-149 baseline.
+
+No default changed, no epoch count chosen, no live 3-client round re-run,
+per instruction.
+
+---
+
+## Step 20/21 conclusion: what genuine federation costs at this corpus size
+## (2026-08-23)
+
+- **Before Step 20, all clients trained on the identical 149-record split.**
+  That was not federation - one dataset submitted three times. Every
+  aggregated number prior to Step 20 (Steps 12-19) should be read as "one
+  client's result, averaged with two copies of itself," not as evidence
+  about how this system behaves under genuinely divided data.
+
+- **Step 20 makes genuine per-client partitioning available (IID and
+  non-IID), verified working, not merely implemented.** Per-client delta
+  spread: 0.037 (IID, range as a fraction of mean ~11%) vs 0.109 (non-IID,
+  alpha=0.5, ~36% of mean) - roughly 3x wider under deliberate label skew at
+  the identical seed and client count, confirming real data divergence is
+  driving the difference, not training stochasticity (which is all that
+  produced per-client variation before this step).
+
+- **Step 21 measures the cost, and it's a real one.** At n=3, each client
+  gets ~50 records with ~15 positives, and no epoch count in {10, 20, 30,
+  50} recovers non-degenerate F1 - best sharded mean F1 0.3654 vs. 0.5729 on
+  the full 149. The failure mode (non-monotonic F1, a real dip at
+  epochs=30, per-seed spread of 0.375/0.000/0.500 on IDENTICAL data at that
+  cell) is the signature of too little signal for a stable decision
+  boundary, not insufficient optimisation.
+
+- **Therefore: DAIC-WOZ at 186 participants does not support genuine 3-way
+  federation at usable utility.** This is a corpus-size limit, not an
+  implementation defect. The arithmetic, stated plainly: 55 positive
+  participants in the whole corpus, 44 of them land in the 149-record train
+  split (11 held out in the global eval 37), leaving ~15 positives per
+  client once split three ways. No architecture or training-schedule choice
+  changes that arithmetic.
+
+- **Sharding stays default OFF**, so every measurement from Step 12 onward
+  remains exactly reproducible without it. It's available via
+  `CLIENT_SHARD_ID` / `CLIENT_N_SHARDS` (and `CLIENT_NONIID_ALPHA` for
+  skew) whenever it's wanted. The non-IID mode is, as of this session, the
+  *only* path to genuine client drift anywhere in this system - the
+  precondition Step 18c already identified FedProx as needing to be
+  meaningfully testable (its proximal term has nothing to correct without
+  real non-IID divergence, which now exists but did not before Step 20).
+
+- **n=2 is an untested intermediate**, noted for anyone who wants to
+  revisit this: 74 records/client, ~22 positives each - roughly 1.5x this
+  step's 50-record/15-positive shards. Not measured here; not claimed to
+  behave any particular way. A natural next data point if genuine
+  federation at usable utility is ever revisited for this corpus.
