@@ -123,6 +123,20 @@ TRAIN_LOG_INTERVAL = int(os.environ.get("TRAIN_LOG_INTERVAL", "5"))
 SUPERVISED_LR = float(os.environ.get("SUPERVISED_LR", "1e-4"))
 SUPERVISED_EPOCHS = int(os.environ.get("SUPERVISED_EPOCHS", "10"))
 
+# Step 16: round-aware LR decay. Step 15 diagnosed WHY multi-round training
+# diverges (Step 14): lr and epochs were byte-identical every round with no
+# schedule, and torch.nn.utils.clip_grad_norm_(..., 1.0) saturates on
+# effectively every step (measured fc1_grad_norm 59.9-454.5 against a ceiling
+# of 1.0) - so every round takes an essentially fixed-size step regardless of
+# how close the model already is to a good solution. This does not touch the
+# grad-norm clip, loss balance, or safety clamps (Step 15's explicit
+# constraint) - it only makes the step size shrink round over round.
+# lr_r = SUPERVISED_LR * (LR_DECAY ** (round_id - 1)), so round 1 is
+# unaffected (LR_DECAY**0 = 1) and every later round decays further.
+# LR_DECAY=1.0 is a valid, explicit "no decay" setting - it reproduces the
+# Step 14 baseline exactly, not a special-cased default.
+LR_DECAY = float(os.environ.get("LR_DECAY", "0.7"))
+
 # Safety hyperparameters (tunable)
 # Fix E5: recalibrated from the old 1e-3, which was set for the pre-Fix-E4
 # regime (19 steps, lr=2e-5) and had gone stale the same way clip_norm had -
@@ -1141,24 +1155,47 @@ def orchestrate(
     max_samples=None,
     safety_params=None,
     global_model_path: str = None,   # ← Phase 10: now an explicit parameter
+    round_id: int = None,            # ← Step 16: explicit, not inferred from global_model_path
     **kwargs
 ):
     """
     Orchestrate training/inference.
- 
+
     global_model_path: optional path to a global model state_dict (.pt file)
                        received from the server.  When provided the model is
                        initialised from these weights before local fine-tuning,
                        implementing the federated averaging warm-start.
+    round_id: optional (Step 16). When given, the effective supervised
+                       learning rate is lr * (LR_DECAY ** (round_id - 1)) -
+                       round 1 unaffected, later rounds decayed. round_id is
+                       explicit and always testable, unlike inferring "this is
+                       a warm-started round" from global_model_path being set
+                       (which would silently do nothing if the global model
+                       were ever absent for a later round).
     """
     import os, json, tempfile, torch
     from pathlib import Path
     from torch.utils.data import DataLoader
- 
+
     # resolve device
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
- 
+
+    # ── Step 16: round-aware LR decay ─────────────────────────────────────────
+    # lr passed in is the BASE rate (SUPERVISED_LR unless overridden by the
+    # caller); round_id, when given, decays it further. LR_DECAY=1.0 makes
+    # this a no-op (lr_r == lr for every round), reproducing Step 14 exactly.
+    effective_lr = lr
+    if round_id is not None:
+        effective_lr = lr * (LR_DECAY ** (round_id - 1))
+    rpt.subheader("STEP 16 — ROUND-AWARE LR DECAY")
+    rpt.kv("Round ID", round_id if round_id is not None else "(not provided)")
+    rpt.kv("Base learning rate", lr)
+    rpt.kv("LR_DECAY", LR_DECAY)
+    rpt.kv("Effective learning rate this round", effective_lr)
+    print(f"[STEP16-LR] round_id={round_id} base_lr={lr} LR_DECAY={LR_DECAY} effective_lr={effective_lr}")
+    lr = effective_lr
+
     # ── inline imports so the rest of the file remains unchanged ─────────────
     from transformers import AutoTokenizer
  

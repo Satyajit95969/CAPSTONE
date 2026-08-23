@@ -419,6 +419,11 @@ def run_pipeline(
         "epochs":      SUPERVISED_EPOCHS,
         "batch_size":  8,
         "lr":          SUPERVISED_LR,
+        # Step 16: round_id was already available here (round_meta.round_id,
+        # used below for logging/receipt signing) but never reached the
+        # trainer. trainer_orchestrate() uses it to decay lr round over
+        # round — see trainer_mentalbert_privacy.py's Step 16 comment.
+        "round_id":    round_meta.round_id,
     }
     if PIPELINE_MODE == "multimodal":
         trainer_kwargs["max_samples"] = _MULTIMODAL_MAX_SAMPLES
@@ -428,9 +433,10 @@ def run_pipeline(
     rpt.header("LOCAL TRAINING")
     rpt.kv("Model", "MentalBERT (multimodal fusion)")
     rpt.kv("Initialization", "Global model (warm-start)" if global_model_path else "Random / local pretrained")
+    rpt.kv("Round ID", trainer_kwargs["round_id"])
     rpt.kv("Epochs", trainer_kwargs["epochs"])
     rpt.kv("Batch size", trainer_kwargs["batch_size"])
-    rpt.kv("Learning rate", trainer_kwargs["lr"])
+    rpt.kv("Learning rate (base)", trainer_kwargs["lr"])
     rpt.kv("Optimizer", "AdamW")
 
     t0 = time.time()

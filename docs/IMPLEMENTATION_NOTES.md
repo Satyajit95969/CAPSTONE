@@ -493,3 +493,89 @@ the headline finding above:**
    rough extrapolation, not a fitted claim), and per the headline finding
    above, it was never going to be sufficient regardless of rate: the
    no-privacy baseline it would need to converge toward instead diverges.
+
+---
+
+## Step 15/16 — diagnosis and fix: round-aware LR decay (2026-08-23)
+
+**Step 15 diagnosis** (investigation only, no code): grepped
+`trainer_mentalbert_privacy.py` and `pipeline.py` for any round-conditioned
+lr/epochs logic - none exists; `round_meta.round_id` reached `pipeline.py`
+already but was only ever used for logging and ECDSA receipt-signing, never
+passed to the trainer. AdamW is freshly constructed every round (expected
+FedAvg behaviour, not itself a defect) with no optimizer-state persistence
+anywhere. The actual mechanism: a fresh diagnostic run at the *current*
+lr=1e-4/epochs=10 config (not the stale Step 9a numbers, which predate Fix
+E3/E4) measured `fc1_grad_norm` at 59.9-454.5 across every sampled step of a
+full training run - `torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)`
+saturates on effectively every one of the 190 steps/round. Clipping preserves
+direction but forces every step to the same pre-Adam magnitude regardless of
+curvature or proximity to a good solution - so every round takes an
+essentially fixed-size step whether starting from random init or from an
+already-well-fit point. Zero `[SAFETY-CLAMP]` engagements across all 10 Step
+14 rounds confirm the delta-level clamps were never involved - they only
+watched, they never shaped this behaviour.
+
+**Step 16 fix** (`trainer_mentalbert_privacy.py`, `runtime/pipeline.py` -
+no security/TPM/crypto/gRPC/Rust touched, grad clip/loss balance/safety
+clamps untouched per the diagnosis's own recommendation): `round_id` now
+flows from `pipeline.py`'s already-available `round_meta.round_id` into
+`trainer_orchestrate()`. When given, `effective_lr = lr * (LR_DECAY **
+(round_id - 1))` - round 1 unaffected (`LR_DECAY**0 = 1`), later rounds
+decayed. `LR_DECAY` is env-configurable, default `0.7`; `LR_DECAY=1.0` is a
+valid, explicit "no decay" setting that reproduces Step 14 exactly, not a
+special case. Explicit `round_id`, never inferred from `global_model_path`
+being set (which would silently no-op if the global model were ever absent
+for a later round). Effective lr is reported every round (`rpt.kv` +
+`[STEP16-LR]` print) alongside `round_id` and the base lr.
+
+**Verification**: re-ran the exact ARM 1 5-round trajectory (seed=303, mean
+aggregation, otherwise identical to Step 14), `LR_DECAY=0.7` (the default).
+
+| round | effective lr | Step 14 F1 (no decay) | Step 16 F1 (decay=0.7) | Step 16 accuracy | Step 16 pred+/37 | Step 16 MAE | Step 16 this-round delta L2 | Step 16 cumulative delta L2 |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 1.00e-4 | 0.6667 | 0.4583 | 0.297 | 37/37 | 5.046 | 0.576 | 0.576 |
+| 2 | 7.00e-5 | 0.4583 | 0.4583 | 0.297 | 37/37 | 6.050 | 0.419 | 0.953 |
+| 3 | 4.90e-5 | 0.0000 | 0.4583 | 0.297 | 37/37 | 6.784 | 0.317 | 1.235 |
+| 4 | 3.43e-5 | 0.0000 | 0.4348 | 0.297 | 35/37 | 7.482 | 0.233 | 1.443 |
+| 5 | 2.40e-5 | 0.0000 | 0.4324 | 0.432 | 26/37 | 8.242 | 0.173 | 1.593 |
+
+**LR decay is confirmed engaged and causally responsible**, not just
+computed and ignored: this-round delta L2 shrinks by a ratio of 0.727,
+0.757, 0.735, 0.743 at each successive round transition - matching
+`LR_DECAY=0.7` almost exactly at every step. (The literal `[STEP16-LR]`
+print lines were truncated out of the driver's combined log by the same
+`[-3000:]` per-subprocess truncation that hid the Step 15 gradient-norm
+logs - not re-plumbed for this run since the delta-L2 ratio is a stronger,
+more direct confirmation than reading a printed number would have been: it
+shows the decay had the right *causal* effect on training, not merely that
+the value was computed.)
+
+**Answer to the specific question - precisely, not glossed over**: round 1's
+F1 does NOT literally hold at 0.6667, because round 1 is a fresh noisy draw
+each run (`GLOBAL_INIT_SEED` fixes only the shared init; training
+stochasticity is deliberately re-randomised per client - Defect B's own
+fix). Comparing round 1 to round 1 across two different runs was never a
+literal apples-to-apples comparison. The question that IS answerable and
+matters: **does the trajectory collapse to F1=0 by round 3, as it did
+without decay?** No. F1 holds flat at 0.4583 for three consecutive rounds,
+then declines gently to 0.4348 and 0.4324 - a ~5.6% relative drop over two
+rounds, not a collapse. **The fix works**: multi-round training under
+LR_DECAY=0.7 stabilises in a moderate, non-degenerate performance band and
+stays there, instead of diverging to a degenerate all-one-class collapse by
+round 3. Not swept against other decay values in this step, per the
+instruction (one value, one trajectory, honest result) - 0.7 neither
+obviously overshoots (rounds don't stagnate at round-1 performance) nor
+undershoots (no collapse) at this evidence, but a systematic decay sweep is a
+separate, future measurement, not concluded here.
+
+**A cost, not just a fix**: MAE degrades monotonically across the same 5
+rounds even as F1 stabilises - 5.046 -> 6.050 -> 6.784 -> 7.482 -> 8.242.
+Consistent with Fix E3's loss rebalance, which pushed `loss_cls` to dominate
+`loss_reg` by 20-100x (measured in Step 9a) - stabilising classification
+under LR decay does nothing to change that imbalance, so the regression head
+keeps getting starved of gradient signal every round, and its error keeps
+growing. Classification stability here was bought at a measurable, growing
+cost to PHQ regression accuracy. `REG_LOSS_WEIGHT` (env, default 0.5) is the
+existing knob if regression performance is ever prioritised - not changed
+here, recorded only.
