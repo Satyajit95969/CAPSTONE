@@ -96,59 +96,13 @@ ARM_ENV = {
 }
 ARM_PER_ROUND_EPSILON = {"none": None, "dp": 5.302585}
 
-# Step 18: CLAUDE.md's stated hyperparameters (traceable to the project
-# document), env-overridable. CLAUDE.md gives eta_s/beta1/beta2 for FedAdam
-# and eta_s/tau for FedYogi only — it does not state FedAdam's tau or
-# FedYogi's beta1/beta2. Reddi et al. 2020 ("Adaptive Federated
-# Optimization") conventionally shares one tau and one (beta1, beta2) pair
-# across both variants, so the missing values below borrow the OTHER
-# algorithm's stated value rather than inventing an unrelated number — this
-# is a documented, deliberate choice, not a silent gap.
-FEDADAM_ETA_S = float(os.environ.get("FEDADAM_ETA_S", "1e-3"))   # CLAUDE.md
-FEDADAM_BETA1 = float(os.environ.get("FEDADAM_BETA1", "0.9"))    # CLAUDE.md
-FEDADAM_BETA2 = float(os.environ.get("FEDADAM_BETA2", "0.999"))  # CLAUDE.md
-FEDADAM_TAU   = float(os.environ.get("FEDADAM_TAU", "1e-3"))     # NOT in CLAUDE.md — borrowed from FedYogi's stated tau
-
-FEDYOGI_ETA_S = float(os.environ.get("FEDYOGI_ETA_S", "1e-2"))   # CLAUDE.md
-FEDYOGI_TAU   = float(os.environ.get("FEDYOGI_TAU", "1e-3"))     # CLAUDE.md
-FEDYOGI_BETA1 = float(os.environ.get("FEDYOGI_BETA1", "0.9"))    # NOT in CLAUDE.md — borrowed from FedAdam's stated beta1
-FEDYOGI_BETA2 = float(os.environ.get("FEDYOGI_BETA2", "0.999"))  # NOT in CLAUDE.md — borrowed from FedAdam's stated beta2
-
-
-def init_moments(template: dict):
-    """m_0 = 0. v_0 = tau^2 (Reddi et al. 2020's own recommended init — avoids
-    dividing by ~0 on the very first round, before v has seen any data)."""
-    m = {k: torch.zeros_like(v.float()) for k, v in template.items()}
-    return m
-
-
-def fedadam_step(m: dict, v: dict, pseudo_grad: dict):
-    """One FedAdam update. Mutates and returns (m, v, applied_delta)."""
-    applied = {}
-    for k, g in pseudo_grad.items():
-        g = g.float()
-        m[k] = FEDADAM_BETA1 * m[k] + (1 - FEDADAM_BETA1) * g
-        v[k] = FEDADAM_BETA2 * v[k] + (1 - FEDADAM_BETA2) * (g ** 2)
-        applied[k] = FEDADAM_ETA_S * m[k] / (v[k].sqrt() + FEDADAM_TAU)
-    return m, v, applied
-
-
-def fedyogi_step(m: dict, v: dict, pseudo_grad: dict):
-    """One FedYogi update — differs from FedAdam only in the v update rule
-    (Reddi et al. 2020, Algorithm 2): v moves toward g^2 by a fixed
-    (1-beta2)*g^2 step in the DIRECTION of sign(v - g^2), rather than FedAdam's
-    exponential-moving-average blend. Intended to behave better than Adam
-    under heavy-tailed/large gradient noise — directly relevant to this
-    project's ~260-magnitude DP noise component. Mutates and returns
-    (m, v, applied_delta)."""
-    applied = {}
-    for k, g in pseudo_grad.items():
-        g = g.float()
-        g2 = g ** 2
-        m[k] = FEDYOGI_BETA1 * m[k] + (1 - FEDYOGI_BETA1) * g
-        v[k] = v[k] - (1 - FEDYOGI_BETA2) * torch.sign(v[k] - g2) * g2
-        applied[k] = FEDYOGI_ETA_S * m[k] / (v[k].sqrt() + FEDYOGI_TAU)
-    return m, v, applied
+# Step 19: the update rules moved to scripts/fl_optimizers.py so
+# scripts/demo_fl_algorithms.py can import the SAME code rather than a copy.
+from fl_optimizers import (  # noqa: E402
+    init_moments, fedadam_step, fedyogi_step,
+    FEDADAM_ETA_S, FEDADAM_BETA1, FEDADAM_BETA2, FEDADAM_TAU,
+    FEDYOGI_ETA_S, FEDYOGI_TAU, FEDYOGI_BETA1, FEDYOGI_BETA2,
+)
 
 
 def run(cmd, env=None, stdin_path=None, timeout=180):
