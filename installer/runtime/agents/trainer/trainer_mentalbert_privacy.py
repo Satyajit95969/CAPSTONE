@@ -68,6 +68,19 @@ MULTIMODAL_MAX_LEN = int(os.environ.get("MULTIMODAL_MAX_LEN", "512"))
 # "0"/"false" for an unfrozen A/B comparison run.
 FREEZE_TEXT_ENCODER = os.environ.get("FREEZE_TEXT_ENCODER", "true").strip().lower() not in ("0", "false", "no", "")
 
+# Step 12 / Defect B (docs/IMPLEMENTATION_NOTES.md): unset by default, so
+# ordinary runs are byte-for-byte unchanged - MultiModalModel(...) gets
+# PyTorch's normal random init, exactly as before this variable existed. When
+# set, orchestrate() seeds torch immediately before constructing the model
+# (so multiple client processes given the same GLOBAL_INIT_SEED start
+# audio_encoder/vision_encoder/fusion from an identical initial state - the
+# common-base precondition FedAvg/trimmed-mean assumes and this system never
+# had) and then re-randomises the RNG right after construction, so training
+# stochasticity (dropout, etc.) still differs per client - not three
+# bit-identical replicas. Does not change what is trained, only what the
+# random init happens to be.
+GLOBAL_INIT_SEED = os.environ.get("GLOBAL_INIT_SEED")
+
 # Fix E3, loss rebalance ONLY (lr/epochs/init untouched this step - see
 # docs/IMPLEMENTATION_NOTES.md). Two problems, measured in Step 9a:
 #   1. loss_cls vs loss_reg: unweighted CrossEntropyLoss on a 30/70 imbalance
@@ -1224,12 +1237,27 @@ def orchestrate(
     rpt.kv("Audio dim", audio_dim)
     rpt.kv("Vision dim", vision_dim)
 
+    # Step 12 / Defect B workaround (docs/IMPLEMENTATION_NOTES.md): only
+    # active when GLOBAL_INIT_SEED is explicitly set. Seeds immediately
+    # before construction so audio_encoder/vision_encoder/fusion's random
+    # init is reproducible across processes given the same seed, then
+    # re-randomises right after so training stochasticity still differs.
+    if GLOBAL_INIT_SEED is not None:
+        torch.manual_seed(int(GLOBAL_INIT_SEED))
+        print(f"[STEP12-SEED] GLOBAL_INIT_SEED={GLOBAL_INIT_SEED} — model init made deterministic for this run")
+        rpt.kv("Model init seed (GLOBAL_INIT_SEED)", GLOBAL_INIT_SEED)
+
     model = MultiModalModel(
         MENTALBERT_PRETRAIN,
         audio_dim=audio_dim,
         vision_dim=vision_dim,
         device=device
     )
+
+    if GLOBAL_INIT_SEED is not None:
+        reseed = torch.seed()
+        print(f"[STEP12-SEED] RNG re-randomized after init (torch.seed()={reseed}) — training stochasticity independent per client")
+
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     rpt.kv("Total parameters", f"{total_params:,}")

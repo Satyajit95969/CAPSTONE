@@ -460,8 +460,12 @@ def run_pipeline(
     # scripts/calibrate_clip_norm.py, N=30) - 0.15 would now clip almost
     # every run. Overridable per-run; env var wins over the calibrated default.
     dp_clip_norm = float(os.environ.get("DP_CLIP_NORM", "0.85"))
-    dp_noise_multiplier = 1.0
-    dp_mechanism = "gaussian"
+    # Step 12: overridable so the privacy-utility comparison can run a
+    # genuine no-privacy arm (DP_MECHANISM=none or DP_NOISE_MULTIPLIER=0)
+    # through the exact same pipeline code path as the DP arm. Defaults
+    # unchanged from before this override existed.
+    dp_noise_multiplier = float(os.environ.get("DP_NOISE_MULTIPLIER", "1.0"))
+    dp_mechanism = os.environ.get("DP_MECHANISM", "gaussian")
     dp_agent = DPAgent(
         clip_norm=dp_clip_norm,
         noise_multiplier=dp_noise_multiplier,
