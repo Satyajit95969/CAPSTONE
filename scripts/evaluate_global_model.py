@@ -139,21 +139,22 @@ def fetch_aggregated_delta(mongo_uri: str, db_name: str, round_id: int):
     return delta
 
 
-def evaluate_delta(aggregated_delta: dict, seed: int, device: str, label: str = ""):
-    """Reconstructs base_state[trainable_keys] + aggregated_delta and evaluates
-    on the Fix E2 held-out 37, given an ALREADY-COMPUTED aggregated delta dict
-    (from GridFS via fetch_aggregated_delta(), or from any other aggregation —
-    e.g. scripts/aggregate_offline.py's offline AggregatorAgent(mode=...) call
-    for Step 13's mean-vs-trimmed_mean comparison). Contains no round_id /
-    GridFS logic itself — that's the caller's job (see fetch_aggregated_delta()
-    and aggregate_offline.py's fetch_round_updates())."""
-    records = read_parquet_records(str(PARQUET_PATH))
-    train_records, eval_records = stratified_split(records)
-    audio_dim, vision_dim = infer_dims(records)
+def reconstruct_absolute_state(aggregated_delta: dict, seed: int, device: str, label: str = ""):
+    """Reconstructs base_state[trainable_keys] + aggregated_delta -> absolute
+    weights (Defect A workaround: base + delta, never load_state_dict(delta)
+    directly). Returns (model, new_state, trainable_keys, delta_l2,
+    audio_dim, vision_dim). `model` already has new_state loaded
+    (strict=False — bert stays at its pretrained checkpoint value, untouched).
 
-    print(f"[info] eval records = {len(eval_records)} "
-          f"(positive={sum(1 for r in eval_records if float(r['phq_score']) >= PHQ_POSITIVE_THRESHOLD)}, "
-          f"negative={sum(1 for r in eval_records if float(r['phq_score']) < PHQ_POSITIVE_THRESHOLD)})")
+    Used by evaluate_delta() (held-out scoring) AND by Step 14's multi-round
+    driver (scripts/run_step14_multiround.py), which writes `new_state`
+    itself into GridFS so the NEXT round's clients warm-start from genuine
+    absolute weights through pipeline.py's completely unmodified, otherwise-
+    buggy (Defect A) load_state_dict(global_state, strict=False) call —
+    that call is only wrong when fed a bare delta; fed real weights, as here,
+    it is exactly correct with zero code changes."""
+    records = read_parquet_records(str(PARQUET_PATH))
+    audio_dim, vision_dim = infer_dims(records)
     print(f"[info] audio_dim={audio_dim} vision_dim={vision_dim} device={device}")
 
     print(f"[info] aggregated delta{' (' + label + ')' if label else ''}: {len(aggregated_delta)} keys, "
@@ -192,6 +193,26 @@ def evaluate_delta(aggregated_delta: dict, seed: int, device: str, label: str = 
     print(f"[info] reconstruction load: {len(missing)} missing keys (expected: bert, untouched), "
           f"{len(unexpected)} unexpected keys (expected: 0)")
     assert len(unexpected) == 0, f"Unexpected keys after loading reconstructed state: {unexpected}"
+
+    return model, new_state, trainable_keys, delta_l2, audio_dim, vision_dim
+
+
+def evaluate_delta(aggregated_delta: dict, seed: int, device: str, label: str = ""):
+    """Reconstructs base_state[trainable_keys] + aggregated_delta and evaluates
+    on the Fix E2 held-out 37, given an ALREADY-COMPUTED aggregated delta dict
+    (from GridFS via fetch_aggregated_delta(), or from any other aggregation —
+    e.g. scripts/aggregate_offline.py's offline AggregatorAgent(mode=...) call
+    for Step 13's mean-vs-trimmed_mean comparison). Contains no round_id /
+    GridFS logic itself — that's the caller's job (see fetch_aggregated_delta()
+    and aggregate_offline.py's fetch_round_updates())."""
+    model, new_state, trainable_keys, delta_l2, audio_dim, vision_dim = reconstruct_absolute_state(
+        aggregated_delta, seed, device, label
+    )
+    records = read_parquet_records(str(PARQUET_PATH))
+    train_records, eval_records = stratified_split(records)
+    print(f"[info] eval records = {len(eval_records)} "
+          f"(positive={sum(1 for r in eval_records if float(r['phq_score']) >= PHQ_POSITIVE_THRESHOLD)}, "
+          f"negative={sum(1 for r in eval_records if float(r['phq_score']) < PHQ_POSITIVE_THRESHOLD)})")
 
     model.to(device)
     model.eval()

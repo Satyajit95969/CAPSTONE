@@ -398,3 +398,98 @@ count). Making this real requires changing the hardcoded literal at
 (`"mode": "trimmed_mean"`) - Rust code, out of scope for this investigation
 per its own constraints. Logged here as a recommended future change with its
 exact location, not made.
+
+---
+
+## Step 14 — multi-round trajectory: warm-start genuinely exercised for the
+## first time (2026-08-23)
+
+Every measurement before this one (Step 12, Step 13) is round 1 - a single
+noisy draw, aggregated once. Warm-start has never fired in this project
+(CLAUDE.md's own "Warm-start never exercised" note). This runs 5 sequential
+rounds for each of ARM 1 (no privacy) and ARM 2 (DP, noise_multiplier=1.0),
+mean aggregation throughout (per the Step 13 recommendation - not
+trimmed_mean), seed=303, evaluating the aggregated global model after every
+round.
+
+**Mechanism** (`scripts/run_step14_multiround.py`, no Rust/security touched):
+the live pipeline runs completely untouched for every client submission. The
+orchestrator's own automatic trimmed_mean aggregation still fires every
+round (harmless, unused). Separately, this script computes its own mean
+aggregation of each round's 3 uploads (`aggregate_offline()`, unmodified
+`AggregatorAgent`), adds it to a running `cumulative_delta`, and evaluates
+`base_state(seed) + cumulative_delta` - the correct multi-round FedAvg
+accumulation. Before the next round's clients run, it overwrites the
+`global_models` MongoDB document's `file_id` (a plain Mongo write - the
+orchestrator just serves whatever's there) to point at a freshly-uploaded
+GridFS object containing this cumulative state as genuine ABSOLUTE weights.
+pipeline.py's existing, completely unmodified warm-start call
+(`model.load_state_dict(global_state, strict=False)`) is only wrong when fed
+a bare delta (Defect A) - fed real weights, as here, it is exactly correct
+with zero code changes to pipeline.py or trainer_mentalbert_privacy.py.
+
+**ARM 1 - no privacy, 5 rounds, mean aggregation:**
+
+| round | F1 | accuracy | precision | recall | MAE | pred+/37 | prob(+) mean/stdev | cumulative delta L2 | this-round delta L2 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 0.6667 | 0.7838 | 0.6154 | 0.7273 | 5.210 | 13/37 | 0.474/0.062 | 0.581 | 0.581 |
+| 2 | 0.4583 | 0.2973 | 0.2973 | 1.0000 | 5.836 | 37/37 | 0.736/0.055 | 1.113 | 0.584 |
+| 3 | 0.0000 | 0.7027 | 0.0000 | 0.0000 | 5.556 | 0/37 | 0.401/0.042 | 1.628 | 0.563 |
+| 4 | 0.0000 | 0.7027 | 0.0000 | 0.0000 | 5.268 | 0/37 | 0.251/0.030 | 2.146 | 0.569 |
+| 5 | 0.0000 | 0.7027 | 0.0000 | 0.0000 | 5.155 | 0/37 | 0.182/0.034 | 2.671 | 0.575 |
+
+**ARM 2 - DP (noise_multiplier=1.0), 5 rounds, mean aggregation:**
+
+| round | F1 | accuracy | precision | recall | MAE | pred+/37 | prob(+) mean/stdev | cumulative delta L2 | this-round delta L2 | per-round eps | cumulative eps (naive additive bound) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 0 | 0.7027 | 0 | 0 | 126,868.58 | 0/37 | 0.000/0.000 | 260.09 | 260.09 | 5.302585 | 5.302585 |
+| 2 | 0 | 0.7027 | 0 | 0 | 411,896.54 | 0/37 | 0.000/0.000 | 367.83 | 260.53 | 5.302585 | 10.605170 |
+| 3 | 0 | 0.7027 | 0 | 0 | 470,234.36 | 0/37 | 0.000/0.000 | 450.31 | 260.09 | 5.302585 | 15.907755 |
+| 4 | 0 | 0.7027 | 0 | 0 | 100,125.43 | 0/37 | 0.000/0.000 | 520.52 | 260.36 | 5.302585 | 21.210340 |
+| 5 | 0 | 0.7027 | 0 | 0 | 1,640,656.53 | 0/37 | 0.000/0.000 | 581.92 | 259.73 | 5.302585 | 26.512925 |
+
+"cumulative eps (naive additive bound)" is `round x 5.302585` - a loose upper
+bound via basic composition, NOT a tight sequential RDP composition. This
+system has no true multi-round accountant (CLAUDE.md defect #7: "Privacy
+accounting is per-round only"); this number is reported as the approximation
+it is, not fabricated as the real accountant's output.
+
+**Headline finding: multi-round training diverges in this system, independent
+of privacy.** ARM 1 (no privacy, DP fully disabled) does NOT improve over
+rounds - it gets WORSE: F1 = 0.6667 (round 1) -> 0.4583 -> 0.0 -> 0.0 -> 0.0.
+**Round 1's F1 = 0.6667 is the strongest utility result this entire
+investigation has produced - the clean-federated, no-privacy reference
+point** (3-client mean aggregation, correctly reconstructed, no DP noise
+anywhere). By round 3 the same no-privacy configuration has collapsed to the
+same degenerate all/none-prediction pattern seen everywhere DP noise
+dominates - except here there is no DP noise to blame. The cumulative
+delta's L2 magnitude growing at a steady ~0.57-0.58/round (linear) reflects
+the model *moving* a consistent amount each round, not moving toward a
+better solution - there is no learning-rate decay or convergence control
+across rounds in this training regime, so multi-round training here diverges
+rather than converges. **This is a training-regime defect independent of
+DP, and it makes "more rounds recovers DP utility" untestable until it is
+fixed** - the no-privacy baseline this hypothesis would need to compare
+against does not itself improve with rounds. See Step 15 for the
+investigation into why.
+
+**Two further, precisely quantified mechanisms, both real, both secondary to
+the headline finding above:**
+
+1. **DP noise accumulates as a random walk (sqrt(r)); ARM 1's own training
+   movement accumulates roughly linearly (r).** ARM 2's cumulative delta L2
+   matches `sqrt(r) x 260.09` to within 0.4% at every one of the 5 rounds
+   (260.09, 367.83->367.82 predicted, 450.31->450.48, 520.52->520.17,
+   581.92->581.57) - textbook independent-zero-mean-noise accumulation.
+
+2. **Consequently the noise-to-signal ratio genuinely improves over
+   rounds** - using ARM 1's cumulative magnitude as the signal-scale
+   reference: 447.7x (round 1) -> 330.5x -> 276.5x -> 242.5x -> 217.9x
+   (round 5). That's a ~2.05x improvement over 5 rounds, close to the
+   sqrt(5)=2.24x the two accumulation rates predict - the actual mechanism
+   the Step 14 prompt hypothesized, real and measured, not assumed. But it
+   is nowhere near enough on its own (closing a ~450x starting ratio via
+   sqrt(r) alone would need on the order of 10^5 rounds at this rate - a
+   rough extrapolation, not a fitted claim), and per the headline finding
+   above, it was never going to be sufficient regardless of rate: the
+   no-privacy baseline it would need to converge toward instead diverges.
