@@ -125,7 +125,7 @@ The OTP is valid 10 minutes — move to Terminal 3 promptly.
 Set-Location "D:\Download D\BE PIPELINE\Capstone-"
 
 # Port + cert sanity checks
-Get-NetTCPConnection -LocalPort 50051 -ErrorAction SilentlyContinue   # expect State=Listen
+Get-NetTCPConnection -LocalPort 50051 -ErrorAction SilentlyContinue   
 Test-Path "server\orchestration_agent\certs\ca.pem"
 Test-Path "server\orchestration_agent\certs\server.pem"
 

@@ -42,9 +42,30 @@ per-round only; no cumulative eps across rounds"). The additive bound is a
 loose upper bound, not a tight composition, and is labeled as such — not
 fabricated as if it were the real accountant's output.
 
+STEP 18 — FedAdam / FedYogi (--update-rule). Server-side only, no Rust, no
+protobuf, no client changes — same offline-aggregation-plus-GridFS-patch
+pattern as Steps 13/14/17. Replaces the plain additive accumulation
+(cumulative += mean(client deltas)) with the Reddi et al. 2020 "Adaptive
+Federated Optimization" update rule: treat the round's mean-aggregated client
+delta as a pseudo-gradient, run it through a server-side Adam/Yogi optimizer
+(m/v tracked in-process across this driver's round loop, exactly like
+cumulative_delta already is — no new MongoDB collection), and accumulate the
+OPTIMIZER'S output, not the raw pseudo-gradient.
+
+This is not a checkbox exercise. Step 14/17 measured DP noise accumulating as
+sqrt(r) at a STABLE ~260 L2 magnitude per round (noise_multiplier=1.0,
+clip_norm=0.85, mean-of-3). FedAdam/FedYogi's v (running second-moment
+estimate) is exactly a running estimate of that per-coordinate magnitude — if
+the noise component really is stable round to round, v should converge to
+reflect it, and m_hat/(sqrt(v_hat)+tau) would then divide it back down to a
+roughly unit-scale, per-coordinate step before eta_s rescales it — a
+normalization plain averaging has no mechanism for. Whether this actually
+damps the noise enough to matter is the open, genuinely unknown question
+Step 18b measures — not assumed here.
+
 Usage:
     .venv\\Scripts\\python.exe scripts\\run_step14_multiround.py \\
-        --arm dp --rounds 5 --seed 303 \\
+        --arm dp --rounds 5 --seed 303 --update-rule fedadam \\
         --orch-log C:\\path\\to\\orch.log
     .venv\\Scripts\\python.exe scripts\\run_step14_multiround.py \\
         --arm none --rounds 5 --seed 303 \\
@@ -61,6 +82,8 @@ import sys
 import time
 from pathlib import Path
 
+import torch  # module level, not inside main() — fedadam_step()/fedyogi_step() below need it as a global
+
 REPO_ROOT = Path(r"D:\Download D\BE PIPELINE\Capstone-")
 PYTHON = str(REPO_ROOT / ".venv" / "Scripts" / "python.exe")
 sys.path.insert(0, str(REPO_ROOT))
@@ -72,6 +95,60 @@ ARM_ENV = {
     "dp": {"DP_MECHANISM": "gaussian", "DP_NOISE_MULTIPLIER": "1.0"},
 }
 ARM_PER_ROUND_EPSILON = {"none": None, "dp": 5.302585}
+
+# Step 18: CLAUDE.md's stated hyperparameters (traceable to the project
+# document), env-overridable. CLAUDE.md gives eta_s/beta1/beta2 for FedAdam
+# and eta_s/tau for FedYogi only — it does not state FedAdam's tau or
+# FedYogi's beta1/beta2. Reddi et al. 2020 ("Adaptive Federated
+# Optimization") conventionally shares one tau and one (beta1, beta2) pair
+# across both variants, so the missing values below borrow the OTHER
+# algorithm's stated value rather than inventing an unrelated number — this
+# is a documented, deliberate choice, not a silent gap.
+FEDADAM_ETA_S = float(os.environ.get("FEDADAM_ETA_S", "1e-3"))   # CLAUDE.md
+FEDADAM_BETA1 = float(os.environ.get("FEDADAM_BETA1", "0.9"))    # CLAUDE.md
+FEDADAM_BETA2 = float(os.environ.get("FEDADAM_BETA2", "0.999"))  # CLAUDE.md
+FEDADAM_TAU   = float(os.environ.get("FEDADAM_TAU", "1e-3"))     # NOT in CLAUDE.md — borrowed from FedYogi's stated tau
+
+FEDYOGI_ETA_S = float(os.environ.get("FEDYOGI_ETA_S", "1e-2"))   # CLAUDE.md
+FEDYOGI_TAU   = float(os.environ.get("FEDYOGI_TAU", "1e-3"))     # CLAUDE.md
+FEDYOGI_BETA1 = float(os.environ.get("FEDYOGI_BETA1", "0.9"))    # NOT in CLAUDE.md — borrowed from FedAdam's stated beta1
+FEDYOGI_BETA2 = float(os.environ.get("FEDYOGI_BETA2", "0.999"))  # NOT in CLAUDE.md — borrowed from FedAdam's stated beta2
+
+
+def init_moments(template: dict):
+    """m_0 = 0. v_0 = tau^2 (Reddi et al. 2020's own recommended init — avoids
+    dividing by ~0 on the very first round, before v has seen any data)."""
+    m = {k: torch.zeros_like(v.float()) for k, v in template.items()}
+    return m
+
+
+def fedadam_step(m: dict, v: dict, pseudo_grad: dict):
+    """One FedAdam update. Mutates and returns (m, v, applied_delta)."""
+    applied = {}
+    for k, g in pseudo_grad.items():
+        g = g.float()
+        m[k] = FEDADAM_BETA1 * m[k] + (1 - FEDADAM_BETA1) * g
+        v[k] = FEDADAM_BETA2 * v[k] + (1 - FEDADAM_BETA2) * (g ** 2)
+        applied[k] = FEDADAM_ETA_S * m[k] / (v[k].sqrt() + FEDADAM_TAU)
+    return m, v, applied
+
+
+def fedyogi_step(m: dict, v: dict, pseudo_grad: dict):
+    """One FedYogi update — differs from FedAdam only in the v update rule
+    (Reddi et al. 2020, Algorithm 2): v moves toward g^2 by a fixed
+    (1-beta2)*g^2 step in the DIRECTION of sign(v - g^2), rather than FedAdam's
+    exponential-moving-average blend. Intended to behave better than Adam
+    under heavy-tailed/large gradient noise — directly relevant to this
+    project's ~260-magnitude DP noise component. Mutates and returns
+    (m, v, applied_delta)."""
+    applied = {}
+    for k, g in pseudo_grad.items():
+        g = g.float()
+        g2 = g ** 2
+        m[k] = FEDYOGI_BETA1 * m[k] + (1 - FEDYOGI_BETA1) * g
+        v[k] = v[k] - (1 - FEDYOGI_BETA2) * torch.sign(v[k] - g2) * g2
+        applied[k] = FEDYOGI_ETA_S * m[k] / (v[k].sqrt() + FEDYOGI_TAU)
+    return m, v, applied
 
 
 def run(cmd, env=None, stdin_path=None, timeout=180):
@@ -158,6 +235,8 @@ def main() -> int:
     ap.add_argument("--orch-log", required=True)
     ap.add_argument("--db", default="federated_multimodal")
     ap.add_argument("--scratch-dir", default=str(REPO_ROOT / "trainer_outputs"))
+    ap.add_argument("--update-rule", choices=["plain", "fedadam", "fedyogi"], default="plain",
+                     help="Step 18: server-side accumulation rule. plain = Step 14/17 behaviour (unchanged).")
     args = ap.parse_args()
 
     scratch = Path(args.scratch_dir)
@@ -166,7 +245,11 @@ def main() -> int:
     ensure_blank_stdin(blank_stdin)
 
     print("=" * 70)
-    print(f"STEP 14 MULTI-ROUND — arm={args.arm} rounds={args.rounds} seed={args.seed}")
+    print(f"STEP 14/18 MULTI-ROUND — arm={args.arm} rounds={args.rounds} seed={args.seed} update_rule={args.update_rule}")
+    if args.update_rule == "fedadam":
+        print(f"[STEP18] FedAdam: eta_s={FEDADAM_ETA_S} beta1={FEDADAM_BETA1} beta2={FEDADAM_BETA2} tau={FEDADAM_TAU}")
+    elif args.update_rule == "fedyogi":
+        print(f"[STEP18] FedYogi: eta_s={FEDYOGI_ETA_S} beta1={FEDYOGI_BETA1} beta2={FEDYOGI_BETA2} tau={FEDYOGI_TAU}")
     print("=" * 70)
 
     # 1. reset + enroll ONCE for this arm (not per round)
@@ -183,13 +266,14 @@ def main() -> int:
     # aggregate_offline` below, not inside the round loop.
     os.environ["MONGO_DATABASE"] = args.db
 
-    import torch
     device = "cuda" if torch.cuda.is_available() else "cpu"
     from aggregate_offline import aggregate_offline
     from evaluate_global_model import evaluate_delta, reconstruct_absolute_state
 
     per_round_eps = ARM_PER_ROUND_EPSILON[args.arm]
     cumulative_delta: dict = {}
+    m_state: dict = {}
+    v_state: dict = {}
     trajectory = []
 
     for r in range(1, args.rounds + 1):
@@ -202,10 +286,30 @@ def main() -> int:
 
         # This script's own clean mean aggregation of round r's 3 uploads —
         # NOT the orchestrator's own (buggy, unused) trimmed_mean output.
-        this_round_delta = aggregate_offline(
+        # This is the "pseudo-gradient" Reddi et al. 2020 feeds to the
+        # server-side optimizer — raw, before any FedAdam/FedYogi transform.
+        raw_pseudo_gradient = aggregate_offline(
             mongo_uri="mongodb://localhost:27017", db_name=args.db, round_id=r, mode="mean"
         )
-        cumulative_delta = add_deltas(cumulative_delta, this_round_delta)
+
+        if args.update_rule == "plain":
+            applied_delta = raw_pseudo_gradient
+        else:
+            if not m_state:
+                m_state = init_moments(raw_pseudo_gradient)
+                v_state = {k: torch.full_like(v.float(), (FEDADAM_TAU if args.update_rule == "fedadam" else FEDYOGI_TAU) ** 2)
+                           for k, v in raw_pseudo_gradient.items()}
+            step_fn = fedadam_step if args.update_rule == "fedadam" else fedyogi_step
+            m_state, v_state, applied_delta = step_fn(m_state, v_state, raw_pseudo_gradient)
+
+        cumulative_delta = add_deltas(cumulative_delta, applied_delta)
+
+        raw_l2 = torch.sqrt(sum((v.float().norm() ** 2) for v in raw_pseudo_gradient.values())).item()
+        applied_l2 = torch.sqrt(sum((v.float().norm() ** 2) for v in applied_delta.values())).item()
+        m_norm = torch.sqrt(sum((v.float().norm() ** 2) for v in m_state.values())).item() if m_state else None
+        v_norm = torch.sqrt(sum((v.float().norm() ** 2) for v in v_state.values())).item() if v_state else None
+        print(f"[STEP18] round={r} update_rule={args.update_rule} raw_pseudo_gradient_l2={raw_l2:.6f} "
+              f"applied_delta_l2={applied_l2:.6f} m_norm={m_norm} v_norm={v_norm}")
 
         eval_result = evaluate_delta(cumulative_delta, args.seed, device, label=f"arm={args.arm} after_round={r}")
 
@@ -213,9 +317,14 @@ def main() -> int:
         row = dict(eval_result)
         row["arm"] = args.arm
         row["round"] = r
-        row["this_round_delta_l2"] = torch.sqrt(
-            sum((v.float().norm() ** 2) for v in this_round_delta.values())
-        ).item()
+        row["update_rule"] = args.update_rule
+        row["raw_pseudo_gradient_l2"] = raw_l2
+        # this_round_delta_l2 kept as the name Step 14/17 used, for direct
+        # comparability — it means "how much the cumulative model moved this
+        # round," i.e. the APPLIED delta (== raw pseudo-gradient when plain).
+        row["this_round_delta_l2"] = applied_l2
+        row["m_norm"] = m_norm
+        row["v_norm"] = v_norm
         row["per_round_epsilon"] = per_round_eps
         row["cumulative_epsilon_naive_additive_bound"] = cum_eps
         trajectory.append(row)
@@ -226,7 +335,7 @@ def main() -> int:
             patch_global_model(args.db, round_id=r + 1, new_state=new_state)
 
     print("\n" + "=" * 70)
-    print(f"STEP 14 MULTI-ROUND COMPLETE — arm={args.arm}, {len(trajectory)} rounds")
+    print(f"MULTI-ROUND COMPLETE — arm={args.arm}, update_rule={args.update_rule}, {len(trajectory)} rounds")
     print("=" * 70)
     print("[TRAJECTORY_JSON] " + json.dumps(trajectory))
     return 0

@@ -652,3 +652,218 @@ stabilised the no-privacy baseline - LR decay shrinks signal every round
 while the DP noise floor stays fixed, so the ratio moves in the wrong
 direction. This is a null result. Nothing was tuned to change it, per
 instruction.
+
+---
+
+## Step 18 — FedAdam / FedYogi: the noise-damping hypothesis is confirmed,
+## utility still doesn't recover, for a different and more specific reason
+## (2026-08-23)
+
+**Not a checkbox exercise - the motivating question, stated precisely before
+running anything**: Step 14/17 measured DP noise accumulating as `sqrt(r)`
+at a STABLE ~260 L2 magnitude per round. FedAdam/FedYogi's `v` (running
+second-moment estimate) is exactly a running estimate of that per-coordinate
+magnitude - if the noise really is stable round to round, `v` should
+converge to reflect it, and `m_hat/(sqrt(v_hat)+tau)` would divide it back
+down before `eta_s` rescales it, a normalisation plain averaging has no
+mechanism for. Whether that damping is enough to matter was genuinely
+unknown going in.
+
+**Implementation** (`scripts/run_step14_multiround.py`, `--update-rule
+{plain,fedadam,fedyogi}` - server-side only, no Rust/protobuf/client changes,
+same offline-aggregation-plus-GridFS-patch pattern as Steps 13/14/17):
+`m`/`v` tracked as additional in-process dicts across the driver's existing
+round loop, exactly like `cumulative_delta` already was - no new MongoDB
+collection. Hyperparameters from CLAUDE.md, env-overridable: FedAdam
+`eta_s=1e-3, beta1=0.9, beta2=0.999`; FedYogi `eta_s=1e-2, tau=1e-3`.
+CLAUDE.md does not state FedAdam's `tau` or FedYogi's `beta1`/`beta2` - each
+borrows the other algorithm's stated value (Reddi et al. 2020 conventionally
+shares one `tau` and one `(beta1,beta2)` pair across both variants), recorded
+as a deliberate, traceable choice, not a silent gap. Verified against
+synthetic stable-magnitude noise before spending any wall-clock time on the
+live run - the update rules behaved exactly as intended (applied step
+shrinking monotonically as `v` ramped up).
+
+**Results** - both arms: DP, noise_multiplier=1.0, mean aggregation, seed=303,
+LR_DECAY=0.7 (default), 5 rounds, compared against Step 17's plain-averaging
+DP baseline (identical in every other respect):
+
+| round | plain this-round Δ L2 | plain F1 | FedAdam this-round Δ L2 | FedAdam F1 | FedYogi this-round Δ L2 | FedYogi F1 |
+|---|---|---|---|---|---|---|
+| 1 | 260.36 | 0 | 1.438 | 0 | 14.386 | 0 |
+| 2 | 260.76 | 0.4583 | 1.484 | 0 | 14.829 | 0 |
+| 3 | 260.58 | 0 | 1.447 | 0 | 14.461 | 0 |
+| 4 | 259.72 | 0 | 1.397 | 0 | 13.941 | 0 |
+| 5 | 259.99 | 0 | 1.344 | 0 | 13.412 | 0 |
+
+Raw pseudo-gradient L2 (before the FedAdam/FedYogi transform) matches the
+plain baseline almost exactly every round (~260, e.g. FedAdam round 1:
+259.87, FedYogi round 1: 260.44) - confirming the aggregation step itself is
+unchanged; only what happens to that aggregated delta afterward differs.
+
+**The damping hypothesis is confirmed, dramatically**: FedAdam's applied
+step is ~176-194x smaller than plain averaging's, every round (260.36 ->
+1.438 at round 1, 259.99 -> 1.344 at round 5). FedYogi's applied step is
+~18-19x smaller (its 10x larger `eta_s` accounts for almost exactly the
+~10x gap between the two - 181/18 ~ 10, matching `eta_s` ratio 1e-3 vs
+1e-2). `v_norm` grows steadily and smoothly across both (0.221 -> 0.754,
+FedAdam; 0.222 -> 0.756, FedYogi - nearly identical, since `v`'s update
+depends on the raw pseudo-gradient, not `eta_s`), confirming the server-side
+optimizer is doing exactly what the hypothesis predicted: learning the noise
+floor's magnitude and dividing it back down.
+
+**Utility does not recover - F1 stays at 0 in 9 of 10 arm-rounds measured**
+(FedAdam all 5, FedYogi all 5). This is NOT the same finding as Step 17's
+"noise/signal ratio gets worse under decay" - here the ratio gets
+*dramatically better*: using Step 16's ARM-1-with-decay trajectory
+(0.576/0.419/0.317/0.233/0.173) as the signal reference, FedAdam's
+per-round noise/signal ratio is 2.50x -> 7.77x across the 5 rounds - two
+orders of magnitude better than plain averaging's 452x -> 1503x (Step 17).
+FedYogi's ratio, 24.98x -> 77.53x, is roughly an order of magnitude better
+than plain, though ~10x worse than FedAdam's (same `eta_s` relationship).
+**And it still doesn't work.**
+
+**Why, precisely - a different, more specific failure mode than plain
+averaging's random per-round saturation.** Plain averaging's DP arm
+(Step 17) saturates to exactly 0.0 or exactly 1.0 essentially at random each
+round - whichever direction that round's raw noise happened to dominate in.
+FedAdam/FedYogi's probability distributions show something qualitatively
+different: `P(positive)` shrinks *monotonically and smoothly* round over
+round (FedAdam: mean 1.8e-5 at round 1 -> 8.8e-10 at round 5) - increasing
+confidence in the SAME wrong direction every round, not a fresh coin flip
+each time. `m` (the momentum term) is the reason: with only 5 rounds and
+`beta1=0.9`, `m` is close to a simple average of the 5 rounds' raw noise
+draws, which for a finite sample in 281,254 dimensions is never exactly
+zero - it has some residual direction. Momentum then applies that SAME
+residual direction, consistently, every round, compounding into an
+increasingly confident wrong prediction, rather than plain averaging's
+independent-per-round coin flip.
+
+**Named finding 1 - the two halves of the optimizer worked against each
+other.** `v` (second moment) did exactly its job: it killed the noise
+MAGNITUDE, ~180x, confirming the hypothesis this step set out to test. `m`
+(first moment) did the opposite of what was hoped: it amplified the noise
+DIRECTION. The residual direction of a finite (5-round) noise sample in
+281,254 dimensions is never exactly zero - some component of it is,
+unavoidably, a specific, non-random direction, purely by sampling luck.
+Momentum (`beta1=0.9`) then applies that SAME residual direction,
+consistently, every round, compounding it into an increasingly confident
+wrong prediction. Plain averaging's independent-per-round coin flip -
+each round's saturation direction essentially uncorrelated with the last -
+was, paradoxically, LESS harmful than momentum-concentrated drift: a fresh
+coin flip each round at least has a chance of cancelling out over time; a
+consistently-reinforced residual direction never does. The algorithm built
+specifically to smooth DP noise across rounds instead gave that noise's
+one non-random component somewhere to accumulate.
+
+**Named finding 2 - the 2.5x floor, and why it gets worse, not better, over
+5 rounds.** Even after ~180x damping, FedAdam's applied step (~1.3-1.5 L2)
+never drops below 2.5x the genuine no-privacy signal it is competing
+against (Step 16's LR-decayed ARM 1 trajectory, 0.576 -> 0.173). That ratio
+does not hold steady either - it DEGRADES across the 5 rounds, 2.50x ->
+3.54x -> 4.56x -> 6.00x -> 7.77x. The reason is the same tension Step 17
+already found, now visible even inside the damped regime: LR decay
+(Step 16) shrinks the genuine signal every round (0.576 -> 0.173, a
+~3.3x reduction over 5 rounds) while FedAdam's damped-noise floor stays
+comparatively flat (1.438 -> 1.344, essentially unchanged) - so the ratio
+between them necessarily widens as decay proceeds, exactly mirroring
+Step 17's plain-averaging finding that decay widens the noise/signal gap,
+just starting from a ~180x-better floor. Whether a ratio near or below 1.0
+would be the threshold where utility actually starts to recover is an
+OPEN QUESTION this measurement does not answer - FedAdam never got closer
+than 2.5x in 5 rounds, and that number was moving in the wrong direction
+by round 5, not the right one. Stated as an open question, not a claim.
+
+**This compounds with, rather than being separate from, Step 16's own
+finding.** Step 16 already established that this training regime is fragile
+even at ZERO noise - the no-privacy baseline itself only stabilises at a
+modest F1~0.43-0.46 under decay, and diverges to F1=0 without it. Given
+that fragility, ANY consistent, momentum-compounded directional
+perturbation - even one reduced 180x from its raw magnitude - lands on
+already-thin ice. The bottleneck this measurement reveals has shifted: not
+"raw DP noise overwhelms everything" (plain averaging's failure mode,
+Steps 12-17), but "any non-trivial, momentum-concentrated drift overwhelms
+an inherently fragile few-hundred-record training regime" (FedAdam/FedYogi's
+failure mode, Step 18). Different mechanism, same practical outcome.
+
+**Answer to the specific question**: the adaptive second-moment term DOES
+damp the stable DP noise component, by two orders of magnitude for FedAdam
+and one for FedYogi, exactly as hypothesised from Step 14/17's own findings
+- this is a genuine, positive, measured result, not a null one, on the
+narrow damping question. But it does not translate into recovered utility
+at this project's data scale and round count, for an identifiable and
+different reason than plain averaging's failure: momentum concentrates
+whatever small residual survives damping into a compounding, confidence-
+collapsing directional drift, on top of a training regime Step 16 already
+showed is fragile even without any noise at all. Both results - the damping
+and the non-recovery - are reported honestly, as instructed; neither was
+tuned to look better or worse than measured.
+
+---
+
+## Step 18c — FL algorithm claim audit: what the document claims vs. what
+## exists (2026-08-23)
+
+The project document's contribution #2 and Table 13 claim "the first
+systematic comparison of five FL optimization algorithms - FedAvg, FedProx,
+FedAdam, FedYogi, and SCAFFOLD - with four aggregation strategies." A
+full-repository search (code + docs + every frozen/historical experiment
+folder - `exp_c2_multiclient/`, `phase22_end_to_end/`,
+`create_dp_comparison.py`, and all others) found:
+
+- **FedProx, SCAFFOLD**: not implemented anywhere, live or historical - zero
+  matches for the algorithms or any plausible code-level proxy (`proximal`,
+  `control_variate`, `c_k`, `c_local`/`c_global`, `delta_c`) in any `.py` or
+  `.rs` file. Only `CLAUDE.md`, `FL_ALGORITHM_COMPARISON.md`, and `README.md`
+  contain the strings at all - all documentation, zero code.
+- **FedAdam, FedYogi**: were not implemented before this session. **Now
+  implemented** (Step 18a/b above) - server-side only, in
+  `scripts/run_step14_multiround.py`, using the offline-aggregation-plus-
+  GridFS-patch pattern, never touching the live Rust orchestrator or
+  `aggregator.py`'s production path.
+- **FedAvg**: only unweighted mean exists (`AggregatorAgent._aggregate_tensor()`,
+  `mode="mean"`, `server/aggregator_agent/aggregator.py:583-584`) - not the
+  textbook (McMahan et al. 2017) sample-count-weighted version. No `n_k`
+  (per-client sample count) is transmitted or referenced anywhere in this
+  codebase. This was already independently documented in this repo's own
+  pre-existing `FL_ALGORITHM_COMPARISON.md:86-90` before this session's audit.
+- **Krum**, one of the document's claimed four aggregation strategies
+  (alongside mean/trimmed_mean/median): also not implemented -
+  `AggregatorAgent._aggregate_tensor()` has exactly three modes, no fourth.
+
+**Bottom line on the document's claim**: of five claimed FL optimization
+algorithms, three (FedProx, SCAFFOLD, and FedAvg's weighting) remain
+unimplemented after this session; two (FedAdam, FedYogi) are now real,
+working, measured implementations (Step 18a/b, above) - the first genuine
+content behind that claim to exist in this codebase. Of four claimed
+aggregation strategies, three (mean, trimmed_mean, median) are implemented;
+Krum is not.
+
+**Not implemented, with reasons - difficulty was not the blocker for any of
+these:**
+
+- **FedProx** - implementable (~40-60 lines across `trainer_mentalbert_privacy.py`
+  and `pipeline.py`, no Rust, following the exact `round_id`-threading pattern
+  Step 16 already used) but its benefit cannot be validated in this project as
+  currently constituted: every "client" trains on the identical 149-record
+  shared corpus (documented since Fix E2), so there is no genuine non-IID
+  client divergence for the proximal term to correct. Building it would
+  produce a mechanism that runs but demonstrates nothing about what FedProx is
+  for. Not implemented for that reason, not for difficulty.
+- **Krum** - needs `K>=5` (`f=floor(K/5)`); at this project's `n=3`
+  ("clients"), `f=0` - zero Byzantine tolerance, a degenerate edge case, not a
+  meaningful demonstration. Even at `K>=5`, there is no genuine adversarial or
+  malfunctioning client to filter - all submissions come from the one honest
+  enrolled device (the single-device-identity disclosure already in
+  `MENTOR_DEMO_RUNBOOK.md`) training on identical data. Krum's entire purpose
+  is adversary detection; this architecture has no adversary for it to detect.
+- **SCAFFOLD** - requires persistent, genuine per-client identity (for `c_k`)
+  and genuine per-client data heterogeneity (for the control variates to have
+  anything to correct), neither of which this single-enrolled-device
+  architecture provides (three or five "clients" per round are one device
+  submitting sequentially, all training on the same corpus). Building it with
+  synthetic per-session client IDs would manufacture a demonstration whose
+  honesty is worse than simply not claiming it - consistent with how Defect
+  A/B and the `server.rs:1499` trimmed_mean-to-mean change are already logged
+  as known-and-not-started rather than worked around with something that only
+  looks correct.
