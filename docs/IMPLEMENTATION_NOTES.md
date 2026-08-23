@@ -288,3 +288,113 @@ substantially lower `noise_multiplier`, or both. Nothing about ARM 2's config
 was retuned to make this comparison land more favorably, per the standing
 rule in this project: report what's measured, don't tune between runs to
 make numbers look better.
+
+---
+
+## Step 13 — testing the root cause: aggregation mode and noise_multiplier
+## (2026-08-23)
+
+**Precise question**: does a configuration exist that recovers non-degenerate
+aggregated utility while remaining within eps<=8 at n=3 clients? Not "find a
+config that works" - a negative answer is a legitimate result.
+
+**Mode-selection blocker, confirmed**: the Rust orchestrator hardcodes
+`"mode": "trimmed_mean"` (`server.rs:1499`) with no env/config/request
+override anywhere (checked `orchestrator.toml` and all of `server.rs`/
+`round.rs`) - selecting `mean` for a live round requires editing Rust source,
+out of scope. Workaround used: `scripts/aggregate_offline.py` lets the live
+pipeline run completely untouched for all 3 client submissions (real gRPC/
+TPM/mTLS/DP, real GridFS uploads, real epsilon), then calls the *unmodified*
+`AggregatorAgent` class directly with a different `mode` argument - same
+decryption code, same class, different caller than the Rust subprocess
+invocation. Nothing in `aggregator.py` or Rust was edited.
+
+**Table** (seed=303 throughout - the one non-degenerate seed from Step 12;
+n_eval=37; clip_norm=0.85, delta=1e-5 unchanged from Step 12):
+
+| noise_multiplier | mode | accuracy | precision | recall | F1 | MAE | pred+/37 | prob(+) mean/stdev | delta L2 | epsilon | eps<=8 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1.0 | mean | 0.7027 | 0.0000 | 0.0000 | 0.0000 | 15,681.78 | 0/37 | 0.000 / 0.000 | 260.25 | 5.302585 | **PASS** |
+| 1.0 | trimmed_mean | 0.7027 | 0.0000 | 0.0000 | 0.0000 | 301,155.11 | 0/37 | 0.000 / 0.000 | 301.80 | 5.302585 | **PASS** |
+| 0.5 | mean | **BLOCKED** - round never completed | | | | | | | | 11.756463 | FAIL |
+| 0.25 | mean | **BLOCKED** - round never completed | | | | | | | | 27.512925 | FAIL |
+
+The `1.0` row is a controlled pair: both modes ran on the *identical* 3
+encrypted uploads from one live round (`round_id=1`, file_ids
+`6a8a7c2d...`, `6a8a7c73...`, `6a8a7cb8...`), so the only thing that differs
+between those two rows is the aggregation math, not training/noise variance.
+
+**BLOCKED means exactly that, not "degraded"**: at noise_multiplier=0.5 and
+0.25, `runtime/pipeline.py`'s own pre-existing hard ceiling
+(`MAX_EPS_VALUE = 10.0`, `pipeline.py:60`) rejects the round outright -
+`[FAIL] epsilon_spent=11.7565 exceeds hard ceiling 10.0` and
+`epsilon_spent=27.5129 exceeds hard ceiling 10.0` respectively, raised before
+`SubmitReceipt` is ever called. No update reaches GridFS, no aggregation
+happens, there is no model to evaluate. This ceiling was not touched,
+weakened, or bypassed to get numbers out of these cells - it did exactly what
+CLAUDE.md documents it should ("Server-side hard epsilon ceiling; round
+aborted on violation"), and the two probe attempts that hit it are reported
+as blocked, not worked around.
+
+**Reading the results:**
+
+1. **Mean genuinely reduces noise, matching the Step 13a arithmetic almost
+   exactly.** A single client's noised update measures L2~450 (Step 12/11d).
+   Mean-of-3 predicts `450/sqrt(3) = 259.8`; measured `260.25` - a 0.2% match.
+   Trimmed_mean (median-of-3) measured `301.80` on the *same 3 uploads*,
+   confirming Step 12's Q3 finding was not an artifact of that particular
+   round: mean is measurably, reproducibly better than this aggregator's
+   trimmed_mean at n=3, by exactly the amount the arithmetic predicts.
+
+2. **It is not enough.** 260.25 is still ~433x the ~0.6 signal scale. Both
+   `1.0` rows collapse to the same degenerate "predict everyone negative"
+   pattern (MAE in the thousands to hundreds of thousands - a real PHQ-scale
+   MAE should be O(1-10)). Switching only the aggregation mode, at the
+   noise_multiplier that keeps eps<=8, does not recover non-degenerate
+   utility.
+
+3. **The only levers that would plausibly help - more clients per round (so
+   mean gets its sqrt(n) benefit at a larger n) or lower noise_multiplier -
+   are unavailable within this project's own constraints as currently
+   configured**: this system runs with one enrolled device (n=3 "clients" is
+   three sequential submissions from it, documented since Fix E2), and
+   lowering noise_multiplier to recover utility is blocked by the pipeline's
+   own eps<=10 ceiling well before reaching eps<=8.
+
+**Answer to the precise question**: **no** - no configuration tested (mean
+aggregation, or lower noise_multiplier, or both together) recovers
+non-degenerate aggregated utility while remaining within eps<=8 at n=3
+clients. This is reported as the negative result it is; nothing was retuned
+between cells to change the outcome.
+
+**Scope of this finding - read this before citing the result anywhere.**
+This is **not** "DP destroys utility for federated depression detection." It
+is: **at n=3 clients, in a single round, DP-SGD at noise_multiplier=1.0
+destroys rather than degrades utility, because sqrt(3) denoising cannot
+bridge a 450:0.6 noise-to-signal ratio.** Every measurement in Step 12 and
+Step 13 is round 1 (or, for the `1.0` pair here, one round evaluated two
+ways) - a single noisy draw, aggregated once, evaluated once. Real FL
+deployments run many rounds across many clients, where noise is zero-mean
+and partially cancels across BOTH dimensions (more clients per round, more
+rounds accumulating signal) while the model's actual learned signal
+compounds round over round. Nothing tested here rules out that a real
+multi-round, larger-n deployment recovers utility this single-round n=3
+snapshot cannot - that is a different, larger, so-far unmeasured question
+(see the Step 14 section below, which begins to measure it). Treat this
+result as a genuine, scoped finding about *this configuration measured this
+way*, not a general verdict on DP-SGD for this task.
+
+**Actionable recommendation, recorded separately from the negative result
+above** (not implemented - a deliberate decision to log, not something to
+slip into a Rust file unreviewed): **mean aggregation should replace
+trimmed_mean at low client counts**, independent of whether it alone
+recovers non-degenerate utility. It is strictly better denoising at n=3
+(measured: 260.25 vs 301.80 on identical data, matching the sqrt(3)
+prediction to 0.2%) with no compensating robustness benefit given up - Step
+12 already established trimmed_mean confers no real Byzantine-robustness at
+n=3 (median-of-3 is not more attack-resistant than mean-of-3 at this client
+count). Making this real requires changing the hardcoded literal at
+`server/orchestration_agent/src/grpc/server.rs:1499`
+(`"mode": "trimmed_mean"`) - Rust code, out of scope for this investigation
+per its own constraints. Logged here as a recommended future change with its
+exact location, not made.

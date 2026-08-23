@@ -139,7 +139,14 @@ def fetch_aggregated_delta(mongo_uri: str, db_name: str, round_id: int):
     return delta
 
 
-def reconstruct_and_evaluate(seed: int, round_id: int, mongo_uri: str, db_name: str, device: str):
+def evaluate_delta(aggregated_delta: dict, seed: int, device: str, label: str = ""):
+    """Reconstructs base_state[trainable_keys] + aggregated_delta and evaluates
+    on the Fix E2 held-out 37, given an ALREADY-COMPUTED aggregated delta dict
+    (from GridFS via fetch_aggregated_delta(), or from any other aggregation —
+    e.g. scripts/aggregate_offline.py's offline AggregatorAgent(mode=...) call
+    for Step 13's mean-vs-trimmed_mean comparison). Contains no round_id /
+    GridFS logic itself — that's the caller's job (see fetch_aggregated_delta()
+    and aggregate_offline.py's fetch_round_updates())."""
     records = read_parquet_records(str(PARQUET_PATH))
     train_records, eval_records = stratified_split(records)
     audio_dim, vision_dim = infer_dims(records)
@@ -149,8 +156,7 @@ def reconstruct_and_evaluate(seed: int, round_id: int, mongo_uri: str, db_name: 
           f"negative={sum(1 for r in eval_records if float(r['phq_score']) < PHQ_POSITIVE_THRESHOLD)})")
     print(f"[info] audio_dim={audio_dim} vision_dim={vision_dim} device={device}")
 
-    aggregated_delta = fetch_aggregated_delta(mongo_uri, db_name, round_id)
-    print(f"[info] aggregated delta: {len(aggregated_delta)} keys, "
+    print(f"[info] aggregated delta{' (' + label + ')' if label else ''}: {len(aggregated_delta)} keys, "
           f"{sum(v.numel() for v in aggregated_delta.values()):,} params")
     delta_l2 = torch.sqrt(sum((v.float().norm() ** 2) for v in aggregated_delta.values())).item()
     print(f"[info] aggregated delta L2 norm = {delta_l2:.6f}")
@@ -223,7 +229,7 @@ def reconstruct_and_evaluate(seed: int, round_id: int, mongo_uri: str, db_name: 
 
     result = {
         "seed": seed,
-        "round_id": round_id,
+        "label": label,
         "n_eval": len(eval_records),
         "aggregated_delta_l2": delta_l2,
         "accuracy": float(acc),
@@ -245,6 +251,13 @@ def reconstruct_and_evaluate(seed: int, round_id: int, mongo_uri: str, db_name: 
     print("=" * 60)
     print("[RESULT_JSON] " + json.dumps(result))
     return result
+
+
+def reconstruct_and_evaluate(seed: int, round_id: int, mongo_uri: str, db_name: str, device: str):
+    """CLI path (Step 12): fetch the orchestrator's own GridFS-aggregated
+    (trimmed_mean, live) delta for round_id, then evaluate_delta() it."""
+    aggregated_delta = fetch_aggregated_delta(mongo_uri, db_name, round_id)
+    return evaluate_delta(aggregated_delta, seed, device, label=f"round_id={round_id}")
 
 
 def main() -> int:
