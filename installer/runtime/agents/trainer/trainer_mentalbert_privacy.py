@@ -111,7 +111,31 @@ SUPERVISED_LR = float(os.environ.get("SUPERVISED_LR", "1e-4"))
 SUPERVISED_EPOCHS = int(os.environ.get("SUPERVISED_EPOCHS", "10"))
 
 # Safety hyperparameters (tunable)
-DEFAULT_MAX_PARAM_CHANGE = 1e-3        # per-parameter absolute clamp on delta
+# Fix E5: recalibrated from the old 1e-3, which was set for the pre-Fix-E4
+# regime (19 steps, lr=2e-5) and had gone stale the same way clip_norm had -
+# measured (N=1, current regime: lr=1e-4, epochs=10) it was clamping 33.10%
+# of all 281,254 trainable params on every single run (93,083 params), not
+# occasionally - a routine limiter masquerading as a rare backstop. Global
+# per-parameter |delta| distribution: median=0.00059, p90=0.00207,
+# p99=0.00403, p99.9=0.00594, max=0.00916 (phq_mu was the most volatile
+# submodule proportionally at 70.8% exceeding the old threshold; fc1
+# dominated by absolute count simply because it's 93.3% of all trainable
+# params). 0.02 gives ~2.2x headroom over the observed max and is fully
+# inert on the measured run (0% clamped) - deliberately more margin than the
+# L2-norm clamps use, because per-parameter maxima are a noisier statistic
+# than an aggregate L2 norm (L2 benefits from central-limit averaging across
+# 281K dimensions - see the CV note in docs/IMPLEMENTATION_NOTES.md - a
+# single parameter's worst case does not), so N=1 doesn't support as tight a
+# margin as the N=30 L2 calibrations did.
+#
+# IMPORTANT: compute_filtered_delta() (used by scripts/calibrate_clip_norm.py
+# to calibrate DP's clip_norm) does NOT apply this clamp or the global-norm
+# one below - it measures the raw, pre-safety-clamp delta. That is only a
+# valid calibration for DP's clip_norm as long as BOTH safety clamps stay
+# inert under normal operation (as intended here). If either is ever
+# tightened enough to routinely engage again, clip_norm must be recalibrated
+# too - see docs/IMPLEMENTATION_NOTES.md.
+DEFAULT_MAX_PARAM_CHANGE = float(os.environ.get("MAX_PARAM_CHANGE", "0.02"))  # per-parameter absolute clamp on delta
 # Fix C, recalibrated again for Fix E4 (lr/epochs changed the delta scale
 # entirely - see scripts/calibrate_clip_norm.py, N=30: max shifted from
 # 0.1177 to 0.7294). This is a general safety backstop applied BEFORE
@@ -925,10 +949,26 @@ def stratified_split(
 
 
 def apply_safety_to_delta(delta: Dict[str, torch.Tensor], max_param_change: float = DEFAULT_MAX_PARAM_CHANGE, max_global_norm: float = DEFAULT_MAX_GLOBAL_DELTA_NORM) -> Dict[str, torch.Tensor]:
+    # Fix E5: these two clamps are meant to be rare safety backstops, not
+    # routine limiters - engagement must be visible, not silent. This is
+    # exactly the check that would have caught DEFAULT_MAX_PARAM_CHANGE
+    # going stale (33% of params clamped every run) immediately instead of
+    # being found after the fact during an unrelated investigation.
+    n_params_total = sum(t.numel() for t in delta.values())
+
     # per-parameter clamp
+    n_params_clamped = 0
     for k in list(delta.keys()):
         t = delta[k]
+        n_params_clamped += (t.abs() > max_param_change).sum().item()
         delta[k] = t.clamp(min=-max_param_change, max=max_param_change)
+
+    if n_params_clamped > 0:
+        frac = n_params_clamped / max(n_params_total, 1)
+        msg = (f"per-parameter safety clamp ENGAGED: {n_params_clamped:,}/{n_params_total:,} "
+               f"params ({frac*100:.2f}%) exceeded +/-{max_param_change} and were clamped")
+        print(f"[SAFETY-CLAMP] {msg}")
+        rpt.warn(msg)
 
     # compute global norm
     total_sq = 0.0
@@ -938,6 +978,10 @@ def apply_safety_to_delta(delta: Dict[str, torch.Tensor], max_param_change: floa
 
     if global_norm > max_global_norm:
         scale = max_global_norm / (global_norm + 1e-12)
+        msg = (f"global-norm safety clamp ENGAGED: delta L2={global_norm:.6f} exceeded "
+               f"max_global_norm={max_global_norm}, rescaled by factor {scale:.6f}")
+        print(f"[SAFETY-CLAMP] {msg}")
+        rpt.warn(msg)
         for k in delta:
             delta[k] = (delta[k].float() * scale).clone()
     return delta

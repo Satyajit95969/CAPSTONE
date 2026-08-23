@@ -70,3 +70,41 @@ CV is safer to trust with less margin above the observed max, and clipping
 behavior is more predictable round to round - fewer surprise clips on tail
 runs. Not the reason Fix E4 was done (that was fixing the degenerate
 collapse), but worth recording as a real, measured side benefit.
+
+---
+
+## Fix E5 — `calibrate_clip_norm.py` measures the RAW delta, not the clamped one (2026-08-23)
+
+**The bug this documents**: after Fix E4 raised `lr`/`epochs`, `clip_norm`
+was recalibrated (0.15→0.85) against `scripts/calibrate_clip_norm.py`'s N=30
+measurement. That measurement calls `compute_filtered_delta()` directly,
+which does **not** call `apply_safety_to_delta()` - it measures the delta
+before either safety clamp (`DEFAULT_MAX_PARAM_CHANGE`,
+`DEFAULT_MAX_GLOBAL_DELTA_NORM`) touches it. Meanwhile the live pipeline
+*does* run `apply_safety_to_delta()` before encryption. At the time of that
+recalibration, `DEFAULT_MAX_PARAM_CHANGE` was still `1e-3`, stale from the
+pre-Fix-E4 regime, and was clamping 33.10% of all 281,254 trainable params on
+every single run - cutting the delta from L2≈0.66 down to L2≈0.36 before DP
+ever saw it. `clip_norm=0.85` was calibrated against a distribution the live
+pipeline was never actually producing.
+
+**Why this was allowed to happen**: nothing surfaced it. Both safety clamps
+were silent - they clamped or rescaled without printing anything different
+from a run where they never engaged. Fixed as part of Fix E5:
+`apply_safety_to_delta()` now prints and `rpt.warn()`s whenever either clamp
+actually engages, so this class of drift is visible on the next run it
+happens on, not discovered later by a separate investigation.
+
+**The standing rule, for whoever touches either clamp next**:
+`compute_filtered_delta()`-based calibration (`calibrate_clip_norm.py`,
+`sweep_lr_epochs.py`) is only a valid measurement of what reaches DP's
+`clip_norm` **as long as both safety clamps stay inert under normal
+operation** - i.e. as long as neither one's `[SAFETY-CLAMP] ... ENGAGED`
+warning fires on ordinary runs. If you tighten `DEFAULT_MAX_PARAM_CHANGE` or
+`DEFAULT_MAX_GLOBAL_DELTA_NORM` enough that either starts engaging routinely
+again, the raw-delta calibration stops being accurate and `clip_norm` must be
+recalibrated - or better, teach the calibration scripts to call
+`apply_safety_to_delta()` too, so they measure what actually reaches DP
+regardless of clamp settings. Neither script does that today; it wasn't
+necessary while both clamps were dead defaults, but it's a known gap now
+that they aren't.
