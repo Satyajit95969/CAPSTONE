@@ -867,3 +867,111 @@ these:**
   A/B and the `server.rs:1499` trimmed_mean-to-mean change are already logged
   as known-and-not-started rather than worked around with something that only
   looks correct.
+
+---
+
+## Step 20 — genuine per-client data partitioning (2026-08-23)
+
+**The problem this closes**: every measurement before this step had all
+"clients" training on the identical 149-record split (documented since Fix
+E2) - not federation, one dataset submitted three times. Step 20 adds a real
+N-way stratified (IID) or Dirichlet-skewed (non-IID) partition of the TRAIN
+records only - the held-out 37 stays global and untouched throughout.
+
+**Where client identity comes from**: nothing distinguished client 1/2/3
+before this step - `device_id` is the same enrolled device every submission,
+`session_id` a fresh random UUID, `round_meta.round_id` identical across all
+3. `RoundMetadata.num_updates` (proto field 6) could in principle self-assign
+a shard but is race-prone under concurrent launches; a `CLIENT_SHARD_ID` env
+var (matching the `GLOBAL_INIT_SEED` precedent) is race-free and was used
+instead.
+
+**Implementation** (`trainer_mentalbert_privacy.py` - no Rust/security
+touched): `stratified_shard(train_records, n_shards, shard_id, seed,
+noniid_alpha=None)`, placed next to `stratified_split()` (never modified -
+every prior measurement depends on its 2-way contract staying exactly as
+today). IID mode divides each class's shuffled indices into near-equal
+contiguous pieces. Non-IID mode draws each class's per-shard share from
+Dirichlet(alpha) (stdlib `random.gammavariate`, no numpy dependency) - low
+alpha concentrates a class into fewer shards. Every client computes the
+identical full partition from the same `(n_shards, seed, alpha)` and slices
+out its own `shard_id` - no cross-client coordination needed, shards are
+guaranteed disjoint and exhaustive. If a draw leaves any shard single-class
+or empty, the WHOLE partition is redrawn (`seed+1, seed+2, ...`, logged) up
+to 100 attempts before raising. `CLIENT_SHARD_ID`/`CLIENT_N_SHARDS` both
+unset by default - `orchestrate()` never calls `stratified_shard()` at all in
+that case, verified two ways: (1) code inspection - the gate requires both
+non-`None`, and the `else` branch performs zero reassignment of
+`train_records`; (2) a fresh offline call to `stratified_split()` reproduced
+the exact train=149 (44 pos/105 neg) reported identically in every run since
+Step 12. Offline unit tests (both modes) confirmed shards disjoint and
+exhaustive (union == the 149 train records) before any live run.
+
+**One mistake caught before it propagated**: the first live Run A used
+`DP_MECHANISM=gaussian` (the driver's naive default) - noise swamps any
+partitioning signal regardless of how data is split (F1=0, aggregated delta
+L2=259.9, indistinguishable from every other DP-enabled run in this project)
+and cannot answer what this step asked, since the comparison target (Step
+14 ARM 1's 0.6667) is the NO-PRIVACY arm. Reset and reran both arms with
+`DP_MECHANISM=none`, isolating partitioning as the only changed variable.
+
+**Run A - IID, 3 shards** (seed=303, shard_seed=20240, no privacy):
+
+| client | shard size | pos/neg | achieved ratio | delta L2 |
+|---|---|---|---|---|
+| 0 | 50 | 15/35 | 0.3000 | 0.3319 |
+| 1 | 50 | 15/35 | 0.3000 | 0.3692 |
+| 2 | 49 | 14/35 | 0.2857 | 0.3421 |
+
+Aggregated delta L2 = 0.2415, F1 = 0.0000, accuracy = 0.6757, predicted+ =
+1/37, MAE = 4.807, eps = inf (arm=none, the real value, not the pipeline's
+1.0 receipt fallback).
+
+**Run B - non-IID, alpha=0.5, same 3 shards, same seed** (no privacy):
+
+| client | shard size | pos/neg | achieved ratio | delta L2 |
+|---|---|---|---|---|
+| 0 | 73 | 11/62 | 0.1507 | 0.3740 |
+| 1 | 40 | 1/39 | 0.0250 | 0.2648 |
+| 2 | 36 | 32/4 | 0.8889 | 0.2752 |
+
+Genuinely skewed - client 1 near all-negative (2.5% positive), client 2 near
+all-positive (89%). Resample-on-collapse fired once (logged) avoiding a
+single-class draw. Aggregated delta L2 = 0.1999, F1 = 0.0000, accuracy =
+0.7027, predicted+ = 0/37, MAE = 6.427, eps = inf.
+
+**Findings:**
+
+1. **Per-client deltas now genuinely differ, and non-IID differs more than
+   IID.** Run A's spread (0.332-0.369, range 0.037, ~11% of mean) vs. Run
+   B's (0.265-0.374, range 0.109, ~36% of mean) - roughly 3x the relative
+   spread at the identical seed and client count. A clean signature that
+   genuinely different data is now driving genuinely different client
+   updates, not merely training stochasticity on identical data (which is
+   what produced ALL prior per-client variation before this step).
+
+2. **Every delta in both runs falls outside the Fix E4 calibration range
+   [0.625, 0.729]** - measured 0.265-0.374, roughly half the calibrated
+   range. `calibrate_clip_norm.py` calibrated `clip_norm=0.85` against
+   149-record training; ~50-record shards produce systematically smaller
+   deltas. Flagged as a finding, per instruction - NOT retuned in this step.
+   A separate recalibration (or an epoch-count sweep for the sharded
+   regime, since ~50 records may not want the same `epochs=10` tuned for
+   149) is a future decision, not made here.
+
+3. **F1 dropped from 0.6667 (identical-partition baseline, Step 14 ARM 1
+   round 1) to 0.0000 in both runs** - exactly the outcome anticipated
+   before running anything. A lower, genuinely-federated number, reported
+   honestly; nothing tuned to compensate. `SUPERVISED_EPOCHS` was left at
+   its default 10 throughout, per instruction - not tuned to chase a better
+   number on ~50-record shards.
+
+4. **Held-out 37 confirmed identical** across both runs and every prior
+   measurement since Step 12 - `stratified_shard()` only ever receives
+   `train_records`, never `eval_records`.
+
+Both runs completed through TPM signing, encryption, and upload with zero
+errors. Clipping was not re-confirmed from a saved log line for these
+specific runs (driver display truncation) but is inferred with high
+confidence to be inert - every delta measured is well under
+`clip_norm=0.85`, consistent with every prior measurement at this scale.

@@ -975,6 +975,142 @@ def stratified_split(
     return train_records, eval_records
 
 
+# Step 20: env-gated, default unset ("off"). With CLIENT_SHARD_ID or
+# CLIENT_N_SHARDS unset, orchestrate() never calls stratified_shard() at all
+# - train_records stays exactly what stratified_split() returned, byte-
+# identical to every measurement from Step 12 onward. CLIENT_SHARD_SEED has a
+# fixed default so a sharded run is reproducible without the caller having to
+# supply one; it is inert unless sharding is actually enabled.
+CLIENT_SHARD_ID      = os.environ.get("CLIENT_SHARD_ID")
+CLIENT_N_SHARDS       = os.environ.get("CLIENT_N_SHARDS")
+CLIENT_SHARD_SEED     = int(os.environ.get("CLIENT_SHARD_SEED", "20240"))
+CLIENT_NONIID_ALPHA   = os.environ.get("CLIENT_NONIID_ALPHA")
+
+
+def _chunk_evenly(idx_list: List[int], n_shards: int) -> List[List[int]]:
+    """n_shards contiguous pieces differing in size by at most 1 element."""
+    n = len(idx_list)
+    base, rem = divmod(n, n_shards)
+    chunks, start = [], 0
+    for i in range(n_shards):
+        size = base + (1 if i < rem else 0)
+        chunks.append(idx_list[start:start + size])
+        start += size
+    return chunks
+
+
+def _chunks_from_counts(idx_list: List[int], counts: List[int]) -> List[List[int]]:
+    chunks, start = [], 0
+    for c in counts:
+        chunks.append(idx_list[start:start + c])
+        start += c
+    return chunks
+
+
+def _dirichlet_sample(rng: random.Random, alpha: float, k: int) -> List[float]:
+    """Dirichlet(alpha,...,alpha) sample of dimension k via the standard
+    normalised-Gamma construction (draw k independent Gamma(alpha,1) values,
+    normalise by their sum) - stdlib-only (random.Random.gammavariate), no
+    numpy dependency, deterministic under a seeded random.Random instance."""
+    gammas = [rng.gammavariate(alpha, 1.0) for _ in range(k)]
+    total = sum(gammas)
+    if total <= 0:  # astronomically unlikely for alpha > 0; fail safe to uniform
+        return [1.0 / k] * k
+    return [g / total for g in gammas]
+
+
+def _proportions_to_counts(proportions: List[float], total: int) -> List[int]:
+    """Largest-remainder rounding: proportions * total, rounded down, then
+    the leftover units go to the largest fractional remainders - guarantees
+    sum(counts) == total exactly, unlike naive round()."""
+    raw = [p * total for p in proportions]
+    counts = [int(x) for x in raw]
+    remainder = total - sum(counts)
+    order = sorted(range(len(raw)), key=lambda i: raw[i] - counts[i], reverse=True)
+    for i in range(remainder):
+        counts[order[i]] += 1
+    return counts
+
+
+def stratified_shard(
+    train_records: List[Dict[str, Any]],
+    n_shards: int,
+    shard_id: int,
+    seed: int,
+    noniid_alpha: Optional[float] = None,
+    max_resample_attempts: int = 100,
+) -> List[Dict[str, Any]]:
+    """
+    Step 20: N-way partition of an ALREADY-COMPUTED train split. Never called
+    on, or given, eval_records - see stratified_split()'s docstring and the
+    single call site in orchestrate(), which only ever shards the 149-record
+    train_records stratified_split() itself already carved out. The held-out
+    37 is never touched by this function and stays global and identical
+    across every client, every shard, every run.
+
+    IID mode (noniid_alpha=None): each class's indices are shuffled once
+    (same discipline as stratified_split()) and divided into n_shards
+    near-equal contiguous pieces (_chunk_evenly) - shard sizes differ by at
+    most 1 record per class, each shard's class ratio tracks the corpus's
+    own ratio closely.
+
+    Non-IID mode (noniid_alpha set): each shard's SHARE of each class is
+    drawn from a Dirichlet(noniid_alpha) distribution over n_shards - low
+    alpha concentrates a class into fewer shards (label skew), high alpha
+    approaches the IID split. Uses ALL real records; nothing is oversampled,
+    undersampled, or synthesised - only how the same records are divided
+    across shards changes.
+
+    Every client calls this with the SAME (n_shards, seed, noniid_alpha) and
+    a DIFFERENT shard_id - the full n_shards-way partition is recomputed
+    identically by each call (deterministic in everything except shard_id),
+    so shards are guaranteed disjoint and exhaustive without any
+    cross-client coordination.
+
+    If a draw would leave any shard single-class or empty, the ENTIRE
+    partition (not just this shard) is redrawn with seed+1, seed+2, ... -
+    all clients redraw identically since none of their inputs differ except
+    shard_id, so shards stay consistent with each other even after a
+    resample. Logged when it happens. Raises AssertionError if no valid
+    partition is found within max_resample_attempts.
+    """
+    assert 0 <= shard_id < n_shards, f"shard_id={shard_id} out of range for n_shards={n_shards}"
+
+    pos_idx_base = [i for i, r in enumerate(train_records) if float(r["phq_score"]) >= PHQ_POSITIVE_THRESHOLD]
+    neg_idx_base = [i for i, r in enumerate(train_records) if float(r["phq_score"]) < PHQ_POSITIVE_THRESHOLD]
+
+    for attempt in range(max_resample_attempts):
+        trial_seed = seed + attempt
+        rng = random.Random(trial_seed)
+        pos_idx = pos_idx_base[:]
+        neg_idx = neg_idx_base[:]
+        rng.shuffle(pos_idx)
+        rng.shuffle(neg_idx)
+
+        if noniid_alpha is None:
+            pos_chunks = _chunk_evenly(pos_idx, n_shards)
+            neg_chunks = _chunk_evenly(neg_idx, n_shards)
+        else:
+            pos_counts = _proportions_to_counts(_dirichlet_sample(rng, noniid_alpha, n_shards), len(pos_idx))
+            neg_counts = _proportions_to_counts(_dirichlet_sample(rng, noniid_alpha, n_shards), len(neg_idx))
+            pos_chunks = _chunks_from_counts(pos_idx, pos_counts)
+            neg_chunks = _chunks_from_counts(neg_idx, neg_counts)
+
+        if all(len(pos_chunks[s]) > 0 and len(neg_chunks[s]) > 0 for s in range(n_shards)):
+            if attempt > 0:
+                print(f"[STEP20-SHARD] resampled partition after {attempt} retr{'y' if attempt == 1 else 'ies'} "
+                      f"(seed {seed} -> {trial_seed}) to avoid a single-class/empty shard")
+            shard_indices = sorted(set(pos_chunks[shard_id]) | set(neg_chunks[shard_id]))
+            return [train_records[i] for i in shard_indices]
+
+    raise AssertionError(
+        f"stratified_shard: no partition with n_shards={n_shards}, alpha={noniid_alpha} "
+        f"avoiding a single-class/empty shard was found in {max_resample_attempts} attempts "
+        f"starting at seed={seed}. With {len(pos_idx_base)} positive / {len(neg_idx_base)} "
+        f"negative train records, this alpha/n_shards combination may be too extreme."
+    )
+
+
 def apply_safety_to_delta(delta: Dict[str, torch.Tensor], max_param_change: float = DEFAULT_MAX_PARAM_CHANGE, max_global_norm: float = DEFAULT_MAX_GLOBAL_DELTA_NORM) -> Dict[str, torch.Tensor]:
     # Fix E5: these two clamps are meant to be rare safety backstops, not
     # routine limiters - engagement must be visible, not silent. This is
@@ -1480,6 +1616,47 @@ def orchestrate(
             f"(positive={eval_pos}, negative={eval_neg}, n={len(eval_records)}) - "
             f"stratified_split() failed to preserve both classes."
         )
+
+        # Step 20: per-client sharding of TRAIN records only — eval_records
+        # (the held-out 37, just asserted non-degenerate above) is never
+        # passed to stratified_shard() and is untouched below. Default OFF:
+        # with either env var unset, train_records is exactly what
+        # stratified_split() returned, above — byte-identical to every
+        # measurement from Step 12 onward.
+        partition_mode = "full"
+        if CLIENT_SHARD_ID is not None and CLIENT_N_SHARDS is not None:
+            shard_id = int(CLIENT_SHARD_ID)
+            n_shards = int(CLIENT_N_SHARDS)
+            noniid_alpha = float(CLIENT_NONIID_ALPHA) if CLIENT_NONIID_ALPHA is not None else None
+            partition_mode = "non-iid" if noniid_alpha is not None else "iid"
+            train_records = stratified_shard(
+                train_records, n_shards=n_shards, shard_id=shard_id,
+                seed=CLIENT_SHARD_SEED, noniid_alpha=noniid_alpha,
+            )
+            train_pos = sum(1 for r in train_records if float(r["phq_score"]) >= PHQ_POSITIVE_THRESHOLD)
+            train_neg = len(train_records) - train_pos
+            assert train_pos > 0 and train_neg > 0, (
+                f"Shard {shard_id}/{n_shards} collapsed to a single class "
+                f"(positive={train_pos}, negative={train_neg}, n={len(train_records)}) - "
+                f"stratified_shard()'s own resample-on-collapse should have prevented this."
+            )
+            achieved_ratio = train_pos / len(train_records) if train_records else 0.0
+
+            rpt.subheader("STEP 20 — CLIENT DATA PARTITION")
+            rpt.kv("Partition mode", partition_mode)
+            rpt.kv("Shard ID", f"{shard_id}/{n_shards}")
+            rpt.kv("Shard size", f"{len(train_records)}  (positive={train_pos}, negative={train_neg})")
+            rpt.kv("Achieved positive ratio", f"{achieved_ratio:.4f}")
+            rpt.kv("Shard seed", CLIENT_SHARD_SEED)
+            if noniid_alpha is not None:
+                rpt.kv("Dirichlet alpha", noniid_alpha)
+            print(f"[STEP20-SHARD] mode={partition_mode} shard={shard_id}/{n_shards} "
+                  f"size={len(train_records)} positive={train_pos} negative={train_neg} "
+                  f"achieved_ratio={achieved_ratio:.4f} seed={CLIENT_SHARD_SEED} alpha={noniid_alpha}")
+        else:
+            rpt.subheader("STEP 20 — CLIENT DATA PARTITION")
+            rpt.kv("Partition mode", "full (CLIENT_SHARD_ID/CLIENT_N_SHARDS unset — every client trains on all 149)")
+            print(f"[STEP20-SHARD] mode=full size={len(train_records)} positive={train_pos} negative={train_neg}")
 
         rpt.subheader("SUPERVISED FINE-TUNING")
         rpt.kv("Epochs", epochs)
