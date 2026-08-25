@@ -1086,3 +1086,96 @@ per instruction.
   step's 50-record/15-positive shards. Not measured here; not claimed to
   behave any particular way. A natural next data point if genuine
   federation at usable utility is ever revisited for this corpus.
+
+---
+
+## Chapter 7 Table 15 silhouette values are fabricated, not measured
+## (2026-08-23)
+
+**The mechanism**: `create_dp_comparison.py:816` —
+```python
+silhouette = base_metrics.get("silhouette_score", 0.65 + np.random.randn() * 0.01)
+```
+A bare dict `.get()` with a random-number fallback expression as the default.
+No warning is printed when this fires (unlike the accuracy/precision/recall/f1
+fallback a few lines below, which at least logs `[WARN] Using fallback
+metrics...`), and no marker is written into the output CSV distinguishing a
+real value from this one - the column just contains a float indistinguishable
+in format from a genuine measurement.
+
+**Why it fired unconditionally, on every run, not just "sometimes"**: the
+only function in the file that computes a real silhouette score is
+`evaluate_unsupervised_X()` (`create_dp_comparison.py:226-247` - a real
+`KMeans` + real `sklearn.metrics.silhouette_score` call). It has **zero call
+sites** anywhere in the file - defined once, invoked nowhere. Neither of the
+two paths that populate `base_metrics` (the real trainer orchestrator's
+output, or this script's own local fallback trainer) ever writes a
+`"silhouette_score"` key into the metrics dict that becomes `base_metrics` -
+that key is structurally absent regardless of which trainer path ran, or
+whether it succeeded. The fallback is not a rare edge case; it is the only
+code path that has ever produced a silhouette value in this file's history.
+
+**Statistical evidence, from surviving CSVs matching the referenced
+filenames** (`dp_noise_mechanism_comparison_base.csv`,
+`..._rag.csv`, `..._vector_rag.csv`, `dp_comparison_all_modes.csv`):
+per-file silhouette means 0.6462-0.6515, stdev 0.0088-0.0114 - against the
+fallback expression's own constructed distribution, mean 0.65 / std 0.01, by
+construction. An essentially exact match, and consistent with Table 15's
+cited 0.635-0.658 clustering across all six DP mechanisms.
+
+**Structural evidence, independent of the statistical match**: within any
+one of these files, silhouette varies row-to-row across all 30 rows, while
+accuracy/precision/recall/f1/mae are frozen **identical** across every one of
+those same 30 rows. `base_metrics` is loaded once, before the
+mechanism/noise-multiplier loop, and re-read (not re-fetched) on every
+iteration - a real dict lookup necessarily returns the same value every row,
+exactly what accuracy/precision/recall/f1 show. The silhouette fallback
+expression sits inside that same loop and is evaluated fresh on every
+iteration, drawing a new `np.random.randn()` each time - exactly what the
+varying silhouette values show. Two structurally different code paths,
+visible directly in which columns move and which don't, in the surviving
+data itself - not inferred from the source alone.
+
+**What is NOT fabricated, stated precisely so this isn't overclaimed**:
+accuracy/precision/recall/f1/mae in these same files are real `metrics.json`
+values, not fallback output - the fallback's own construction (`mae =
+round(np.random.uniform(0.1, 0.4), 3)`) is bounded to [0.100, 0.400] and
+rounded to 3 decimals; the surviving mae values (1.320428729057312,
+1.6080342531204224, 2.1529345512390137) are full float precision and 3-5x
+outside that range, proof they came from a real file read. What they show is
+a genuinely collapsed, single-class model (accuracy=1.0, precision=recall=
+f1=0.0 on every row) - the already-documented single-class-collapse defect
+elsewhere in this project's history, not a new fabrication finding.
+
+**The limit of this claim, stated plainly**: no documentary chain of custody
+was established from these surviving CSVs to the specific numbers published
+in Table 15. What was established: these are the sole surviving artifacts in
+the repository matching the filenames Chapter 7's numbers are named after;
+their statistical signature matches the fallback expression's construction
+almost exactly; and their range is consistent with the table's cited
+0.635-0.658. That is strong, direct evidence the table's silhouette column
+traces to this fallback - not a proven, unbroken chain to the exact published
+cells.
+
+**`dp_noise_mechanism_comparison_full.csv` is excluded from this finding, as
+a separate, untraced artifact**: a different, older 10-column schema (no
+accuracy/precision/recall/f1/mae/mode columns at all), Linux paths
+(`/home/ritik26/Desktop/BE-Major-Project/...`, October 2025 timestamps)
+versus the other three files' Windows paths (`C:\Users\DELL\Desktop\pipeline
+backup\BE-Major-Project\...`, June 2026 timestamps) - a different machine, a
+different code snapshot, a different run. Its silhouette distribution (mean
+0.573, stdev 0.147, range 0.30-0.78) matches neither the fallback's
+construction nor Table 15's cited range. Not traced further; not folded into
+this finding.
+
+**Consequence**: Chapter 7's Table 15, and any analysis built on it
+(Figures 19/20/23/24 - "Gaussian mechanism superiority," "Laplace
+instability," and similar silhouette-driven claims) rest on random numbers
+drawn from a fixed distribution, not measurements of anything about the
+data, the DP mechanism, or the noise level. Any silhouette-based claim in the
+report must be withdrawn or re-measured against a real evaluation path -
+`evaluate_unsupervised_X()` already exists and is correct, it simply has
+never been called. `create_dp_comparison.py` was not modified, nothing was
+re-run, and re-measurement was not attempted here - fixing the fallback and
+re-establishing what the real numbers are is a separate, deliberate decision,
+not made in this investigation.
