@@ -68,6 +68,16 @@ MULTIMODAL_MAX_LEN = int(os.environ.get("MULTIMODAL_MAX_LEN", "512"))
 # "0"/"false" for an unfrozen A/B comparison run.
 FREEZE_TEXT_ENCODER = os.environ.get("FREEZE_TEXT_ENCODER", "true").strip().lower() not in ("0", "false", "no", "")
 
+# Phase A / STEP A2: Integrated-Gradients attribution over the LOCAL, PRE-DP
+# model on held-out data (docs/IMPLEMENTATION_NOTES.md - Phase A design).
+# Default OFF: diagnostic-only, never required for training/upload to
+# succeed. Local disk only - never added to the delta, a receipt, or a gRPC
+# message; runs strictly after training/eval and before DP, but nothing it
+# produces is ever read by the DP/encryption/upload path.
+XAI_ENABLED = os.environ.get("XAI_ENABLED", "0").strip().lower() not in ("0", "false", "no", "")
+XAI_N_STEPS = int(os.environ.get("XAI_N_STEPS", "25"))
+XAI_EXPLAIN_DIR = Path.home() / ".federated" / "data" / "explain_logs"
+
 # Step 12 / Defect B (docs/IMPLEMENTATION_NOTES.md): unset by default, so
 # ordinary runs are byte-for-byte unchanged - MultiModalModel(...) gets
 # PyTorch's normal random init, exactly as before this variable existed. When
@@ -321,8 +331,21 @@ class MultiModalModel(nn.Module):
         fusion_input_dim = bert_hidden + (128 if self.has_audio else 0) + (128 if self.has_vision else 0)
         self.fusion = FusionHead(fusion_input_dim)
 
-    def forward(self, input_ids, attention_mask, audio_vec=None, vision_vec=None, rl_mode=False, sample_action=False):
-        bert_out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+    def forward(self, input_ids, attention_mask, audio_vec=None, vision_vec=None, rl_mode=False, sample_action=False, inputs_embeds=None):
+        # inputs_embeds (Phase A / STEP A2): optional precomputed text embedding
+        # tensor, e.g. an Integrated-Gradients interpolation between a PAD
+        # baseline and the real embedding output. When given, it REPLACES the
+        # input_ids embedding lookup so attribution can be computed w.r.t. a
+        # differentiable embedding tensor instead of discrete token ids (token
+        # ids have no gradient). input_ids is still required in this case only
+        # to determine batch size upstream by callers, never used here when
+        # inputs_embeds is provided. Every existing call site omits
+        # inputs_embeds (defaults to None) and is therefore byte-for-byte
+        # unaffected by this parameter's addition.
+        if inputs_embeds is not None:
+            bert_out = self.bert(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+        else:
+            bert_out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
         pooled = bert_out.last_hidden_state[:, 0, :]
 
         audio_enc = None
@@ -1223,6 +1246,234 @@ def modality_ablation_importance(model: MultiModalModel, sample_batch: Dict[str,
         return agg
 
 
+# ---------- Phase A / STEP A2: Integrated Gradients attribution ----------
+XAI_SCOPE_DISCLAIMER = (
+    "SCOPE: this attribution is computed on the LOCAL, PRE-DP model "
+    "(post-fine-tuning, before clip/noise/DP, before encryption/upload) - "
+    "the model that reaches roughly F1~0.57 on this client's held-out split. "
+    "It is NOT computed on the aggregated global model produced under "
+    "differential privacy: that model is degenerate on this corpus (F1=0, "
+    "single-class predictions on all 37 held-out records - see Steps 12-18 "
+    "in docs/IMPLEMENTATION_NOTES.md), so attribution on it would explain "
+    "nothing meaningful. This is a deliberate, documented scope choice, not "
+    "an oversight. Nothing in this report left the client device: it is not "
+    "part of the uploaded payload, any receipt, or any gRPC message, and it "
+    "has no effect on epsilon or the DP-noised delta."
+)
+
+
+def xai_integrated_gradients(
+    model: "MultiModalModel",
+    ds_eval,
+    eval_records: List[Dict[str, Any]],
+    tokenizer,
+    session_id: str,
+    device: str,
+    eval_metrics: Dict[str, float],
+    n_steps: int = XAI_N_STEPS,
+    out_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """
+    Per-sample Integrated Gradients attribution over ds_eval's held-out
+    records, on the model AS PASSED IN (caller's responsibility to pass the
+    local, pre-DP model - see XAI_SCOPE_DISCLAIMER).
+
+    Text: IntegratedGradients over the BERT embeddings-layer output (a PAD
+    baseline), via MultiModalModel.forward's inputs_embeds parameter -
+    gradients flow through the frozen encoder to that output (verified
+    empirically, STEP A1) so Fix B's frozen text encoder does not block this.
+    Audio/vision: IntegratedGradients jointly over (audio_vec, vision_vec)
+    against a zero baseline, text held fixed at its real (non-baseline)
+    embedding. Attribution target is the model's positive-class probability
+    (softmax(logits)[:, 1]) - the same quantity modality_ablation_importance
+    and physician_feedback_cli already treat as "the" prediction.
+
+    Writes explain_logs/xai_ig_<session_id>_<timestamp>.json and .txt to
+    out_dir (default XAI_EXPLAIN_DIR). Returns the aggregate summary dict
+    (also used by orchestrate() to print the modality split).
+    """
+    from captum.attr import IntegratedGradients
+
+    out_dir = Path(out_dir) if out_dir is not None else XAI_EXPLAIN_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    model.eval()
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+
+    def forward_text(embeds, audio_vec, vision_vec, attention_mask, dummy_ids):
+        logits, _, _ = model(dummy_ids, attention_mask, audio_vec=audio_vec,
+                              vision_vec=vision_vec, inputs_embeds=embeds)
+        return torch.softmax(logits, dim=1)[:, 1]
+
+    def forward_av(audio_vec, vision_vec, embeds, attention_mask, dummy_ids):
+        logits, _, _ = model(dummy_ids, attention_mask, audio_vec=audio_vec,
+                              vision_vec=vision_vec, inputs_embeds=embeds)
+        return torch.softmax(logits, dim=1)[:, 1]
+
+    ig_text = IntegratedGradients(forward_text)
+    ig_av = IntegratedGradients(forward_av)
+
+    per_sample = []
+    for idx in range(len(ds_eval)):
+        item = ds_eval[idx]
+        input_ids = item["input_ids"].unsqueeze(0).to(device)
+        attention_mask = item["attention_mask"].unsqueeze(0).to(device)
+        audio_vec = item["audio_vec"].unsqueeze(0).to(device) if item.get("audio_vec") is not None else None
+        video_vec = item["video_vec"].unsqueeze(0).to(device) if item.get("video_vec") is not None else None
+        true_label = int(item["label"].item())
+
+        with torch.no_grad():
+            real_embeds = model.bert.embeddings(input_ids=input_ids)
+            baseline_ids = torch.full_like(input_ids, pad_id)
+            baseline_embeds = model.bert.embeddings(input_ids=baseline_ids)
+            audio_baseline = torch.zeros_like(audio_vec) if audio_vec is not None else None
+            vision_baseline = torch.zeros_like(video_vec) if video_vec is not None else None
+            base_probs = torch.softmax(
+                model(input_ids, attention_mask, audio_vec=audio_vec, vision_vec=video_vec)[0], dim=1
+            )
+            pred_prob_pos = base_probs[0, 1].item()
+
+        attr_embeds = ig_text.attribute(
+            inputs=real_embeds, baselines=baseline_embeds,
+            additional_forward_args=(audio_vec, video_vec, attention_mask, input_ids),
+            n_steps=n_steps,
+        )
+        per_token = attr_embeds[0].sum(dim=-1)  # [seq_len], signed
+        text_raw = per_token.abs().sum().item()
+
+        av_inputs = tuple(v for v in (audio_vec, video_vec) if v is not None)
+        av_baselines = tuple(v for v in (audio_baseline, vision_baseline) if v is not None)
+        attr_av = ig_av.attribute(
+            inputs=av_inputs, baselines=av_baselines,
+            additional_forward_args=(real_embeds, attention_mask, input_ids),
+            n_steps=n_steps,
+        )
+        if not isinstance(attr_av, tuple):
+            attr_av = (attr_av,)
+        audio_raw = attr_av[0][0].abs().sum().item() if audio_vec is not None else 0.0
+        vision_raw = attr_av[1 if audio_vec is not None else 0][0].abs().sum().item() if video_vec is not None else 0.0
+
+        total_raw = text_raw + audio_raw + vision_raw
+        if total_raw > 0:
+            norm = {"text": text_raw / total_raw, "audio": audio_raw / total_raw, "vision": vision_raw / total_raw}
+        else:
+            norm = {"text": 0.0, "audio": 0.0, "vision": 0.0}
+
+        tokens = tokenizer.convert_ids_to_tokens(input_ids[0].detach().cpu().tolist())
+        mask_list = attention_mask[0].detach().cpu().tolist()
+        per_token_list = per_token.detach().cpu().tolist()
+        token_scores = [(tok, sc) for tok, sc, m in zip(tokens, per_token_list, mask_list) if m == 1]
+        top_tokens = sorted(token_scores, key=lambda x: abs(x[1]), reverse=True)[:10]
+
+        record = eval_records[idx] if idx < len(eval_records) else {}
+        record_id = record.get("participant_id") or record.get("session_id") or record.get("id") or f"eval_{idx}"
+
+        per_sample.append({
+            "eval_index": idx,
+            "record_id": record_id,
+            "true_label": true_label,
+            "predicted_positive_prob": pred_prob_pos,
+            "raw": {"text": text_raw, "audio": audio_raw, "vision": vision_raw},
+            "normalized": norm,
+            "top_tokens": [{"token": t, "score": s} for t, s in top_tokens],
+        })
+
+    n = len(per_sample)
+    agg_raw = {
+        k: sum(s["raw"][k] for s in per_sample) / n for k in ("text", "audio", "vision")
+    } if n else {"text": 0.0, "audio": 0.0, "vision": 0.0}
+    agg_total = sum(agg_raw.values())
+    agg_normalized = (
+        {k: v / agg_total for k, v in agg_raw.items()} if agg_total > 0
+        else {"text": 0.0, "audio": 0.0, "vision": 0.0}
+    )
+
+    def _stats(key):
+        vals = [s["normalized"][key] for s in per_sample]
+        if not vals:
+            return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
+        mean = sum(vals) / len(vals)
+        var = sum((v - mean) ** 2 for v in vals) / len(vals)
+        return {"mean": mean, "std": var ** 0.5, "min": min(vals), "max": max(vals)}
+
+    variability = {k: _stats(k) for k in ("text", "audio", "vision")}
+
+    summary = {
+        "scope_disclaimer": XAI_SCOPE_DISCLAIMER,
+        "session_id": session_id,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "eval_metrics": eval_metrics,
+        "n_steps": n_steps,
+        "num_samples": n,
+        "aggregate_raw": agg_raw,
+        "aggregate_normalized": agg_normalized,
+        "per_sample_variability_of_normalized_scores": variability,
+        "per_sample": per_sample,
+    }
+
+    ts_ms = int(time.time() * 1000)
+    base_name = f"xai_ig_{session_id}_{ts_ms}"
+    json_path = out_dir / f"{base_name}.json"
+    txt_path = out_dir / f"{base_name}.txt"
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, default=float)
+
+    lines = []
+    lines.append("=" * 78)
+    lines.append("PHASE A XAI REPORT - INTEGRATED GRADIENTS MODALITY & TOKEN ATTRIBUTION")
+    lines.append("=" * 78)
+    lines.append("")
+    lines.append(XAI_SCOPE_DISCLAIMER)
+    lines.append("")
+    lines.append(f"session_id      : {session_id}")
+    lines.append(f"generated_at    : {summary['generated_at']}")
+    lines.append(f"n_steps         : {n_steps}")
+    lines.append(f"num_samples     : {n}")
+    lines.append(f"eval_metrics    : {eval_metrics}")
+    lines.append("")
+    lines.append("-" * 78)
+    lines.append("AGGREGATE MODALITY ATTRIBUTION (mean over held-out set)")
+    lines.append("-" * 78)
+    lines.append(f"  raw        : text={agg_raw['text']:.6f}  audio={agg_raw['audio']:.6f}  vision={agg_raw['vision']:.6f}")
+    lines.append(
+        f"  normalized : text={agg_normalized['text']:.4f}  audio={agg_normalized['audio']:.4f}  "
+        f"vision={agg_normalized['vision']:.4f}"
+    )
+    lines.append("")
+    lines.append("  per-sample variability of normalized scores (mean / std / min / max):")
+    for k in ("text", "audio", "vision"):
+        v = variability[k]
+        lines.append(f"    {k:7s}: mean={v['mean']:.4f}  std={v['std']:.4f}  min={v['min']:.4f}  max={v['max']:.4f}")
+    lines.append("")
+    lines.append("-" * 78)
+    lines.append(f"PER-SAMPLE DETAIL ({n} records)")
+    lines.append("-" * 78)
+    for s in per_sample:
+        lines.append("")
+        lines.append(
+            f"[{s['eval_index']}] record={s['record_id']}  true_label={s['true_label']}  "
+            f"pred_pos_prob={s['predicted_positive_prob']:.4f}"
+        )
+        lines.append(
+            f"    normalized: text={s['normalized']['text']:.4f} audio={s['normalized']['audio']:.4f} "
+            f"vision={s['normalized']['vision']:.4f}"
+        )
+        lines.append(
+            f"    raw       : text={s['raw']['text']:.6f} audio={s['raw']['audio']:.6f} "
+            f"vision={s['raw']['vision']:.6f}"
+        )
+        top_str = ", ".join(f"{t['token']}({t['score']:.4f})" for t in s["top_tokens"])
+        lines.append(f"    top tokens: {top_str}")
+
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    summary["json_path"] = str(json_path)
+    summary["txt_path"] = str(txt_path)
+    return summary
+
+
 # ---------- Physician CLI for supervised correction ----------
 PHQ_POSITIVE_THRESHOLD = 10.0  # matches label = 1 if phq_val >= 10.0 in MultiModalDataset
 
@@ -1691,6 +1942,40 @@ def orchestrate(
             rpt.kv("final_avg_loss", f"{result['final_avg_loss']:.4f}", indent=2)
         for mk, mv in result["metrics"].items():
             rpt.kv(mk, f"{mv:.4f}", indent=2)
+
+        # ── Phase A / STEP A2: XAI attribution (local pre-DP model, held-out
+        # data). Default off (XAI_ENABLED); diagnostic only - a captum or
+        # attribution failure must never break training or the upload path
+        # that follows this block, hence the broad except.
+        rpt.subheader("XAI — INTEGRATED GRADIENTS (Phase A, local pre-DP model)")
+        if XAI_ENABLED:
+            try:
+                t_xai0 = time.time()
+                xai_summary = xai_integrated_gradients(
+                    model, ds_eval, eval_records, tokenizer, session_id, device,
+                    eval_metrics=result["metrics"], n_steps=XAI_N_STEPS,
+                )
+                xai_elapsed = time.time() - t_xai0
+                ar = xai_summary["aggregate_raw"]
+                an = xai_summary["aggregate_normalized"]
+                print(f"[STEP-A2-XAI] {xai_summary['num_samples']} samples attributed in {xai_elapsed:.2f}s "
+                      f"(n_steps={XAI_N_STEPS})")
+                print(f"[STEP-A2-XAI] aggregate modality split (normalized): "
+                      f"text={an['text']:.4f} audio={an['audio']:.4f} vision={an['vision']:.4f}")
+                rpt.kv("Samples attributed", xai_summary["num_samples"], indent=2)
+                rpt.kv("Runtime", f"{xai_elapsed:.2f} sec", indent=2)
+                rpt.kv("Modality split (normalized)",
+                       f"text={an['text']:.4f} audio={an['audio']:.4f} vision={an['vision']:.4f}", indent=2)
+                rpt.kv("Modality split (raw)",
+                       f"text={ar['text']:.6f} audio={ar['audio']:.6f} vision={ar['vision']:.6f}", indent=2)
+                rpt.kv("JSON report", xai_summary["json_path"], indent=2)
+                rpt.kv("Text report", xai_summary["txt_path"], indent=2)
+                rpt.ok("XAI attribution written to local disk (explain_logs/) — never uploaded")
+            except Exception as e:
+                print(f"[STEP-A2-XAI] WARNING: attribution failed, continuing without it: {e}")
+                rpt.warn(f"XAI attribution failed (non-fatal, training/upload unaffected): {e}")
+        else:
+            rpt.kv("Status", "disabled (XAI_ENABLED not set)", indent=2)
 
         trainable_param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
         frozen_param_count    = sum(p.numel() for p in model.parameters() if not p.requires_grad)

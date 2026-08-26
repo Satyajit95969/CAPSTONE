@@ -244,7 +244,7 @@ Full list in the companion analysis (§17). The non-negotiables:
 Map the full tree (excluding `node_modules`, `.venv`, data). Identify top-level modules and how they map onto the four layers (Edge / Client / Server / Artifacts). Note anything that maps to nothing in the documented architecture, and any documented component with no corresponding directory.
 
 ### Step 2 — Technologies actually used
-Read `requirements.txt` / `pyproject.toml` / `Cargo.toml` / `package.json` / `Dockerfile` / lockfiles. Produce an actual-vs-documented technology table (§ "Required Technologies"). Flag: missing required deps, unexpected heavyweight deps, and version drift (esp. Python 3.10 vs 3.11, PyTorch 2.6.0).
+Read `requirements.txt` / `pyproject.toml` / `Cargo.toml` / `package.json` / `Dockerfile` / lockfiles. Produce an actual-vs-documented technology table (§ "Required Technologies"). Flag: missing required deps, unexpected heavyweight deps, and version drift (esp. Python 3.10 vs 3.11, PyTorch — requirements.txt:239 pins `torch==2.8.0`, verified installed as `2.8.0+cu128` in `.venv` as of 2026-08-26; this line previously said "2.6.0", which was stale and did not match the repo).
 
 ### Step 3 — Layer identification
 Locate concretely: capture module, LDA, SecureStore, Receipt Manager, Trainer, DP Agent, Encryption Agent, runtime security, orchestrator (Rust and/or `create_dp_comparison.py`), aggregator, KMA, audit agent, vector index. For each, record path + main entry symbol.
