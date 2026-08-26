@@ -393,6 +393,8 @@ def main() -> int:
             f"{consistency['num_traceable_as_percentage']}\n"
             f"- Excluded as identifier substrings (digits inside a session/device ID or hash, not a claim): "
             f"{consistency['num_excluded_as_identifier_substring']}\n"
+            f"- Excluded as timestamp fragments (clock-time or ISO-8601 datetime components, not a claim): "
+            f"{consistency['num_excluded_as_timestamp']}\n"
         )
         if not consistency["passed"]:
             doc.append(f"- **Untraceable numbers (present in the narrative, not found in the facts):** "

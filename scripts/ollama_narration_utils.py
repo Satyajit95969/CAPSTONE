@@ -155,6 +155,38 @@ def _is_identifier_substring(narrative: str, start: int, end: int) -> bool:
     return before_ok or after_ok
 
 
+_CLOCK_RE = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?\b")
+_ISO_DATETIME_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?)?\b")
+
+
+def _is_timestamp_fragment(narrative: str, start: int, end: int) -> bool:
+    """True if the number is a substring of a recognisable clock-time
+    (H:MM, H:MM:SS, H:MM:SS.ffffff) or ISO-8601 datetime
+    (YYYY-MM-DD, optionally with a T/space-separated HH:MM:SS.ffffffZ) span
+    in the narrative text.
+
+    Local, pattern-based like the identifier rule (Step B4) - NOT "is there
+    a colon somewhere nearby". A candidate span must fall entirely INSIDE a
+    span the clock/ISO regex actually matched, so e.g. "48" only counts as a
+    timestamp fragment when it is literally the MM or SS component of a
+    matched "2:48:09.825000"-shaped string, not merely near one.
+
+    Deliberately narrow scope, matching what was asked: this catches clock
+    fragments and ISO datetimes, NOT free-form written dates like "August
+    26, 2026" - "26" and "2026" in that construction have no colon or ISO
+    date-punctuation touching them, so neither regex matches, and they are
+    NOT excluded by this function. That is a separate, still-open category
+    (see check_consistency()'s docstring).
+    """
+    window_start = max(0, start - 30)
+    window_end = min(len(narrative), end + 30)
+    for pattern in (_CLOCK_RE, _ISO_DATETIME_RE):
+        for m in pattern.finditer(narrative, window_start, window_end):
+            if m.start() <= start and end <= m.end():
+                return True
+    return False
+
+
 def check_consistency(narrative: str, facts: dict) -> dict:
     """Hallucination guard: every number the LLM wrote must trace back to a
     number in the facts dict (exact match, or matches after rounding — LLMs
@@ -173,10 +205,27 @@ def check_consistency(narrative: str, facts: dict) -> dict:
         device ID, hash) is excluded from checking entirely, not just
         forgiven - it was never a claimed measurement - counted in
         num_excluded_as_identifier_substring.
-    Neither loosens what counts as a genuine fabrication: a number with no
-    percentage context and no identifier context still must match a fact
-    number (exact, rounded, or within 0.1% relative tolerance) or it is
-    flagged, exactly as before.
+
+    Step B6 addition, same treatment: a number that is a substring of a
+    recognisable clock-time or ISO-8601 datetime span in the narrative text
+    (e.g. the "48" and "09.825000" inside "2:48:09.825000") is excluded -
+    counted in num_excluded_as_timestamp. Free-form written dates ("August
+    26, 2026") are NOT covered by this - see _is_timestamp_fragment()'s
+    docstring - that is a separate, still-open false-positive category,
+    reported but deliberately not addressed here (Step B6 scoped this
+    narrowly to clock/ISO patterns).
+
+    None of these three loosen what counts as a genuine fabrication: a
+    number with no percentage context, no identifier context, and no
+    timestamp context still must match a fact number (exact, rounded, or
+    within 0.1% relative tolerance) or it is flagged, exactly as before.
+
+    Known, separately-reported, NOT fixed here: large integers the LLM
+    reformats with a misplaced thousands separator (e.g. 1506992 written as
+    "150,6992") are a real generation defect, not a false positive - see
+    docs/IMPLEMENTATION_NOTES.md "Step B6" for the investigation. Suppressing
+    that flag would hide a genuine error in the generated document, so it is
+    intentionally left flagged.
     """
     fact_numbers = _flatten_numbers(facts)
 
@@ -184,6 +233,7 @@ def check_consistency(narrative: str, facts: dict) -> dict:
     untraceable = []
     num_traceable_as_percentage = 0
     num_excluded_as_identifier_substring = 0
+    num_excluded_as_timestamp = 0
     num_candidates = 0
 
     for m in _NUMBER_RE.finditer(narrative):
@@ -193,8 +243,19 @@ def check_consistency(narrative: str, facts: dict) -> dict:
             continue
         num_candidates += 1
 
+        # NOTE: this condition is a pre-existing no-op, kept as-is (out of
+        # scope for Step B4/B6) - c is a float by this point, and f"{c}"
+        # ALWAYS contains "." for a Python float (e.g. f"{14.0}" == "14.0"),
+        # so "." not in f"{c}" is always False and this never continues.
+        # The intent ("don't flag small bare integers like the word 'one'
+        # written as a digit") is real, but the check as written does not
+        # implement it. Reported to the user, not silently fixed.
         if "." not in f"{c}" and abs(c) < 100:
             continue  # generic small integer, not treated as a claimed measurement
+
+        if _is_timestamp_fragment(narrative, m.start(), m.end()):
+            num_excluded_as_timestamp += 1
+            continue
 
         if _is_identifier_substring(narrative, m.start(), m.end()):
             num_excluded_as_identifier_substring += 1
@@ -216,5 +277,6 @@ def check_consistency(narrative: str, facts: dict) -> dict:
         "num_fact_numbers_available": len(fact_numbers),
         "num_traceable_as_percentage": num_traceable_as_percentage,
         "num_excluded_as_identifier_substring": num_excluded_as_identifier_substring,
+        "num_excluded_as_timestamp": num_excluded_as_timestamp,
         "untraceable_numbers": untraceable,
     }

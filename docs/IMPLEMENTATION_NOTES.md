@@ -1294,3 +1294,75 @@ scoped to what Steps A3-A7 actually established:
 - Aggregate, cohort-level statements about modality contribution (e.g. "text
   was the most heavily weighted modality across this client's held-out set")
   **are** supportable by Steps A5-A6's results and may be used.
+
+---
+
+## Step B6 — thousands-separator mangling: investigated, not suppressed (2026-08-27)
+
+Phase D's consistency checker (`scripts/ollama_narration_utils.py`) flagged
+`150.0` and `6992.0` as untraceable across repeated runs. Narrative text:
+*"...consisted of **150,6992** bytes of data..."* — the real value is
+`1506992` (the encrypted payload size, `model_updates[0]["size_bytes"]`).
+phi3:mini is writing the digits in the right order but placing the comma
+wrong (grouping from the front - 3 digits, comma, 4 digits - instead of the
+standard right-to-left thousands grouping). Unlike Step B4/B6's other three
+categories (percentage restatement, identifier substrings, timestamp
+fragments), this is **not a false positive** - the checker flagging it is
+correct: the generated document states the payload size incorrectly. Per
+instruction, investigated rather than suppressed.
+
+**1. Determinism.** Confirmed deterministic, not random: two independent
+Phase D runs (Step B5, Step B7) both produced the byte-for-byte identical
+wrong string `"150,6992"`. Same input, same wrong output, every time.
+
+**2. Presentation-format test.** Two experiments:
+- *Isolated* (a single-fact, single-sentence prompt: "state this payload
+  size"): tested `1506992` (unformatted int), `"1,506,992"` (comma-formatted
+  string), and `"1.5 MB"` (human-readable string), 2 trials each. **All three
+  forms were reproduced correctly in every trial** - `1506992`, `1,506,992`,
+  and `1.5 MB` respectively, no mangling. This ruled out "phi3:mini simply
+  cannot write large digit sequences" as the cause.
+- *Real prompt* (the actual, full Phase D facts JSON and prompt - ~14
+  fact numbers, receipts, epsilon, L2 norms, static caveats - not a
+  simplified one-fact test): `size_bytes` swapped from the raw int
+  `1506992` to the pre-formatted string `"1,506,992"`, 2 trials, everything
+  else identical to a real run. **Both trials reproduced `1,506,992`
+  correctly, with zero mangling.** The isolated test alone would not have
+  been sufficient evidence - the real failure only ever occurred inside the
+  busier, many-numbers prompt, so the fix needed to be proven there, not in
+  simplification.
+
+**3. Conclusion and recommendation.** The defect is not about the number's
+magnitude or the checker's tolerance - it is that presenting `size_bytes` as
+a bare JSON integer, inside a prompt already carrying many other numbers,
+gives phi3:mini's small parameter count nothing to anchor the digit-grouping
+to, and it improvises one - wrong - under load. Pre-formatting the value as
+a comma-separated string *in the facts dict* (not the checker, not the
+prompt instructions) fixed it reliably, 2/2 trials, under real prompt
+conditions. **Recommended fix, not yet implemented pending approval**: in
+`gather_facts()` (`privacy_explanation_agent.py`), format
+`model_updates[i]["size_bytes"]` as `f"{value:,}"` before it enters the
+facts dict, matching the same principle Phase B already applies to
+per-patient data - present the value in the form the model can reproduce
+faithfully, rather than trusting free-form generation to get formatting
+right unaided. If ever a byte-count fact exceeded what this fix could
+reliably reproduce, the fallback consistent with Phase B's own design would
+be to state it only in the deterministic facts table and instruct the LLM
+not to restate it in prose at all - but that fallback was not needed here;
+the comma-formatting fix is proven sufficient.
+
+**Two further false-positive categories surfaced during Step B7 re-
+verification, both newly discovered, neither in scope for Step B4/B6, and
+neither fixed:**
+- A fact stated only inside a descriptive string (e.g.
+  `static_system_facts.aggregation_strategy`'s prose mentions
+  "trim_ratio=0.1") is correctly restated by the LLM but flagged
+  untraceable, because `_flatten_numbers()` only walks real JSON *number*
+  fields - strings are skipped by design (so string-embedded numbers were
+  never facts to trace against in the first place).
+- A file:line citation like `server.rs:1497-1500`, when echoed verbatim by
+  the LLM, has its range hyphen parsed by `_NUMBER_RE` as a unary minus,
+  producing a spurious `-1500.0`.
+
+Both are reported here rather than fixed, consistent with this step's
+scoping discipline - a candidate for a future, explicitly-scoped step.
