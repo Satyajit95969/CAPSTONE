@@ -176,10 +176,19 @@ def gather_facts(round_id: int, db_name: str, mongo_uri: str, receipts_dir: Path
 
     model_updates_out = []
     for mu in model_updates:
+        raw_size = mu.get("size_bytes")
         model_updates_out.append({
             "device_id": mu.get("device_id"),
             "session_id": mu.get("session_id"),
-            "size_bytes": mu.get("size_bytes"),
+            # Step B8: pre-formatted as a comma-grouped string, not a bare
+            # int - proven 2/2 trials under the real prompt (Step B6
+            # investigation, docs/IMPLEMENTATION_NOTES.md) to fix phi3:mini
+            # reliably mangling large digit-groups (1506992 -> "150,6992")
+            # when writing it out in a busy, many-numbers narrative. A bare
+            # int is still available as size_bytes_raw for any caller that
+            # needs the actual number rather than the display string.
+            "size_bytes": f"{raw_size:,}" if isinstance(raw_size, (int, float)) else raw_size,
+            "size_bytes_raw": raw_size,
             "upload_time": str(mu.get("upload_time")),
             "verified": mu.get("verified"),
         })
@@ -386,15 +395,18 @@ def main() -> int:
         doc.append(f"**Result: {'PASSED' if consistency['passed'] else 'WARNING — narrative contains numbers not traceable to the facts above'}**\n")
         doc.append(
             f"- Numeric claims extracted from the narrative: {consistency['num_checked_as_claims']} "
-            f"(of {consistency['num_candidates_extracted']} numbers found; small bare integers "
-            f"under 100 are excluded as generic prose, not treated as claims)\n"
+            f"(of {consistency['num_candidates_extracted']} numbers found)\n"
             f"- Fact numbers available to check against: {consistency['num_fact_numbers_available']}\n"
+            f"- Excluded as generic small integers (bare, no decimal point, under 100 - not a claim): "
+            f"{consistency['num_excluded_as_small_integer']}\n"
             f"- Traceable as a percentage restatement (e.g. 0.5676 written as \"56.76%\"): "
             f"{consistency['num_traceable_as_percentage']}\n"
             f"- Excluded as identifier substrings (digits inside a session/device ID or hash, not a claim): "
             f"{consistency['num_excluded_as_identifier_substring']}\n"
             f"- Excluded as timestamp fragments (clock-time or ISO-8601 datetime components, not a claim): "
             f"{consistency['num_excluded_as_timestamp']}\n"
+            f"- Excluded as written-date fragments (e.g. \"August 26, 2026\", not a claim): "
+            f"{consistency['num_excluded_as_written_date']}\n"
         )
         if not consistency["passed"]:
             doc.append(f"- **Untraceable numbers (present in the narrative, not found in the facts):** "

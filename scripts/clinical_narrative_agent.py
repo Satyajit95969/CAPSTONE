@@ -387,12 +387,16 @@ def main() -> int:
             f"- Numeric claims extracted: {consistency['num_checked_as_claims']} "
             f"(of {consistency['num_candidates_extracted']} numbers found)\n"
             f"- Fact numbers available to check against: {consistency['num_fact_numbers_available']}\n"
+            f"- Excluded as generic small integers (bare, no decimal point, under 100 - not a claim): "
+            f"{consistency['num_excluded_as_small_integer']}\n"
             f"- Traceable as a percentage restatement (e.g. 0.5676 written as \"56.76%\"): "
             f"{consistency['num_traceable_as_percentage']}\n"
             f"- Excluded as identifier substrings (digits inside a session/device ID or hash, not a claim): "
             f"{consistency['num_excluded_as_identifier_substring']}\n"
             f"- Excluded as timestamp fragments (clock-time or ISO-8601 datetime components, not a claim): "
             f"{consistency['num_excluded_as_timestamp']}\n"
+            f"- Excluded as written-date fragments (e.g. \"August 26, 2026\", not a claim): "
+            f"{consistency['num_excluded_as_written_date']}\n"
         )
         if not consistency["passed"]:
             doc.append(f"- **Untraceable numbers:** {consistency['untraceable_numbers']}\n")

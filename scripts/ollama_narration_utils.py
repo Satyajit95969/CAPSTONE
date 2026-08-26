@@ -59,8 +59,40 @@ def call_ollama(prompt: str, model: str, url: str, timeout: int) -> tuple[str | 
 
 _NUMBER_RE = re.compile(r"-?\d+\.\d+(?:[eE][-+]?\d+)?|-?\d{2,}")
 
+# Step B8 item 3: a file:line source citation embedded in a facts string
+# (e.g. "server.rs:1497-1500") - excluded from string-number extraction
+# below because these are code locations, not measurements, and several of
+# them (92, 104, 528, 542, 629, 660, 1497, 1500 - the exact citations in
+# this project's STATIC_SYSTEM_FACTS) would otherwise become "known facts"
+# every single Phase D run, purely as a side effect of being quoted in a
+# caveat string.
+_FILE_LINE_CITATION_RE = re.compile(r"\b[\w./\\-]+\.\w{1,4}:\d+(?:-\d+)?\b")
+
 
 def _flatten_numbers(obj) -> list[float]:
+    """Step B8 item 3: also extracts numbers embedded in string VALUES
+    (e.g. "trimmed_mean, trim_ratio=0.1" -> 0.1), not just real JSON number
+    fields. Previously a fact stated only inside descriptive prose (like
+    that trim_ratio) was invisible to this function and so could never be
+    traced against, even when the LLM restated it correctly.
+
+    Risk, stated plainly rather than left implicit: this widens what counts
+    as a "known fact" to include any number that happens to appear anywhere
+    in any string in the facts dict - including incidental numbers that
+    are not measurements at all (source line numbers, hex-ish fragments,
+    dates). A fabricated claim that coincidentally matches one of those
+    incidental numbers would now be forgiven when it shouldn't be. The
+    concrete, non-hypothetical instance of this risk in THIS system is file:
+    line citations in STATIC_SYSTEM_FACTS ("server.rs:1497-1500" and
+    similar) - without a guard, ~8 source-line integers between 92 and 1500
+    would become "traceable" every run purely as a byproduct of being
+    quoted in a caveat. _FILE_LINE_CITATION_RE excludes exactly that
+    pattern and nothing broader. This does not eliminate the general risk
+    (a coincidental match to some OTHER incidental string-embedded number is
+    still conceivable), but it removes the specific, guaranteed-to-recur
+    case observed in this codebase. Judged an acceptable, narrow widening on
+    that basis - see check_consistency()'s docstring for the fabrication
+    re-test performed after this change."""
     out = []
     if isinstance(obj, bool):
         return out
@@ -73,11 +105,14 @@ def _flatten_numbers(obj) -> list[float]:
         for v in obj:
             out.extend(_flatten_numbers(v))
     elif isinstance(obj, str):
-        # numeric strings stored as strings (e.g. session/record ids are NOT
-        # numeric facts, and timestamps embed numbers we don't want as
-        # "facts" to match against) - skip strings entirely, only real JSON
-        # numbers count.
-        pass
+        citation_spans = [(m.start(), m.end()) for m in _FILE_LINE_CITATION_RE.finditer(obj)]
+        for m in _NUMBER_RE.finditer(obj):
+            if any(cs <= m.start() and m.end() <= ce for cs, ce in citation_spans):
+                continue  # file:line source citation, not a fact
+            try:
+                out.append(float(m.group()))
+            except ValueError:
+                pass
     return out
 
 
@@ -187,6 +222,64 @@ def _is_timestamp_fragment(narrative: str, start: int, end: int) -> bool:
     return False
 
 
+_MONTH_NAMES = (
+    r"January|February|March|April|May|June|July|August|September|October|November|December|"
+    r"Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept|Sep|Oct|Nov|Dec"
+)
+_WRITTEN_DATE_RE = re.compile(
+    rf"\b(?:{_MONTH_NAMES})\.?\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s*\d{{4}}\b"    # "August 26, 2026" / "Aug 26th 2026"
+    rf"|\b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:{_MONTH_NAMES})\.?,?\s*\d{{4}}\b"   # "26 August 2026"
+    rf"|\b(?:{_MONTH_NAMES})\.?\s+\d{{4}}\b",                                # "August 2026" (no day)
+    re.IGNORECASE,
+)
+
+
+def _is_written_date_fragment(narrative: str, start: int, end: int) -> bool:
+    """True if the number is a substring of a recognisable written date
+    ("August 26, 2026", "26 August 2026", "August 2026") - anchored to an
+    actual month name (full or standard abbreviation) directly adjacent to
+    the day/year numbers, not "any number near any capitalised word".
+
+    Same containment approach as the identifier/timestamp rules: the number
+    must fall entirely inside a span _WRITTEN_DATE_RE actually matched. "In
+    May, 26 patients were enrolled" does NOT match - the comma right after
+    the month breaks the required "month <whitespace> day" adjacency, so
+    "26" there is correctly left as an ordinary number to check, not
+    excluded as a date fragment.
+    """
+    window_start = max(0, start - 30)
+    window_end = min(len(narrative), end + 30)
+    for m in _WRITTEN_DATE_RE.finditer(narrative, window_start, window_end):
+        if m.start() <= start and end <= m.end():
+            return True
+    return False
+
+
+def _parse_number_match(narrative: str, m: re.Match) -> tuple[float, int, int]:
+    """Step B8 item 2: corrects _NUMBER_RE's bare-int alternative allowing an
+    optional leading '-', which misreads a numeric-RANGE hyphen (e.g. the
+    "1497-1500" in a file:line citation "server.rs:1497-1500") as a unary
+    minus, producing a spurious -1500.
+
+    Detection: the character immediately before the matched '-' is itself a
+    digit. No genuine negative-number usage in English prose produces this -
+    a real negative is always preceded by whitespace, punctuation, "is/of/
+    was", an opening parenthesis, or the start of the string (e.g. "value:
+    -3", "temperature is -3", "(-3)", "-3 degrees"); nothing in ordinary
+    prose writes a digit immediately followed by a minus sign immediately
+    followed by another digit except a range. Returns the corrected
+    (value, start, end) - start is advanced past the stripped '-' so
+    downstream adjacency checks (identifier/timestamp/date) see the number's
+    true span, not the discarded sign character.
+    """
+    text = m.group()
+    start, end = m.start(), m.end()
+    if text.startswith("-") and start > 0 and narrative[start - 1].isdigit():
+        text = text[1:]
+        start += 1
+    return float(text), start, end
+
+
 def check_consistency(narrative: str, facts: dict) -> dict:
     """Hallucination guard: every number the LLM wrote must trace back to a
     number in the facts dict (exact match, or matches after rounding — LLMs
@@ -215,17 +308,41 @@ def check_consistency(narrative: str, facts: dict) -> dict:
     reported but deliberately not addressed here (Step B6 scoped this
     narrowly to clock/ISO patterns).
 
-    None of these three loosen what counts as a genuine fabrication: a
-    number with no percentage context, no identifier context, and no
-    timestamp context still must match a fact number (exact, rounded, or
-    within 0.1% relative tolerance) or it is flagged, exactly as before.
+    Step B8 additions:
+      - Written dates ("August 26, 2026") are excluded, same local
+        containment approach as timestamps - counted in
+        num_excluded_as_written_date. "In May, 26 patients..." is NOT
+        excluded (no month-day adjacency) - see _is_written_date_fragment().
+      - The range-hyphen misparse (a file:line citation's "1497-1500"
+        producing a spurious -1500) is corrected at match level - see
+        _parse_number_match(). Verified against a genuine negative-number
+        narrative (see the Step B8 verification report) to confirm real
+        negatives still parse correctly.
+      - _flatten_numbers() now also extracts numbers from string values
+        (e.g. "trim_ratio=0.1"), with a narrow file:line-citation exclusion
+        - see _flatten_numbers()'s own docstring for the risk this
+        introduces and why it's judged acceptable.
+      - The small-bare-integer skip below now checks the RAW MATCHED TEXT
+        (m.group(), pre-sign-correction) for a decimal point, not the
+        stringified float - the previous version was a no-op (a Python
+        float always stringifies with "."), so this exclusion has never
+        actually fired before Step B8. See the Step B8 verification report
+        for how many numbers this newly excludes in real narratives.
+
+    None of these loosen what counts as a genuine fabrication: a number with
+    no percentage context, no identifier context, no timestamp context, and
+    no written-date context still must match a fact number (exact, rounded,
+    or within 0.1% relative tolerance) or it is flagged, exactly as before.
+    Re-verified after every addition in this file via a deliberate
+    fabrication test (fabricated F1 + fabricated percentage) - see the Step
+    B4/B6/B8 verification reports.
 
     Known, separately-reported, NOT fixed here: large integers the LLM
     reformats with a misplaced thousands separator (e.g. 1506992 written as
     "150,6992") are a real generation defect, not a false positive - see
-    docs/IMPLEMENTATION_NOTES.md "Step B6" for the investigation. Suppressing
-    that flag would hide a genuine error in the generated document, so it is
-    intentionally left flagged.
+    docs/IMPLEMENTATION_NOTES.md "Step B6" for the investigation and the
+    recommended FACTS-level fix (implemented separately in
+    privacy_explanation_agent.py's gather_facts(), not here).
     """
     fact_numbers = _flatten_numbers(facts)
 
@@ -234,36 +351,37 @@ def check_consistency(narrative: str, facts: dict) -> dict:
     num_traceable_as_percentage = 0
     num_excluded_as_identifier_substring = 0
     num_excluded_as_timestamp = 0
+    num_excluded_as_written_date = 0
+    num_excluded_as_small_integer = 0
     num_candidates = 0
 
-    for m in _NUMBER_RE.finditer(narrative):
+    for raw_m in _NUMBER_RE.finditer(narrative):
+        num_candidates += 1
         try:
-            c = float(m.group())
+            c, start, end = _parse_number_match(narrative, raw_m)
         except ValueError:
             continue
-        num_candidates += 1
+        raw_text = narrative[start:end]
 
-        # NOTE: this condition is a pre-existing no-op, kept as-is (out of
-        # scope for Step B4/B6) - c is a float by this point, and f"{c}"
-        # ALWAYS contains "." for a Python float (e.g. f"{14.0}" == "14.0"),
-        # so "." not in f"{c}" is always False and this never continues.
-        # The intent ("don't flag small bare integers like the word 'one'
-        # written as a digit") is real, but the check as written does not
-        # implement it. Reported to the user, not silently fixed.
-        if "." not in f"{c}" and abs(c) < 100:
+        if "." not in raw_text and abs(c) < 100:
+            num_excluded_as_small_integer += 1
             continue  # generic small integer, not treated as a claimed measurement
 
-        if _is_timestamp_fragment(narrative, m.start(), m.end()):
+        if _is_timestamp_fragment(narrative, start, end):
             num_excluded_as_timestamp += 1
             continue
 
-        if _is_identifier_substring(narrative, m.start(), m.end()):
+        if _is_written_date_fragment(narrative, start, end):
+            num_excluded_as_written_date += 1
+            continue
+
+        if _is_identifier_substring(narrative, start, end):
             num_excluded_as_identifier_substring += 1
             continue
 
         checked.append(c)
         traceable = _traceable_to_facts(c, fact_numbers)
-        if not traceable and _is_percentage_context(narrative, m.end()):
+        if not traceable and _is_percentage_context(narrative, end):
             if _traceable_to_facts(c / 100.0, fact_numbers):
                 traceable = True
                 num_traceable_as_percentage += 1
@@ -276,6 +394,8 @@ def check_consistency(narrative: str, facts: dict) -> dict:
         "num_checked_as_claims": len(checked),
         "num_fact_numbers_available": len(fact_numbers),
         "num_traceable_as_percentage": num_traceable_as_percentage,
+        "num_excluded_as_written_date": num_excluded_as_written_date,
+        "num_excluded_as_small_integer": num_excluded_as_small_integer,
         "num_excluded_as_identifier_substring": num_excluded_as_identifier_substring,
         "num_excluded_as_timestamp": num_excluded_as_timestamp,
         "untraceable_numbers": untraceable,
