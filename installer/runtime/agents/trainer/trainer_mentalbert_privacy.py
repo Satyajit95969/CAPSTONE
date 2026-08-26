@@ -1192,7 +1192,29 @@ def save_encrypted_delta(delta_state: Dict[str, torch.Tensor], store: SecureStor
 
 
 # ---------- Explainability (modality ablation) ----------
-def modality_ablation_importance(model: MultiModalModel, sample_batch: Dict[str, torch.Tensor], device: str = DEFAULT_DEVICE):
+def modality_ablation_importance(
+    model: MultiModalModel, sample_batch: Dict[str, torch.Tensor], device: str = DEFAULT_DEVICE,
+    audio_baseline: Optional[torch.Tensor] = None,
+    vision_baseline: Optional[torch.Tensor] = None,
+    text_baseline_embedding: Optional[torch.Tensor] = None,
+):
+    """
+    audio_baseline / vision_baseline / text_baseline_embedding (Step A5):
+    optional in-distribution "removed" values to ablate TO, replacing the
+    original zero-vector / empty-string ablation. Default None preserves the
+    EXACT original zero/empty-string behaviour unchanged - this keeps the
+    pre-existing, unconditional "autonomous" mode call site
+    (orchestrate(), mode="autonomous") byte-for-byte identical to before
+    Step A5, since it does not pass these new parameters. Callers that want
+    the corrected, scale-consistent behaviour (Step A6's diagnostic, and any
+    future opt-in) pass compute_modality_baselines()'s output explicitly.
+    See docs/IMPLEMENTATION_NOTES.md "Step A4/A5" for why zero was found to
+    be a biased baseline for audio/vision (16.6x / 11.1x scale mismatch vs
+    text) and why this is gated per-call rather than a global default.
+    audio_baseline/vision_baseline: 1-D tensors broadcastable to the batch's
+    audio_vec/video_vec shape. text_baseline_embedding: 1-D [hidden] tensor,
+    broadcast across every token position.
+    """
     model.eval()
     with torch.no_grad():
         inputs = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in sample_batch.items()}
@@ -1202,7 +1224,10 @@ def modality_ablation_importance(model: MultiModalModel, sample_batch: Dict[str,
         results = {}
         # audio ablation
         if inputs.get("audio_vec") is not None:
-            zero_a = torch.zeros_like(inputs["audio_vec"])
+            if audio_baseline is not None:
+                zero_a = audio_baseline.to(device).unsqueeze(0).expand_as(inputs["audio_vec"])
+            else:
+                zero_a = torch.zeros_like(inputs["audio_vec"])
             l_a, r_a, _ = model(inputs["input_ids"], inputs["attention_mask"], audio_vec=zero_a, vision_vec=inputs.get("video_vec"))
             p_a = torch.softmax(l_a, dim=1)[:, 1].mean().item()
             r_a_val = r_a.mean().item()
@@ -1213,7 +1238,10 @@ def modality_ablation_importance(model: MultiModalModel, sample_batch: Dict[str,
             results["audio_phqdelta"] = 0.0
         # vision ablation
         if inputs.get("video_vec") is not None:
-            zero_v = torch.zeros_like(inputs["video_vec"])
+            if vision_baseline is not None:
+                zero_v = vision_baseline.to(device).unsqueeze(0).expand_as(inputs["video_vec"])
+            else:
+                zero_v = torch.zeros_like(inputs["video_vec"])
             l_v, r_v, _ = model(inputs["input_ids"], inputs["attention_mask"], audio_vec=inputs.get("audio_vec"), vision_vec=zero_v)
             p_v = torch.softmax(l_v, dim=1)[:, 1].mean().item()
             r_v_val = r_v.mean().item()
@@ -1222,13 +1250,21 @@ def modality_ablation_importance(model: MultiModalModel, sample_batch: Dict[str,
         else:
             results["vision_posdelta"] = 0.0
             results["vision_phqdelta"] = 0.0
-        # text ablation via empty string
+        # text ablation: mean-embedding baseline (Step A5) if given, else the
+        # original empty-string baseline (unchanged default)
         try:
-            tokenizer = AutoTokenizer.from_pretrained(MENTALBERT_PRETRAIN)
-            empty = tokenizer([""] * inputs["input_ids"].shape[0], padding=True, truncation=True, return_tensors="pt")
-            empty_ids = empty["input_ids"].to(device)
-            empty_mask = empty["attention_mask"].to(device)
-            l_t, r_t, _ = model(empty_ids, empty_mask, audio_vec=inputs.get("audio_vec"), vision_vec=inputs.get("video_vec"))
+            if text_baseline_embedding is not None:
+                seq_len = inputs["input_ids"].shape[1]
+                bsz = inputs["input_ids"].shape[0]
+                mean_embeds = text_baseline_embedding.to(device).view(1, 1, -1).expand(bsz, seq_len, -1)
+                l_t, r_t, _ = model(inputs["input_ids"], inputs["attention_mask"], audio_vec=inputs.get("audio_vec"),
+                                     vision_vec=inputs.get("video_vec"), inputs_embeds=mean_embeds)
+            else:
+                tokenizer = AutoTokenizer.from_pretrained(MENTALBERT_PRETRAIN)
+                empty = tokenizer([""] * inputs["input_ids"].shape[0], padding=True, truncation=True, return_tensors="pt")
+                empty_ids = empty["input_ids"].to(device)
+                empty_mask = empty["attention_mask"].to(device)
+                l_t, r_t, _ = model(empty_ids, empty_mask, audio_vec=inputs.get("audio_vec"), vision_vec=inputs.get("video_vec"))
             p_t = torch.softmax(l_t, dim=1)[:, 1].mean().item()
             r_t_val = r_t.mean().item()
             results["text_posdelta"] = abs(base_pos - p_t)
@@ -1244,6 +1280,95 @@ def modality_ablation_importance(model: MultiModalModel, sample_batch: Dict[str,
             "raw": results
         }
         return agg
+
+
+# ---------- Phase A / STEP A5: in-distribution modality baselines ----------
+XAI_BASELINE_CACHE_PATH = Path.home() / ".federated" / "data" / "xai_baselines" / "modality_baselines.pt"
+
+
+def compute_modality_baselines(
+    train_records: List[Dict[str, Any]],
+    tokenizer,
+    device: str,
+    cache_path: Optional[Path] = None,
+    force_recompute: bool = False,
+) -> Dict[str, Any]:
+    """
+    Step A5: in-distribution baseline vectors for XAI attribution, computed
+    once over the TRAIN split only (never eval - using eval data to build a
+    baseline would leak information about the held-out set into the
+    "removed" reference point). Cached to disk so it is deterministic and
+    reused across runs/clients rather than recomputed from randomness.
+
+    Replaces the zero-vector baseline for audio/vision found in Step A4 to
+    be a large, systematically biased perturbation (audio_vec's real
+    magnitude is ~16.6x text's and ~11.1x vision's, so zero is a far more
+    extreme, out-of-distribution "removed" state for audio than for the
+    other two modalities - this, not output scale, was the actual root
+    cause of Step A3's audio-dominant result). For full consistency, also
+    replaces text's PAD-token baseline with a genuine mean-embedding
+    baseline: PAD is in-distribution in the sense of being a real
+    embedding-table row, but it is one specific token's embedding, not a
+    distributional average - the audio/vision baselines below ARE averages,
+    so text is switched to match (mean of real, attended/non-PAD token
+    embeddings across the train corpus).
+
+    All three baselines are computed independent of any locally fine-tuned
+    weights: audio_mean/vision_mean are raw MultiModalDataset feature
+    averages, and text_mean_embedding only touches the FROZEN (Fix B) BERT
+    embeddings layer. This makes the cached baselines deterministic and
+    identical across every client/round that shares the same pretrained
+    MENTALBERT_PRETRAIN checkpoint.
+    """
+    cache_path = Path(cache_path) if cache_path is not None else XAI_BASELINE_CACHE_PATH
+    if cache_path.exists() and not force_recompute:
+        return torch.load(cache_path, map_location=device)
+
+    from transformers import AutoModel
+    bert = AutoModel.from_pretrained(MENTALBERT_PRETRAIN).to(device)
+    bert.eval()
+    for p in bert.parameters():
+        p.requires_grad_(False)
+
+    ds_train = MultiModalDataset(train_records, tokenizer, max_len=MULTIMODAL_MAX_LEN)
+    audio_sum = vision_sum = text_embed_sum = None
+    text_token_count = 0
+    n = len(ds_train)
+
+    with torch.no_grad():
+        for i in range(n):
+            item = ds_train[i]
+            input_ids = item["input_ids"].unsqueeze(0).to(device)
+            attention_mask = item["attention_mask"].to(device)
+            emb = bert.embeddings(input_ids=input_ids)[0]        # [seq_len, hidden]
+            real = emb[attention_mask.bool()]                     # [n_real_tokens, hidden]
+            s = real.sum(dim=0)
+            text_embed_sum = s if text_embed_sum is None else text_embed_sum + s
+            text_token_count += real.size(0)
+
+            a = item["audio_vec"].to(device)
+            audio_sum = a.clone() if audio_sum is None else audio_sum + a
+            v = item["video_vec"].to(device)
+            vision_sum = v.clone() if vision_sum is None else vision_sum + v
+
+    audio_mean = (audio_sum / n).cpu()
+    vision_mean = (vision_sum / n).cpu()
+    text_mean_embedding = (text_embed_sum / text_token_count).cpu()
+
+    baselines = {
+        "audio_mean": audio_mean,
+        "vision_mean": vision_mean,
+        "text_mean_embedding": text_mean_embedding,
+        "num_train_records": n,
+        "num_text_tokens_averaged": text_token_count,
+        "audio_mean_l2_norm": audio_mean.norm().item(),
+        "vision_mean_l2_norm": vision_mean.norm().item(),
+        "text_mean_embedding_l2_norm": text_mean_embedding.norm().item(),
+        "source": "stratified_split() train split, computed via compute_modality_baselines()",
+    }
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(baselines, cache_path)
+    return baselines
 
 
 # ---------- Phase A / STEP A2: Integrated Gradients attribution ----------
@@ -1270,6 +1395,7 @@ def xai_integrated_gradients(
     session_id: str,
     device: str,
     eval_metrics: Dict[str, float],
+    baselines: Dict[str, Any],
     n_steps: int = XAI_N_STEPS,
     out_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
@@ -1278,15 +1404,21 @@ def xai_integrated_gradients(
     records, on the model AS PASSED IN (caller's responsibility to pass the
     local, pre-DP model - see XAI_SCOPE_DISCLAIMER).
 
-    Text: IntegratedGradients over the BERT embeddings-layer output (a PAD
-    baseline), via MultiModalModel.forward's inputs_embeds parameter -
-    gradients flow through the frozen encoder to that output (verified
-    empirically, STEP A1) so Fix B's frozen text encoder does not block this.
-    Audio/vision: IntegratedGradients jointly over (audio_vec, vision_vec)
-    against a zero baseline, text held fixed at its real (non-baseline)
-    embedding. Attribution target is the model's positive-class probability
-    (softmax(logits)[:, 1]) - the same quantity modality_ablation_importance
-    and physician_feedback_cli already treat as "the" prediction.
+    Text: IntegratedGradients over the BERT embeddings-layer output, via
+    MultiModalModel.forward's inputs_embeds parameter - gradients flow
+    through the frozen encoder to that output (verified empirically, STEP
+    A1) so Fix B's frozen text encoder does not block this. Audio/vision:
+    IntegratedGradients jointly over (audio_vec, vision_vec), text held
+    fixed at its real (non-baseline) embedding. Attribution target is the
+    model's positive-class probability (softmax(logits)[:, 1]) - the same
+    quantity modality_ablation_importance and physician_feedback_cli already
+    treat as "the" prediction.
+
+    baselines: output of compute_modality_baselines() (Step A5) - in-
+    distribution mean vectors for text/audio/vision, replacing the original
+    PAD-token / zero-vector baselines found in Step A4 to bias the result
+    toward whichever modality has the largest raw input scale (audio,
+    16.6x/11.1x larger than text/vision) rather than genuine importance.
 
     Writes explain_logs/xai_ig_<session_id>_<timestamp>.json and .txt to
     out_dir (default XAI_EXPLAIN_DIR). Returns the aggregate summary dict
@@ -1298,7 +1430,9 @@ def xai_integrated_gradients(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     model.eval()
-    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    text_mean_embedding = baselines["text_mean_embedding"].to(device)
+    audio_mean = baselines["audio_mean"].to(device)
+    vision_mean = baselines["vision_mean"].to(device)
 
     def forward_text(embeds, audio_vec, vision_vec, attention_mask, dummy_ids):
         logits, _, _ = model(dummy_ids, attention_mask, audio_vec=audio_vec,
@@ -1324,10 +1458,10 @@ def xai_integrated_gradients(
 
         with torch.no_grad():
             real_embeds = model.bert.embeddings(input_ids=input_ids)
-            baseline_ids = torch.full_like(input_ids, pad_id)
-            baseline_embeds = model.bert.embeddings(input_ids=baseline_ids)
-            audio_baseline = torch.zeros_like(audio_vec) if audio_vec is not None else None
-            vision_baseline = torch.zeros_like(video_vec) if video_vec is not None else None
+            seq_len = input_ids.shape[1]
+            baseline_embeds = text_mean_embedding.view(1, 1, -1).expand(1, seq_len, -1).contiguous()
+            audio_baseline = audio_mean.unsqueeze(0).expand_as(audio_vec).contiguous() if audio_vec is not None else None
+            vision_baseline = vision_mean.unsqueeze(0).expand_as(video_vec).contiguous() if video_vec is not None else None
             base_probs = torch.softmax(
                 model(input_ids, attention_mask, audio_vec=audio_vec, vision_vec=video_vec)[0], dim=1
             )
@@ -1405,6 +1539,15 @@ def xai_integrated_gradients(
         "eval_metrics": eval_metrics,
         "n_steps": n_steps,
         "num_samples": n,
+        "baseline_kind": "in-distribution mean vectors (Step A5) - text: mean of real "
+                          "attended-token embeddings over train; audio/vision: mean feature "
+                          "vector over train. Replaces the earlier zero/PAD baseline found "
+                          "in Step A4 to bias attribution toward audio's larger raw scale.",
+        "baseline_l2_norms": {
+            "text_mean_embedding": baselines.get("text_mean_embedding_l2_norm"),
+            "audio_mean": baselines.get("audio_mean_l2_norm"),
+            "vision_mean": baselines.get("vision_mean_l2_norm"),
+        },
         "aggregate_raw": agg_raw,
         "aggregate_normalized": agg_normalized,
         "per_sample_variability_of_normalized_scores": variability,
@@ -1431,6 +1574,8 @@ def xai_integrated_gradients(
     lines.append(f"n_steps         : {n_steps}")
     lines.append(f"num_samples     : {n}")
     lines.append(f"eval_metrics    : {eval_metrics}")
+    lines.append(f"baseline_kind   : {summary['baseline_kind']}")
+    lines.append(f"baseline_l2_norms: {summary['baseline_l2_norms']}")
     lines.append("")
     lines.append("-" * 78)
     lines.append("AGGREGATE MODALITY ATTRIBUTION (mean over held-out set)")
@@ -1951,9 +2096,15 @@ def orchestrate(
         if XAI_ENABLED:
             try:
                 t_xai0 = time.time()
+                xai_baselines = compute_modality_baselines(train_records, tokenizer, device)
+                rpt.kv("Baseline source", xai_baselines["source"], indent=2)
+                rpt.kv("Baseline L2 norms",
+                       f"text={xai_baselines['text_mean_embedding_l2_norm']:.2f} "
+                       f"audio={xai_baselines['audio_mean_l2_norm']:.2f} "
+                       f"vision={xai_baselines['vision_mean_l2_norm']:.2f}", indent=2)
                 xai_summary = xai_integrated_gradients(
                     model, ds_eval, eval_records, tokenizer, session_id, device,
-                    eval_metrics=result["metrics"], n_steps=XAI_N_STEPS,
+                    eval_metrics=result["metrics"], baselines=xai_baselines, n_steps=XAI_N_STEPS,
                 )
                 xai_elapsed = time.time() - t_xai0
                 ar = xai_summary["aggregate_raw"]
