@@ -1366,3 +1366,208 @@ neither fixed:**
 
 Both are reported here rather than fixed, consistent with this step's
 scoping discipline - a candidate for a future, explicitly-scoped step.
+
+---
+
+## Phases D, A and B: the LLM explanation layer (2026-08-27)
+
+This section is written for a reader who has not followed the step-by-step
+work above - a summary of what exists, not a log of how it got built.
+
+### What each agent is
+
+Three post-hoc reporting scripts, all in `scripts/`, none of them part of
+the live federated-learning pipeline. Each reads data that some other,
+already-run process already produced and persisted; none of them compute a
+new prediction, a new privacy metric, or a new attribution value.
+
+**Phase D - `privacy_explanation_agent.py`.** Reads one federated round's
+privacy/audit telemetry (MongoDB `receipts` + `model_updates` collections,
+plus local DP-agent receipt files under `~/.federated/data/receipts/`,
+joined by `session_id`). Writes
+`~/.federated/data/audit_reports/round_<N>_privacy_report.md`. Intended
+reader: an **auditor or compliance reviewer** checking a round's epsilon
+spend, signature/HMAC-chain status, and aggregation configuration.
+
+**Phase A - `xai_integrated_gradients()`, inside
+`installer/runtime/agents/trainer/trainer_mentalbert_privacy.py`.** Not a
+standalone report-reading script like the other two - it runs INSIDE the
+training pipeline itself, gated behind `XAI_ENABLED` (default off), on the
+local model immediately after local fine-tuning finishes and before DP/
+encryption/upload. Reads the trained model and the held-out evaluation
+split; writes `explain_logs/xai_ig_<session_id>_<timestamp>.json` and
+`.txt`. Intended reader: whoever is investigating model behaviour
+(the Steps A3-A8 investigation itself, and Phase B, which consumes its
+output).
+
+**Phase B - `clinical_narrative_agent.py`.** Reads Phase A's
+`explain_logs/xai_ig_*.json`. Writes
+`~/.federated/data/clinical_reports/round_<N>_clinical_report.md`. Intended
+reader: a **clinician** deciding whether a round's screening output is
+worth acting on.
+
+### Local LLM only, never an external API
+
+Both Phase D and Phase B call `call_ollama()` (`scripts/ollama_narration_utils.py`),
+which talks to `http://localhost:11434` - a locally-running Ollama server,
+model `phi3:mini` by default - and nothing else. No other network call
+exists in either script. This was set up and verified in Phase D's own
+Step D0 (getting Ollama running entirely on local disk, `D:\TeraBoxDownload\.ollama`,
+confirmed via live TCP-connection inspection that the only established
+connection during generation was loopback-to-loopback) and re-confirmed
+structurally for Phase B in Step B3 (see below). This matters because the
+telemetry these two agents narrate - epsilon values, device IDs, receipt
+hashes, and in Phase B's case a mental-health screening cohort's prediction
+data - is exactly the kind of operationally sensitive material this
+project's core privacy claim (raw data and derived signals never leave the
+client device) would be undermined by sending to a third-party API merely
+to generate a paragraph of prose about it. Keeping the narration step local
+is not an incidental implementation choice; it is required by the same
+claim the rest of the system is built to support.
+
+### Phase B's structural guarantee: per-patient data literally cannot reach the LLM
+
+Phase A's investigation (Steps A3-A8, below) established that per-patient
+modality attribution is not reliable - two independent methods (Integrated
+Gradients and ablation) do not agree at the individual-patient level, most
+likely because this model's predictions cluster tightly around the decision
+boundary rather than committing confidently. Phase B was designed around
+that finding, not despite it.
+
+The design choice that matters most: `build_cohort_facts()`
+(`clinical_narrative_agent.py`) builds the dict that becomes the LLM
+prompt, and it **never includes the `per_sample` list** from Phase A's
+report - only aggregate counts and metrics. This was not just asserted; it
+was verified directly in Step B3 by reconstructing the actual facts dict
+and the actual prompt string sent to Ollama and inspecting both: `'per_sample'
+in facts` returned `False`, and the full ~3,100-character prompt, printed
+in full, contained exactly ten aggregate keys and zero per-record data.
+
+This makes "no per-patient attribution claims" a **structural** property of
+the system, not an instruction the model might ignore. An LLM that never
+receives a given patient's record cannot narrate that patient's record,
+regardless of how it is prompted - a stronger guarantee than "the prompt
+tells it not to." The per-patient table in the generated report is entirely
+separate: a deterministic, template-rendered table (`build_per_patient_rows()`),
+zero LLM involvement, so there is no generation step there to hallucinate
+in the first place.
+
+### The consistency checker
+
+`check_consistency()` (`scripts/ollama_narration_utils.py`) is the
+hallucination guard shared by both agents: every number the LLM's narrative
+states must trace back to a number literally present in the facts dict it
+was given (exact match, matched after rounding to fewer decimal places, or
+within 0.1% relative tolerance). A number that fails this is reported as
+"untraceable" and the report is marked WARNING rather than PASSED - the
+facts table and (in Phase B) the per-patient table are unaffected either
+way, since neither depends on the LLM succeeding.
+
+Five categories of number are excluded from checking entirely - not
+"forgiven," excluded, because they were never claimed measurements in the
+first place:
+
+1. **Generic small integers** - a bare number under 100 with no decimal
+   point in the narrative text (e.g. "12 devices"). Present in the design
+   since Phase D's original version, but broken until Step B8 - the
+   original implementation checked the stringified *float* for a decimal
+   point, and a Python float always stringifies with one (`f"{14.0}"` is
+   `"14.0"`), so the exclusion never actually fired. Fixed by checking the
+   raw matched text instead.
+2. **Percentage restatements** - a number is also checked scaled by 100 if
+   a `%` or the word "percent"/"percentage" immediately follows it in the
+   text (e.g. the LLM writing `0.5676` as `"56.76%"`). Exists because
+   converting a fraction to a percentage for readability is a faithful
+   restatement, not a fabrication - but only when the text actually
+   presents it as a percentage; a bare `56.76` with no such context is
+   still flagged.
+3. **Identifier substrings** - a number that sits inside a longer
+   alphanumeric token (a session ID, device ID, or hash quoted verbatim,
+   e.g. the `1978` inside `client-aef1978aef7f`) is not a claimed
+   measurement. Exists because these hex-ish tokens mix letters and digits
+   with no separator, or use a hyphen as an internal token separator, and
+   the LLM correctly quoting one should not be penalised.
+4. **Timestamp fragments** - a number that is a substring of a
+   clock-time or ISO-8601 datetime span (e.g. the `48` inside
+   `2:48:09.825000`) is a clock component, not a measurement.
+5. **Written-date fragments** - a number adjacent to an actual month name
+   in a date-shaped construction (e.g. `26` and `2026` inside
+   "August 26, 2026"). Anchored to real month names, not "any number near
+   any capitalised word" - "In May, 26 patients..." does not exclude the
+   26, since the comma breaks the required month-day adjacency.
+
+None of these five loosen what counts as a genuine fabrication - a number
+with none of these contexts still must match a fact number or it is
+flagged. This was proven, not assumed: a narrative was deliberately
+constructed containing a fabricated F1 score, a fabricated percentage, and
+a fabricated negative number, mixed in among a real timestamp, a real
+session ID, and a real written date. Result: all three fabrications were
+flagged as untraceable, and all three real, non-fabricated numbers were
+correctly excluded rather than flagged as noise. Re-run after every
+addition to the checker (Steps B4, B6, B8) to confirm no change had
+quietly weakened it.
+
+### The Step B6 finding: a real generation defect, not suppressed
+
+Phase D's checker flagged a payload byte count (`1506992`) that phi3:mini
+had written into the narrative as `"150,6992"` - the digits in the right
+order, the comma in the wrong place. Investigation (not suppression) found
+this to be deterministic (two independent runs produced the byte-identical
+wrong string) and specific to prompt complexity, not the number's
+magnitude - an isolated, single-fact prompt reproduced the value correctly
+in every form tested (unformatted, comma-formatted, "1.5 MB"), but the
+mangling reappeared reliably inside the real, many-numbers Phase D prompt.
+The fix that was proven to work, 2-for-2 under the real prompt: **pre-format
+the number as a comma-grouped string in the facts dict itself**
+(`gather_facts()`, Step B8), rather than adjusting the checker to tolerate
+the wrong output. The checker flagging a genuinely incorrect number in a
+generated document was correct behaviour; the fix belonged at the data
+layer, not the guard layer.
+
+### Phase A's limits, and what Phase B was built to respect
+
+Phase A's own investigation (Steps A3-A8, the "Phase A: what the attribution
+mechanism can and cannot support" section above) is not repeated here.
+Summary only: an initial unanimous 37/37 "audio dominates" result traced to
+a raw-scale baseline artefact, not a real signal; fixing the baseline
+resolved the artefact but did not make Integrated Gradients and ablation
+agree at the per-patient level; the n_steps hypothesis for that remaining
+disagreement was tested and refuted; the most likely underlying cause is
+that 36 of 37 held-out predictions sit in a low-confidence 0.3-0.7 band, not
+a defect in either attribution method. The four constraints that section
+places on any downstream narrative - no per-patient modality percentages,
+no claim a modality "drove" an individual prediction, must surface the
+model's uncertainty, aggregate/cohort-level statements are supportable -
+are what Phase B's design (this section, above) was built around from the
+start, not retrofitted afterward.
+
+### Runtimes
+
+- Phase D (`privacy_explanation_agent.py`): ~79s per round (data gathering
+  well under 1s; almost entirely local Ollama generation time).
+- Phase B (`clinical_narrative_agent.py`): ~47s per round - faster than
+  Phase D despite writing a longer report, because the per-patient section
+  is template-only (no LLM call) and the cohort prompt is smaller (aggregate
+  facts only, never per-sample records).
+- Phase A attribution (`xai_integrated_gradients()`): ~370s for a 37-record
+  held-out set at n_steps=25 (the default) - this is why `XAI_ENABLED`
+  defaults off; it is a meaningful addition to a training round's wall
+  time, not a rounding error.
+
+### What is NOT done: Phase C (RAG) does not exist
+
+The project document describes a "Vector Index Manager + Vector Database"
+retrieval-augmented-generation layer. It does not exist as a real,
+persisted retrieval system. `build_rag_features()`
+(`create_dp_comparison.py`) uses a real `sklearn.neighbors.NearestNeighbors`
+call, but retrieves from the current batch only - there is no persisted
+vector store, nothing survives between runs - and the mode dispatch for
+`rag` and `vector_rag` is code-identical, so the document's claimed
+distinction between the two modes does not exist in the code. The
+function's own docstring states plainly that it "simulates retrieval
+latency in a deterministic (seeded) way" - the `rag_mean_latency` figures
+this produces are not measured timings of anything. This was established in
+an earlier, separate investigation (report-only, not written up in this
+file at the time) and is recorded here because this section is the natural
+place a reader would look for it alongside Phase D/A/B. No Phase C agent
+has been designed or built.
