@@ -1179,3 +1179,118 @@ never been called. `create_dp_comparison.py` was not modified, nothing was
 re-run, and re-measurement was not attempted here - fixing the fallback and
 re-establishing what the real numbers are is a separate, deliberate decision,
 not made in this investigation.
+
+---
+
+## Phase A: what the attribution mechanism can and cannot support (2026-08-26)
+
+Phase A built an Integrated-Gradients (IG) modality/token attribution
+mechanism over the local, pre-DP model (`xai_integrated_gradients()`,
+`installer/runtime/agents/trainer/trainer_mentalbert_privacy.py`), intended
+to explain which modality - text, audio, video - drove a prediction, for use
+by a later explanation layer (Phase B). Getting from "it runs and produces
+numbers" to "the numbers mean what they appear to mean" took five steps of
+investigation (A3-A7), documented here so a later session does not have to
+re-derive them, and does not repeat an already-refuted hypothesis.
+
+**Step A3's original result, and why it was wrong.** The first live run
+(one client, round 1, local model F1=0.5294) produced an aggregate modality
+split of text=0.131 / audio=**0.791** / vision=0.078, with audio ranked #1
+in **37/37** held-out samples, zero exceptions. Read at face value, this
+looks like a strong, unanimous clinical finding: audio dominates. It is not
+one. Step A4 traced it to the IG baseline: audio_vec's real per-sample L2
+norm (mean 6381.6) is 16.6x text's (383.6) and 11.1x vision's (574.1) - the
+zero-vector baseline used for audio/vision is therefore a vastly more
+extreme, out-of-distribution "removed" state for audio than for the other
+two modalities, which inflates IG's raw attribution sum for audio regardless
+of genuine importance. This is a scale artefact, not a signal.
+
+**Step A4's correction of the investigation's own working assumption.** The
+original plan was to cross-check IG against `modality_ablation_importance()`
+(zero-out-a-modality, measure prediction shift) on the theory that ablation
+is "naturally scale-aware in a way raw IG is not." It agreed with raw IG
+(audio dominant, 37/37, ablation share 0.877) - but this was **not**
+independent confirmation. Ablation zeroes a modality exactly the same way
+IG's baseline does; zeroing audio is a proportionally far larger, more
+out-of-distribution perturbation than zeroing text or vision for the
+identical reason IG's baseline is biased. The two methods agreeing was two
+instances of the same shared vulnerability, not two independent methods
+converging on the truth. Catching this before treating "ablation agrees" as
+proof was the most consequential correction in this phase.
+
+**Step A5's fix.** `compute_modality_baselines()` computes in-distribution
+mean vectors over the TRAIN split only (never eval - using eval data to
+build a baseline would leak), cached to
+`~/.federated/data/xai_baselines/modality_baselines.pt`, and wires them into
+both `xai_integrated_gradients()` and (opt-in only, `modality_ablation_importance()`'s
+existing unconditional `"autonomous"`-mode call site is deliberately left on
+its original zero/empty-string behaviour to avoid an uninstructed change to
+already-shipped output) `modality_ablation_importance()`. Text's baseline
+was also switched, from a single PAD-token embedding to a mean-embedding
+(average of real, attended-token embeddings over train) - PAD is
+in-distribution but is one specific token's embedding, not a distributional
+average, which was inconsistent with the audio/vision fix's own logic.
+
+**Step A6's outcome: the artefact is fixed, the methods still don't
+converge.** Under the new baselines, the unanimous audio-dominance pattern
+is gone from both methods - IG: text=0.844/audio=0.087/vision=0.070 (37/37
+text); ablation: text=0.515/audio=0.416/vision=0.068, but only **11/20/6**
+per-sample (audio actually wins the plurality of *individual* samples while
+losing on the mean). 11/20/6 across three categories is close to a random
+three-way split (~12.3 each). An earlier draft of this step's own verdict
+logic called this "CONVERGE" because it only compared aggregate top-1 picks;
+that was an overclaim, corrected before being reported - matching on the
+mean while one method is unanimous and the other is barely-better-than-noise
+per sample is not convergence at the level Phase B would need.
+
+**Step A7: the leading hypothesis for the divergence is refuted, and the
+likely real cause is the model, not the attribution methods.** The working
+theory was that ablation is a single discrete jump from baseline to input
+while IG integrates over a path of `n_steps` points, and that predictions
+sitting near the 0.5 decision boundary would make a discrete jump more
+exposed to local nonlinearity. Tested directly: IG's per-sample dominance is
+**37/37 text at every n_steps from 5 to 50** (aggregate text score drifts
+from 0.946 at n_steps=5 down to 0.836 at n_steps=50, but the ranking never
+moves). If path-integration smoothness were what produced IG's unanimity,
+the coarsest setting (n_steps=5) should have looked unstable, closer to
+ablation. It didn't - the hypothesis is refuted, not confirmed. Per-sample
+Spearman correlation between IG and ablation across the 37 samples: mean
+ρ=0.189 (std=0.661), top-1 agreement 11/37=29.7% - at or below chance for
+three categories. The more important finding came from splitting by
+prediction confidence: **36 of the 37 held-out samples have a predicted
+positive probability in [0.377, 0.709]** - essentially the entire held-out
+set sits in the uncertain 0.3-0.7 band; only one sample is even marginally
+outside it (0.709). The "confident vs uncertain" comparison this step set
+out to run was not testable, because there is almost no confident subset to
+compare against. Decision, made explicitly rather than by continuing to
+chase the divergence: this is a property of the local model's weakness
+(F1≈0.53, precision 0.39, recall 0.82 - a model that rarely commits) not a
+defect in either attribution method, and no further attribution experiment
+on this checkpoint will resolve it. Further investigation was stopped here
+by deliberate decision, not because the question was answered.
+
+**Plain conclusion.** This mechanism supports **aggregate, cohort-level**
+modality attribution, with the method caveat stated above (IG and ablation
+do not agree on individual patients, and the model's near-universal
+prediction uncertainty is the likely reason). It does **not** support
+confident **per-patient** modality ranking. No baseline choice, no n_steps
+setting, and no confidence-based subset tested in Steps A3-A7 changes that.
+
+### Constraints Phase B must respect
+
+Written down before any narrative-generation code exists, so Phase B is
+scoped to what Steps A3-A7 actually established:
+
+- The narrative **must not** quote per-patient modality percentages (e.g.
+  "audio contributed 79% to this patient's prediction") as if they were a
+  reliable, individual measurement - Step A6/A7 showed per-patient IG and
+  ablation rankings do not agree with each other.
+- It **must not** claim a specific modality "drove" an individual
+  prediction - the same evidence applies.
+- It **must** surface the model's own uncertainty: given 36 of 37 held-out
+  predictions sit in the 0.3-0.7 band, any narrative that presents a
+  prediction as confident without saying so would misrepresent the
+  underlying model.
+- Aggregate, cohort-level statements about modality contribution (e.g. "text
+  was the most heavily weighted modality across this client's held-out set")
+  **are** supportable by Steps A5-A6's results and may be used.
