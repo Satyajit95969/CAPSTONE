@@ -1369,7 +1369,7 @@ scoping discipline - a candidate for a future, explicitly-scoped step.
 
 ---
 
-## Phases D, A and B: the LLM explanation layer (2026-08-27)
+## Phases D, A, B and C: the LLM explanation layer (2026-08-27)
 
 This section is written for a reader who has not followed the step-by-step
 work above - a summary of what exists, not a log of how it got built.
@@ -1570,4 +1570,79 @@ this produces are not measured timings of anything. This was established in
 an earlier, separate investigation (report-only, not written up in this
 file at the time) and is recorded here because this section is the natural
 place a reader would look for it alongside Phase D/A/B. No Phase C agent
-has been designed or built.
+had been designed or built AT THE TIME THIS PARAGRAPH WAS WRITTEN - it has
+since been built, with a deliberately different scope than the document
+describes. See the subsection immediately below.
+
+### Phase C, built: a clinical knowledge grounding layer, not the document's patient-embedding RAG
+
+The RAG design above (patient-embedding retrieval, simulated latency) was
+explicitly NOT revived. In a federated setting, retrieving one patient's
+embedding to inform another patient's prediction is itself a privacy
+problem, independent of it never having been on the live path. What was
+built instead: `scripts/clinical_knowledge_corpus.py` +
+`clinical_narrative_agent.py`'s retrieval step - a small, local corpus of
+**reference material only, zero patient data**, that grounds Phase B's
+cohort narrative so its clinical framing is traceable to a cited source
+instead of generated from a 3B model's unverifiable parametric memory.
+
+**The corpus's two tiers, and why a third was deliberately left out.**
+Tier 1 is PHQ-8 item wording, response scale, and scoring range, cited to
+Kroenke et al. 2009 - fixed, standardized, publicly-published instrument
+text. Tier 2 is this project's own Phase A findings, cited to this same
+file - the project citing itself, verifiable by reading it. A third
+category - feature-to-symptom mappings, e.g. "reduced AU06/AU12 activation
+↔ blunted affect" - was considered and explicitly rejected. These are
+specific, contested, actively-researched empirical claims, not fixed public
+facts like PHQ-8's wording; drafting them without a real, specific,
+peer-reviewed citation would have been introducing exactly the kind of
+unverifiable clinical claim this whole layer exists to prevent - "two
+unverified things, not one," stacking an unverified clinical claim on top
+of an attribution mechanism Phase A had already shown to be unreliable at
+the individual-patient level. That gap is left visible in the corpus
+(11 Tier-1 + 6 Tier-2 = 17 documents, no Tier 3) rather than filled with
+something plausible.
+
+**Every Tier 1 document carries `verified: False`** and a
+`verification_note` stating it was reproduced from memory of a standard
+instrument, not checked against a primary copy. This flag is designed to
+survive into the generated report, not just sit in the corpus file - see
+the compliance-gap discussion below for how that survival was ultimately
+made structural rather than left to the LLM.
+
+**Embedding model trade-off, and the retrieval miss it caused.** MentalBERT
+(already on local disk, zero new download) was chosen over
+sentence-transformers (would need a first-time HuggingFace download,
+against this layer's local-only principle) and Ollama's embeddings endpoint
+(unsupported by the running server, and phi3:mini isn't trained for
+embeddings anyway). The honest trade-off stated at design time: MentalBERT's
+raw `[CLS]` embeddings, with no contrastive/triplet fine-tuning for semantic
+similarity, are a documented-weaker retrieval signal than a purpose-built
+sentence-embedding model. This showed up in practice, not just in theory:
+`project-per-patient-unreliable` - arguably the single most on-topic
+document in the corpus for the "how reliable is per-patient modality
+attribution" query, given its title - did not surface in the top-2 results
+for that query, and **still did not surface after widening to top-3**
+(Step C4). It was consistently outranked by `project-model-training-limits`
+and `project-attribution-scope`, both topically adjacent but less precisely
+on-point. Not fixed; recorded as a known limitation of the embedding choice
+for a future session to weigh against the cost of a downloaded,
+similarity-tuned model.
+
+**Two phi3:mini instruction-compliance gaps, and how each was handled.**
+The prompt asks the model (rule 8) to cite retrieved sources inline, next to
+each claim, and (rule 10) to say "unverified" explicitly whenever it cites
+an unverified source. In live verification runs, phi3:mini complied with
+neither reliably: it collapsed inline citations into one list at the end of
+the narrative (with an occasional typo in the source name), and in at least
+one run cited unverified PHQ-8 content without ever stating it was
+unverified anywhere in the narrative body. Rather than iterating on the
+prompt and trusting compliance, the same structural principle used
+elsewhere in this layer (Phase B's per-patient table, the numeric
+consistency checker) was applied here too: `build_unverified_sources_warning()`
+generates a plain-Python sentence - not an LLM output - listing every
+unverified source by title, and it is placed immediately before the
+narrative in the generated report whenever any retrieved document has
+`verified: False`. A reader sees the warning regardless of what the model
+wrote. Rule 10 stays in the prompt as well - belt and braces, not a
+replacement for the structural guarantee.
