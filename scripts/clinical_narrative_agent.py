@@ -43,6 +43,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -53,12 +54,34 @@ from pymongo import MongoClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ollama_narration_utils import call_ollama, check_consistency  # noqa: E402
+from clinical_knowledge_corpus import CORPUS, corpus_hash  # noqa: E402
 
 DEFAULT_EXPLAIN_DIR = Path.home() / ".federated" / "data" / "explain_logs"
 DEFAULT_OUT_DIR = Path.home() / ".federated" / "data" / "clinical_reports"
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_MONGO_URI = "mongodb://localhost:27017"
 DEFAULT_DB = "federated_multimodal"
+
+# Phase C: local-only clinical knowledge retrieval. MentalBERT (already on
+# disk, no new download - see Step C1 investigation) for embeddings; the
+# path is redefined here rather than importing it from
+# trainer_mentalbert_privacy.py, which would pull in a heavy, unrelated
+# transitive dependency (the full training module) just for one constant.
+MENTALBERT_PRETRAIN = str(Path.home() / ".federated" / "models" / "mentalbert")
+CORPUS_CACHE_DIR = Path.home() / ".federated" / "data" / "clinical_knowledge_cache"
+CORPUS_EMBEDDINGS_CACHE = CORPUS_CACHE_DIR / "corpus_embeddings.pt"
+
+# Fixed topic queries (Step C2 point 3) - NOT dynamically generated from the
+# cohort facts or the LLM's own output, so retrieval stays deterministic and
+# auditable: the same three queries run every time, tied to the report's
+# three known content areas (what PHQ-8 is, the modality-attribution method
+# caveat, the confidence/uncertainty framing).
+TOPIC_QUERIES = [
+    "What does the PHQ-8 depression screening questionnaire measure, and what are its items and scoring?",
+    "How reliable is per-patient modality attribution across text, audio, and video for this model?",
+    "What does it mean when a model's prediction confidence is near the decision boundary?",
+]
+RETRIEVAL_TOP_K = 2
 
 # Confidence band threshold - Step A7's own threshold, reused deliberately
 # rather than inventing a new one (Step B2 point 3).
@@ -122,6 +145,87 @@ METHOD_CAVEAT = (
     "committing confidently either way. The aggregate, cohort-level split "
     "below remains supportable; per-patient attribution does not."
 )
+
+
+def _embed_texts(texts: list[str], device: str) -> "list[list[float]]":
+    """MentalBERT [CLS] embeddings for a list of short strings (Step C1
+    choice: already on local disk, zero new download, zero new
+    dependency - see docs/IMPLEMENTATION_NOTES.md Step C1 investigation)."""
+    import torch
+    from transformers import AutoModel, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(MENTALBERT_PRETRAIN)
+    model = AutoModel.from_pretrained(MENTALBERT_PRETRAIN).to(device)
+    model.eval()
+    out = []
+    with torch.no_grad():
+        for text in texts:
+            inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=128).to(device)
+            hidden = model(**inputs).last_hidden_state[:, 0, :]  # [CLS]
+            out.append(hidden[0].cpu().tolist())
+    return out
+
+
+def compute_or_load_corpus_embeddings(device: str, cache_path: Path | None = None,
+                                       force_recompute: bool = False) -> dict:
+    """Step C2 point 2: caches the corpus's MentalBERT embeddings to disk,
+    following Step A5's compute_modality_baselines() caching pattern.
+    Invalidation: the cache stores clinical_knowledge_corpus.corpus_hash()
+    at write time; if the CURRENT corpus's hash doesn't match, the cache is
+    stale (the corpus changed since it was written) and is recomputed
+    rather than silently served."""
+    import torch
+
+    cache_path = cache_path or CORPUS_EMBEDDINGS_CACHE
+    current_hash = corpus_hash()
+    if cache_path.exists() and not force_recompute:
+        cached = torch.load(cache_path, map_location="cpu")
+        if cached.get("corpus_hash") == current_hash:
+            return cached
+        print(f"[clinical-agent] corpus changed since embeddings were cached "
+              f"({cached.get('corpus_hash', '?')[:8]}... -> {current_hash[:8]}...), recomputing")
+
+    doc_ids = [doc["id"] for doc in CORPUS]
+    texts = [f"{doc['title']}. {doc['text']}" for doc in CORPUS]
+    embeddings = _embed_texts(texts, device)
+    cached = {"corpus_hash": current_hash, "doc_ids": doc_ids, "embeddings": embeddings}
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(cached, cache_path)
+    return cached
+
+
+def retrieve_context(queries: list[str], device: str, top_k: int = RETRIEVAL_TOP_K) -> list[dict]:
+    """Runs each of the fixed TOPIC_QUERIES against the corpus (MentalBERT
+    embeddings, sklearn NearestNeighbors cosine - Step C1's recommendation:
+    a corpus this size needs no approximate-nearest-neighbor index).
+    Returns the union of top_k matches per query, deduplicated, each entry
+    carrying its full corpus record (including the verified flag and
+    verification_note) plus which query retrieved it, so a reader can see
+    exactly why each source was pulled in."""
+    import numpy as np
+    from sklearn.neighbors import NearestNeighbors
+
+    cached = compute_or_load_corpus_embeddings(device)
+    doc_by_id = {doc["id"]: doc for doc in CORPUS}
+    corpus_matrix = np.array(cached["embeddings"], dtype=np.float32)
+
+    k = min(top_k, len(cached["doc_ids"]))
+    nn = NearestNeighbors(n_neighbors=k, metric="cosine")
+    nn.fit(corpus_matrix)
+
+    query_vecs = np.array(_embed_texts(queries, device), dtype=np.float32)
+    distances, indices = nn.kneighbors(query_vecs)
+
+    retrieved: dict[str, dict] = {}
+    for qi, query in enumerate(queries):
+        for rank, idx in enumerate(indices[qi]):
+            doc_id = cached["doc_ids"][idx]
+            similarity = 1.0 - float(distances[qi][rank])
+            entry = retrieved.setdefault(doc_id, {**doc_by_id[doc_id], "matched_queries": [], "similarity": similarity})
+            entry["matched_queries"].append(query)
+            entry["similarity"] = max(entry["similarity"], similarity)
+
+    return list(retrieved.values())
 
 
 def _find_latest_xai_report(explain_dir: Path) -> Path:
@@ -258,12 +362,51 @@ STRICT RULES:
    description of model behavior on a held-out evaluation set, not a
    statement about any patient's mental health.
 7. Write 3-5 short paragraphs. No headings, no bullet lists, no markdown.
+8. The JSON below also contains a "retrieved_context" list. Each entry has a
+   "title", "text", "source" citation, and a "verified" flag. If you use ANY
+   information from retrieved_context in your narrative, you MUST cite it by
+   its title in parentheses, e.g. "(source: PHQ-8 scoring range)". Do not
+   present retrieved_context content as your own knowledge.
+9. Do NOT make any clinical claim, definition, or interpretation that is not
+   directly supported by retrieved_context or the facts above it. If
+   retrieved_context does not cover something, do not fill the gap from your
+   own training - only state what is grounded in what you were given.
+10. If a retrieved_context entry has "verified": false, you MUST say so when
+    citing it (e.g., "unverified PHQ-8 wording, source: ...") - never present
+    it as confirmed fact.
 
 JSON facts:
 {facts_json}
 
 Now write the cohort narrative.
 """
+
+
+def render_sources_used_markdown(retrieved_docs: list[dict]) -> str:
+    """Step C2 point 6: every retrieved document, its citation, and its
+    verified flag, so a reader can check what the cohort narrative was
+    grounded in without having to open the corpus file."""
+    lines = []
+    lines.append("## Sources used\n")
+    if not retrieved_docs:
+        lines.append("*No sources retrieved (retrieval unavailable or corpus empty for this run - "
+                      "the cohort narrative above was not grounded in any retrieved reference text).*\n")
+        return "\n".join(lines)
+    lines.append(
+        "Retrieved from `scripts/clinical_knowledge_corpus.py` against this report's fixed topic "
+        "queries. The cohort narrative above was instructed to cite any of these it used, and to say "
+        "so explicitly if a source is unverified.\n"
+    )
+    lines.append("| Title | Verified | Source | Tier |")
+    lines.append("|---|---|---|---|")
+    for doc in sorted(retrieved_docs, key=lambda d: (-d.get("similarity", 0), d["id"])):
+        verified_label = "yes" if doc.get("verified") else "**NO - unverified**"
+        lines.append(f"| {doc['title']} | {verified_label} | {doc['source']} | {doc['tier']} |")
+    lines.append("")
+    for doc in sorted(retrieved_docs, key=lambda d: (-d.get("similarity", 0), d["id"])):
+        lines.append(f"**{doc['title']}** (`{doc['id']}`, verified={doc.get('verified')}): {doc['text']}")
+        lines.append(f"  *{doc.get('verification_note', '')}*\n")
+    return "\n".join(lines)
 
 
 def build_per_patient_rows(per_sample: list[dict], f1: float | None) -> list[dict]:
@@ -314,6 +457,8 @@ def main() -> int:
     ap.add_argument("--db", default=DEFAULT_DB)
     ap.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)
     ap.add_argument("--ollama-timeout", type=int, default=240)
+    ap.add_argument("--no-retrieval", action="store_true",
+                     help="skip clinical-knowledge retrieval (Phase C) - narrative generated ungrounded")
     args = ap.parse_args()
 
     t_start = time.time()
@@ -335,6 +480,32 @@ def main() -> int:
     t_gather = time.time() - t_start
     print(f"[clinical-agent] cohort facts assembled in {t_gather:.2f}s "
           f"({cohort_facts['num_patients_in_eval_set']} patients in eval set)")
+
+    # ── Phase C: clinical knowledge retrieval, between build_cohort_facts()
+    # and the prompt build (Step C2 point 4). retrieve_context() only ever
+    # queries clinical_knowledge_corpus.CORPUS, which contains zero patient
+    # data - so attaching its output to cohort_facts does not touch the
+    # structural no-per-patient-data guarantee (facts still never contains
+    # per_sample). Wrapped in try/except: retrieval failing must not break
+    # narrative generation or the deterministic tables (Step B2 point 4's
+    # principle, extended to this new step).
+    t_retrieval0 = time.time()
+    retrieved_docs = []
+    if not args.no_retrieval:
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            retrieved_docs = retrieve_context(TOPIC_QUERIES, device)
+            print(f"[clinical-agent] retrieved {len(retrieved_docs)} unique source(s) "
+                  f"for {len(TOPIC_QUERIES)} topic queries")
+        except Exception as e:
+            print(f"[clinical-agent] WARNING: clinical-knowledge retrieval failed, "
+                  f"continuing without grounding: {e}")
+    t_retrieval = time.time() - t_retrieval0
+    cohort_facts["retrieved_context"] = [
+        {"id": d["id"], "title": d["title"], "text": d["text"], "source": d["source"], "verified": d["verified"]}
+        for d in retrieved_docs
+    ]
 
     cohort_facts_md = render_cohort_facts_markdown(cohort_facts)
     prompt = build_cohort_prompt(cohort_facts)
@@ -411,21 +582,25 @@ def main() -> int:
                     f"\nThe facts table and per-patient table above/below are unaffected; "
                     f"they do not depend on the LLM.\n")
 
+    doc.append(render_sources_used_markdown(retrieved_docs))
+
     doc.append(per_patient_md)
 
     t_total = time.time() - t_start
     doc.append("---\n")
     doc.append(
         f"*Runtime: {t_total:.2f}s total — facts gathering {t_gather:.2f}s, "
-        f"LLM generation {t_llm:.2f}s, per-patient table generation is template-only "
-        f"(no LLM call, negligible time). No external network calls: MongoDB at "
-        f"{args.mongo_uri}, Ollama at {args.ollama_url} — both localhost only.*\n"
+        f"clinical-knowledge retrieval {t_retrieval:.2f}s, LLM generation {t_llm:.2f}s, "
+        f"per-patient table generation is template-only (no LLM call, negligible time). "
+        f"No external network calls: MongoDB at {args.mongo_uri}, Ollama at {args.ollama_url}, "
+        f"MentalBERT embeddings run locally — all localhost/local disk only.*\n"
     )
 
     out_path.write_text("\n".join(doc), encoding="utf-8")
 
     print(f"[clinical-agent] report written to {out_path}")
-    print(f"[clinical-agent] total runtime {t_total:.2f}s (gather {t_gather:.2f}s, llm {t_llm:.2f}s)")
+    print(f"[clinical-agent] total runtime {t_total:.2f}s "
+          f"(gather {t_gather:.2f}s, retrieval {t_retrieval:.2f}s, llm {t_llm:.2f}s)")
     return 0
 
 
