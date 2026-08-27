@@ -226,14 +226,26 @@ def compute_or_load_corpus_embeddings(device: str, cache_path: Path | None = Non
     return cached
 
 
-def retrieve_context(queries: list[str], device: str, top_k: int = RETRIEVAL_TOP_K) -> list[dict]:
-    """Runs each of the fixed TOPIC_QUERIES against the corpus (MentalBERT
-    embeddings, sklearn NearestNeighbors cosine - Step C1's recommendation:
-    a corpus this size needs no approximate-nearest-neighbor index).
-    Returns the union of top_k matches per query, deduplicated, each entry
-    carrying its full corpus record (including the verified flag and
-    verification_note) plus which query retrieved it, so a reader can see
-    exactly why each source was pulled in."""
+def retrieve_context_detailed(queries: list[str], device: str, top_k: int = RETRIEVAL_TOP_K):
+    """The single retrieval code path (Step C5: retrieve_context() below is
+    now a thin wrapper over this - visibility changes must not create a
+    second way retrieval could disagree with itself). MentalBERT embeddings,
+    sklearn NearestNeighbors cosine (Step C1's recommendation: a corpus this
+    size needs no approximate-nearest-neighbor index).
+
+    Returns (retrieved_docs, per_query, cached):
+      - retrieved_docs: the union of top_k matches across all queries,
+        deduplicated, each entry carrying its full corpus record plus which
+        queries matched it and its best similarity score - same shape
+        retrieve_context() has always returned.
+      - per_query: one entry per query, each with that query's own top_k
+        matches and THAT query's own similarity score (not deduped/maxed) -
+        what Step C5's console output and scripts/demo_rag.py need to show
+        "different queries retrieve different documents" honestly.
+      - cached: the corpus-embeddings cache dict (corpus_hash, doc_ids,
+        embeddings) - exposed so callers can print corpus size/hash without
+        a second cache load.
+    """
     import numpy as np
     from sklearn.neighbors import NearestNeighbors
 
@@ -248,16 +260,48 @@ def retrieve_context(queries: list[str], device: str, top_k: int = RETRIEVAL_TOP
     query_vecs = np.array(_embed_texts(queries, device), dtype=np.float32)
     distances, indices = nn.kneighbors(query_vecs)
 
+    per_query = []
     retrieved: dict[str, dict] = {}
     for qi, query in enumerate(queries):
+        matches = []
         for rank, idx in enumerate(indices[qi]):
             doc_id = cached["doc_ids"][idx]
+            doc = doc_by_id[doc_id]
             similarity = 1.0 - float(distances[qi][rank])
-            entry = retrieved.setdefault(doc_id, {**doc_by_id[doc_id], "matched_queries": [], "similarity": similarity})
+            matches.append({"id": doc_id, "title": doc["title"], "tier": doc["tier"],
+                             "verified": doc["verified"], "similarity": similarity})
+            entry = retrieved.setdefault(doc_id, {**doc, "matched_queries": [], "similarity": similarity})
             entry["matched_queries"].append(query)
             entry["similarity"] = max(entry["similarity"], similarity)
+        per_query.append({"query": query, "matches": matches})
 
-    return list(retrieved.values())
+    return list(retrieved.values()), per_query, cached
+
+
+def retrieve_context(queries: list[str], device: str, top_k: int = RETRIEVAL_TOP_K) -> list[dict]:
+    """Thin wrapper preserving the pre-Step-C5 return contract (used by
+    main() below and by any external caller) - see
+    retrieve_context_detailed() for the actual retrieval logic and the
+    richer per-query data."""
+    retrieved_docs, _per_query, _cached = retrieve_context_detailed(queries, device, top_k)
+    return retrieved_docs
+
+
+def print_retrieval_console_summary(per_query: list[dict], retrieved_docs: list[dict], cached: dict) -> None:
+    """Step C5 point 1: compact, ~20-line console visibility into what
+    retrieval actually did, printed right after retrieve_context_detailed()
+    returns - corpus size/hash, each fixed query, its top-k matches with
+    similarity/tier/verified, and the total unique-document count."""
+    print(f"[clinical-agent] --- Phase C retrieval detail ---")
+    print(f"[clinical-agent] corpus: {len(CORPUS)} documents, hash={cached['corpus_hash'][:12]}...")
+    for pq in per_query:
+        q = pq["query"]
+        q_short = q if len(q) <= 78 else q[:75] + "..."
+        print(f"[clinical-agent] query: \"{q_short}\"")
+        for m in pq["matches"]:
+            v = "verified" if m["verified"] else "UNVERIFIED"
+            print(f"[clinical-agent]     sim={m['similarity']:.4f}  tier={m['tier']}  [{v:10s}]  {m['title']}")
+    print(f"[clinical-agent] {len(retrieved_docs)} unique document(s) retrieved across {len(per_query)} queries")
 
 
 def _find_latest_xai_report(explain_dir: Path) -> Path:
@@ -527,9 +571,8 @@ def main() -> int:
         try:
             import torch
             device = "cuda" if torch.cuda.is_available() else "cpu"
-            retrieved_docs = retrieve_context(TOPIC_QUERIES, device)
-            print(f"[clinical-agent] retrieved {len(retrieved_docs)} unique source(s) "
-                  f"for {len(TOPIC_QUERIES)} topic queries")
+            retrieved_docs, per_query, cached = retrieve_context_detailed(TOPIC_QUERIES, device)
+            print_retrieval_console_summary(per_query, retrieved_docs, cached)
         except Exception as e:
             print(f"[clinical-agent] WARNING: clinical-knowledge retrieval failed, "
                   f"continuing without grounding: {e}")
