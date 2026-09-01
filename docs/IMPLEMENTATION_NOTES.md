@@ -1193,6 +1193,20 @@ numbers" to "the numbers mean what they appear to mean" took five steps of
 investigation (A3-A7), documented here so a later session does not have to
 re-derive them, and does not repeat an already-refuted hypothesis.
 
+**Attribution, added after a later session-mixing error was caught (2026-09-01):**
+every specific count and score in Steps A3-A7 below (37/37, 11/20/6, 36 of 37,
+etc.) was measured on ONE client round's trained checkpoint, session_id
+`client-aef1978aef7f` (local F1=0.5294 - the figure Step A3 cites below). These
+are properties of that one trained model, not fixed properties of the system -
+live client rounds do not set a fixed init seed, so a different round trains a
+genuinely different model. Confirmed directly: a separate session,
+`client-405c6057ab84`, trained independently, measures **37 of 37** in the
+uncertain 0.3-0.7 band (not 36 of 37) on the identical held-out split. Do not
+carry these specific counts forward as if they describe "the model" in
+general - they describe this one checkpoint, and were previously stated
+without that attribution in the summary sections below (now corrected) and in
+an out-of-repo handover document (not corrected here, out of scope).
+
 **Step A3's original result, and why it was wrong.** The first live run
 (one client, round 1, local model F1=0.5294) produced an aggregate modality
 split of text=0.131 / audio=**0.791** / vision=0.078, with audio ranked #1
@@ -1232,12 +1246,14 @@ in-distribution but is one specific token's embedding, not a distributional
 average, which was inconsistent with the audio/vision fix's own logic.
 
 **Step A6's outcome: the artefact is fixed, the methods still don't
-converge.** Under the new baselines, the unanimous audio-dominance pattern
-is gone from both methods - IG: text=0.844/audio=0.087/vision=0.070 (37/37
-text); ablation: text=0.515/audio=0.416/vision=0.068, but only **11/20/6**
-per-sample (audio actually wins the plurality of *individual* samples while
-losing on the mean). 11/20/6 across three categories is close to a random
-three-way split (~12.3 each). An earlier draft of this step's own verdict
+converge.** (All figures in this paragraph: session `client-aef1978aef7f`
+only - see the attribution note at the top of this section.) Under the new
+baselines, the unanimous audio-dominance pattern is gone from both methods -
+IG: text=0.844/audio=0.087/vision=0.070 (37/37 text); ablation:
+text=0.515/audio=0.416/vision=0.068, but only **11/20/6** per-sample (audio
+actually wins the plurality of *individual* samples while losing on the
+mean). 11/20/6 across three categories is close to a random three-way split
+(~12.3 each). An earlier draft of this step's own verdict
 logic called this "CONVERGE" because it only compared aggregate top-1 picks;
 that was an overclaim, corrected before being reported - matching on the
 mean while one method is unanimous and the other is barely-better-than-noise
@@ -1260,7 +1276,10 @@ three categories. The more important finding came from splitting by
 prediction confidence: **36 of the 37 held-out samples have a predicted
 positive probability in [0.377, 0.709]** - essentially the entire held-out
 set sits in the uncertain 0.3-0.7 band; only one sample is even marginally
-outside it (0.709). The "confident vs uncertain" comparison this step set
+outside it (0.709). (Again, `client-aef1978aef7f` only - `client-405c6057ab84`
+measures 37 of 37 on the same split, not 36 of 37; see the top-of-section
+attribution note. This count is not a fixed system property.) The "confident
+vs uncertain" comparison this step set
 out to run was not testable, because there is almost no confident subset to
 compare against. Decision, made explicitly rather than by continuing to
 chase the divergence: this is a property of the local model's weakness
@@ -1287,10 +1306,12 @@ scoped to what Steps A3-A7 actually established:
   ablation rankings do not agree with each other.
 - It **must not** claim a specific modality "drove" an individual
   prediction - the same evidence applies.
-- It **must** surface the model's own uncertainty: given 36 of 37 held-out
-  predictions sit in the 0.3-0.7 band, any narrative that presents a
-  prediction as confident without saying so would misrepresent the
-  underlying model.
+- It **must** surface the model's own uncertainty: on session
+  `client-aef1978aef7f`, 36 of 37 held-out predictions sit in the 0.3-0.7
+  band (a different session, `client-405c6057ab84`, measures 37 of 37 on the
+  identical split - this count is checkpoint-specific, not fixed). Either
+  way, any narrative that presents a prediction as confident without saying
+  so would misrepresent the underlying model.
 - Aggregate, cohort-level statements about modality contribution (e.g. "text
   was the most heavily weighted modality across this client's held-out set")
   **are** supportable by Steps A5-A6's results and may be used.
@@ -1528,12 +1549,15 @@ layer, not the guard layer.
 
 Phase A's own investigation (Steps A3-A8, the "Phase A: what the attribution
 mechanism can and cannot support" section above) is not repeated here.
-Summary only: an initial unanimous 37/37 "audio dominates" result traced to
-a raw-scale baseline artefact, not a real signal; fixing the baseline
-resolved the artefact but did not make Integrated Gradients and ablation
-agree at the per-patient level; the n_steps hypothesis for that remaining
-disagreement was tested and refuted; the most likely underlying cause is
-that 36 of 37 held-out predictions sit in a low-confidence 0.3-0.7 band, not
+Summary only (all figures below: session `client-aef1978aef7f` - see that
+section's attribution note; a different session, `client-405c6057ab84`,
+measures 37 of 37 rather than 36 of 37 on the identical split): an initial
+unanimous 37/37 "audio dominates" result traced to a raw-scale baseline
+artefact, not a real signal; fixing the baseline resolved the artefact but
+did not make Integrated Gradients and ablation agree at the per-patient
+level; the n_steps hypothesis for that remaining disagreement was tested and
+refuted; the most likely underlying cause is that 36 of 37 held-out
+predictions sit in a low-confidence 0.3-0.7 band on this checkpoint, not
 a defect in either attribution method. The four constraints that section
 places on any downstream narrative - no per-patient modality percentages,
 no claim a modality "drove" an individual prediction, must surface the
@@ -1646,3 +1670,4 @@ narrative in the generated report whenever any retrieved document has
 `verified: False`. A reader sees the warning regardless of what the model
 wrote. Rule 10 stays in the prompt as well - belt and braces, not a
 replacement for the structural guarantee.
+
