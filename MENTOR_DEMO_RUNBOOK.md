@@ -59,10 +59,17 @@ Start-Sleep -Seconds 3
 & ".venv\Scripts\python.exe" -c "import pymongo; c=pymongo.MongoClient('mongodb://localhost:27017', serverSelectionTimeoutMS=5000); print(c.admin.command('ping')); print(c.admin.command('getCmdLineOpts')['parsed']['storage'])"
 
 # Wipe both project databases to a clean, empty state (does NOT touch the unrelated 'libraryDB' database)
-& ".venv\Scripts\python.exe" "scripts\reset_all_federated_dbs.py"
+& ".venv\Scripts\python.exe" "scripts\reset_all_federated_dbs.py" *>&1 | Tee-Object -FilePath "trainer_outputs\demo_db_reset.log"
 ```
 Expected: `{'ok': 1.0}`, `dbPath: D:\MongoDB\data`, and the reset script prints
 `[OK] All collections in all project databases are empty.`
+
+Captured to `trainer_outputs\demo_db_reset.log` (same `Tee-Object` pattern as
+Terminal 4's client runs below) so `scripts\render_session.py` can render the
+[1/7] Database block from a file instead of console-only output. Like every
+other `Tee-Object` capture in this runbook, this file is UTF-16LE with a BOM
+(PowerShell's default) - any reader must decode it explicitly, not assume
+UTF-8.
 
 Leave this terminal open for the whole session.
 
@@ -130,11 +137,16 @@ Test-Path "server\orchestration_agent\certs\ca.pem"
 Test-Path "server\orchestration_agent\certs\server.pem"
 
 # Device enrollment (required every time Terminal 1's reset wipes the 'devices' collection)
-& ".venv\Scripts\python.exe" enroll_step5.py "D:\Download D\BE PIPELINE\Capstone-\trainer_outputs\demo_orchestrator.log"
+& ".venv\Scripts\python.exe" enroll_step5.py "D:\Download D\BE PIPELINE\Capstone-\trainer_outputs\demo_orchestrator.log" *>&1 | Tee-Object -FilePath "trainer_outputs\demo_enroll.log"
 ```
 Expected tail: `ENROLLMENT COMPLETE`, with a `client.pem` fingerprint printed. This
 single exchange (RequestEnrollment → OTP → EnrollDevice → signed cert) **is** your live
 connection check: it proves mTLS, gRPC, and MongoDB are all wired together correctly.
+
+Captured to `trainer_outputs\demo_enroll.log`, same `Tee-Object`/UTF-16LE
+pattern as Terminal 1's reset capture above - `scripts\render_session.py`'s
+[3/7] Enrollment block reads this file. No changes to `enroll_step5.py`
+itself.
 
 Verify the cert if you want a second, independent check:
 ```powershell
