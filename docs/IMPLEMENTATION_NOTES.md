@@ -1671,3 +1671,36 @@ narrative in the generated report whenever any retrieved document has
 wrote. Rule 10 stays in the prompt as well - belt and braces, not a
 replacement for the structural guarantee.
 
+---
+
+## Accepted, deferred: checkpoint versioning (2026-09-01)
+
+Investigation for `scripts/demo_predictions.py` found that
+`train_model()` (`trainer_mentalbert_privacy.py:604-608,775-789`) saves the
+trained model and its metrics to fixed filenames
+(`mentalbert_privacy_subset.pt`, `metrics.json`, `metrics_report.json`)
+under a fixed `output_dir`, with no `session_id` in scope at that call - every
+client round silently overwrites the previous round's checkpoint and
+metrics. This was discovered because two specific historical checkpoints
+(`client-405c6057ab84`, `client-aef1978aef7f`) were needed for a mentor
+demo and both were already gone by the time this was noticed - only the
+timestamped `explain_logs/xai_ig_<session_id>_<timestamp>.json` reports
+survived, because that path already includes the session_id (a convention
+this fix would extend to the checkpoint/metrics path).
+
+**Proposed fix (accepted, NOT implemented)**: add an optional
+`session_id: Optional[str] = None` parameter to `train_model()`; when given,
+embed it in the output filenames (e.g. `mentalbert_privacy_subset_{session_id}.pt`),
+falling back to today's exact fixed filename when `None` - backward-compatible
+by construction, same pattern already used for this function's own
+`eval_dataset=None` parameter. At the one call site, in `orchestrate()`,
+pass `session_id=session_id` - already in scope there.
+
+**Deliberately not implemented yet**: this touches the training path, and a
+mentor demo was imminent when it was found. Do this after the demo, not
+before. `scripts/demo_predictions.py` and its anchor-session backup
+(`~/.federated/data/anchor_session_backups/client-405c6057ab84/`, mirrored
+into this repo at `anchor_session_backups/client-405c6057ab84/`) exist as the
+interim workaround - reading a specific session's persisted `per_sample`
+data rather than depending on the checkpoint still being on disk.
+
