@@ -1,0 +1,220 @@
+================================================================================
+ [1/7]  DATABASE                                                              !!
+================================================================================
+ MongoDB           up, port 27017
+ Data path         D:\MongoDB\data (D: not C:)                              [OK]
+ Reset             MISSING (trainer_outputs/demo_db_reset.log not found - re-run Terminal 1 with the Tee-Object capture) [!!]
+ Untouched         libraryDB (by design, not checked)                       [--]
+ Blank stdin       260 lines ready                                          [OK]
+--------------------------------------------------------------------------------
+ Some [1/7] fields could not be sourced - see [!!] rows above.
+================================================================================
+================================================================================
+ [2/7]  RUST ORCHESTRATOR                                             OK  24.8ms
+================================================================================
+ Database          federated_multimodal                                     [OK]
+ Recovery state    Round 1: verified_updates=0, global_model=absent         [OK]
+ Transport         mTLS on 0.0.0.0:50051                                    [OK]
+ Enrollment OTP    623736 expires in 10 min
+--------------------------------------------------------------------------------
+ mTLS = BOTH sides present certificates, not just the server.
+ verified_updates=0 confirms the reset actually took effect.
+================================================================================
+================================================================================
+ [3/7]  DEVICE ENROLLMENT                                                     !!
+================================================================================
+ TPM public key    177 bytes (live MongoDB devices collection)              [OK]
+ Client key        MISSING (no demo_enroll.log for this session - re-run Terminal 3 with the Tee-Object capture) [!!]
+ OTP matched       MISSING                                                  [!!]
+ Certificate       client.pem, 1480 bytes (live disk file)                  [OK]
+ Fingerprint       b487b6aaef2c9e48
+--------------------------------------------------------------------------------
+ The private key NEVER exists as a file. It lives inside the TPM chip.
+ An attacker cannot copy it and impersonate this machine.
+================================================================================
+================================================================================
+ [4/7]  CLIENT 1 of 3                                            SUCCESS  449.0s
+================================================================================
+
+ DATA                                                      ACTUAL      EXPECTED
+ ------------------------------------------------------------------------------
+ Labels from parquet (real PHQ-8) 186                                       [OK]
+ Labels from model fallback (must be zero) 0                                [OK]
+ Distribution (computed: train+eval) 55 / 131                               [OK]
+ Train / eval split 149 / 37                                                [OK]
+ Partition mode    full                                                     [OK]
+
+ MODEL                                                     ACTUAL      EXPECTED
+ ------------------------------------------------------------------------------
+ Trainable (only these are trained + noised + sent) 281254                  [OK]
+ Frozen (MentalBERT, never leaves device) 109482240    109482240   [OK]
+ Batch  text / audio / video (8, 512) (8, 154) (8, 84)                      [OK]
+
+ TRAINING                                                  ACTUAL      EXPECTED
+ ------------------------------------------------------------------------------
+ Learning rate     1.0e-04                                                  [OK]
+ Loss  epoch 1 -> 10 1.9253 -> 1.0752 falling                               [OK]
+ F1  (LOCAL, PRE-DP, on 37 held-out) 0.5000                                 [OK]
+
+ XAI  - INTEGRATED GRADIENTS                               ACTUAL
+ ------------------------------------------------------------------------------
+ Modality split  text / audio / vision 0.9243 / 0.0414 / 0.0343             [OK]
+ Samples attributed 37 in 378.04s
+ Uploaded?         NO - local disk only
+
+ PRIVACY                                                   ACTUAL      EXPECTED
+ ------------------------------------------------------------------------------
+ Delta L2 (the genuine learning signal) 0.672997     0.625-0.729  [OK]
+ Safety clamp engaged no                                                    [OK]
+ Clipping applied  (0.673 vs 0.85 threshold, from this run's own log) False        False       [OK]
+ Noise added       451.648346                                               [OK]
+ Epsilon  (privacy cost, target <= 8) 5.302585     <= 8        [OK]
+
+ TRANSPORT                                                 ACTUAL      EXPECTED
+ ------------------------------------------------------------------------------
+ Encrypted payload  (AES-256-GCM) 1,506,992 B                               [OK]
+ mTLS              PASS                                                     [OK]
+ TPM signature     71 bytes signed                                          [OK]
+
+ STAGES   Metadata:PASS  GlobalModel:SKIP  Lda:PASS  Training:PASS
+          Dp:PASS  Encryption:PASS  TpmSigning:PASS  Receipt:PASS
+--------------------------------------------------------------------------------
+ GlobalModel:SKIP is CORRECT in round 1 - nothing exists to warm-start from.
+ SUPPRESSED (per-category line counts - use --full to disable):
+   physician-loop prompt echoes      : 1490
+   per-step training diagnostics     : 73
+   ANSI / progress-bar escape residue: 51
+   dp_updates file listing            : 2
+================================================================================
+================================================================================
+ [4/7]  CLIENT 2 of 3                                                    MISSING
+================================================================================
+
+ [!!] MISSING - D:\Download D\BE PIPELINE\Capstone-\trainer_outputs\demo_r1_client2.log exists but is STALE - last modified 2026-08-28 00:05:55, before the current orchestrator process started. This is a leftover artifact from a previous demo session reusing this round's filename, not a client that ran in this round. Treated as not-run.
+================================================================================
+================================================================================
+ [4/7]  CLIENT 3 of 3                                                    MISSING
+================================================================================
+
+ [!!] MISSING - D:\Download D\BE PIPELINE\Capstone-\trainer_outputs\demo_r1_client3.log exists but is STALE - last modified 2026-08-28 00:07:54, before the current orchestrator process started. This is a leftover artifact from a previous demo session reusing this round's filename, not a client that ran in this round. Treated as not-run.
+================================================================================
+================================================================================
+ THREE CLIENTS - SIDE BY SIDE                                     Mode A / full
+================================================================================
+                         CLIENT 1        CLIENT 2        CLIENT 3
+ ------------------------------------------------------------------------------
+ Delta L2                0.672997        MISSING         MISSING        
+ Noise norm              451.648346      MISSING         MISSING        
+ Epsilon                 5.302585        MISSING         MISSING        
+ Payload                 1506992         MISSING         MISSING        
+ F1 (local, pre-DP)      0.500000        MISSING         MISSING        
+ Status                  SUCCESS         MISSING         MISSING        
+ ------------------------------------------------------------------------------
+ 2 of 3 client(s) MISSING this round - see [4/7] cards above.
+================================================================================
+================================================================================
+ [5/7]  SERVER AGGREGATION                                                    !!
+================================================================================
+ Trigger           MISSING                                                  [!!]
+ Algorithm         MISSING                                                  [!!]
+ Result            MISSING                                                  [!!]
+ Global model      MISSING                                                  [!!]
+ Next round        MISSING                                                  [!!]
+--------------------------------------------------------------------------------
+ Aggregation has not run yet - fewer than 3 accepted updates so far this round.
+================================================================================
+================================================================================
+ [6/7]  DATABASE VERIFICATION                                                  ~
+================================================================================
+ model_updates     1 client(s) uploaded this round                           [~]
+ receipts          1 signed receipt(s), 1 per update                        [OK]
+ global_models     0 aggregated model(s) produced                           [!!]
+ GridFS            update_r1_db487b6aa_sclient-0903c, 1,506,992 bytes       [OK]
+--------------------------------------------------------------------------------
+ Incomplete round: 1/3 client updates, 0 global model(s) produced so far.
+================================================================================
+================================================================================
+ [7/7]  AI REPORTS                                                              
+================================================================================
+
+ Two reports were written by an AI assistant running entirely on this laptop.
+
+   1. PRIVACY REPORT   - for an auditor. Did we protect the data properly?
+   2. CLINICAL REPORT  - for a doctor. What did the model find, overall?
+
+--------------------------------------------------------------------------------
+ WAS ANYTHING MADE UP?
+--------------------------------------------------------------------------------
+ Every number the AI wrote was automatically checked against our real
+ recorded results.
+
+   Privacy report     LLM UNAVAILABLE  the report was written, but the local AI did not respond in time - it has no narrative section
+   Clinical report    CAUGHT 1  the AI wrote a number that was not traceable to the facts: [4.13]
+
+ The clinical report's warning is the system WORKING, not failing. Our checker
+ caught a number before a doctor could read an unverifiable claim.
+
+ The privacy report has no narrative to check this run (local AI timed out) -
+ its facts table is unaffected and does not depend on the LLM.
+
+--------------------------------------------------------------------------------
+ WHERE DID THE FACTS COME FROM?
+--------------------------------------------------------------------------------
+ The AI was given a small library of 17 reference documents to quote from.
+
+   Contains no patient data at all
+   6 document(s) were used for this report
+   3 of those are marked UNVERIFIED and labelled as such in the report
+
+--------------------------------------------------------------------------------
+ TWO SAFETY RULES WE BUILT IN
+--------------------------------------------------------------------------------
+ The AI never left this laptop.       No internet. No external company.
+ The AI never saw individual patients. Only group-level totals were given to
+                                       it, so it CANNOT comment on any one
+                                       person even if asked.
+
+--------------------------------------------------------------------------------
+ YOUR REPORTS ARE HERE
+--------------------------------------------------------------------------------
+   C:\Users\satya\.federated\data\audit_reports\round_1_privacy_report.md
+   C:\Users\satya\.federated\data\clinical_reports\round_1_clinical_report.md
+================================================================================
+================================================================================
+ SESSION SUMMARY SCORECARD
+================================================================================
+ 1. Database                                 [!!]
+ 2. Orchestrator                             [OK]
+ 3. Enrollment                               [!!]
+ 4. Client 1                                 [OK]
+ 5. Client 2                                 [!!] MISSING
+ 6. Client 3                                 [!!] MISSING
+ 7. Aggregation                              [!!] MISSING
+ 8. DB Verification                          [~]
+ 9. AI Reports                               [!!]
+
+ 2 OK / 1 notes / 3 failures / 3 missing
+ Renderer runtime (reading these artifacts, not the demo itself): 0.11s
+
+ WHAT WORKS END TO END
+--------------------------------------------------------------------------------
+ TPM-backed device enrollment, mTLS transport, per-client local training with
+ real PHQ-8 labels, DP clip+noise+epsilon accounting, AES-256-GCM encrypted
+ upload, TPM-signed receipts, and (when 3 clients complete) trimmed_mean
+ aggregation into a new global model - all proven at the database level.
+
+ WHAT IS HONESTLY REPORTED AS NOT WORKING
+--------------------------------------------------------------------------------
+ Signal-vs-noise ratio: local delta L2 (~0.6-0.8) vs DP noise (~450) is a
+ ~590x gap this configuration does not close. Scope: this project's own
+ measured configuration at n=3 clients, not a general DP claim.
+ Aggregated F1 collapse: trimmed_mean at n=3 is a coordinate-wise median with
+ no averaging benefit - measured mean 260.25 vs trimmed_mean 301.80 on
+ identical data confirms mean is closer to the sqrt(3) prediction.
+ Sharding's corpus-size floor: genuine per-client partitioning at this
+ corpus's size (149 train records / 3 clients) leaves too few positive
+ examples per shard for reliable local training (documented, Step 20/21).
+ Per-patient attribution refused: two independent methods (Integrated
+ Gradients, ablation) do not agree at the individual-patient level - only
+ cohort-level modality attribution is reported, structurally, not by request.
+================================================================================

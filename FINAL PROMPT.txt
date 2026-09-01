@@ -1,0 +1,326 @@
+INVESTIGATE FIRST — CHANGE NOTHING until I approve. Then implement, then verify.
+
+Build scripts/render_session.py — a NEW read-only script that renders a demo
+session in the exact layout at the bottom of this message. Presentation only.
+It must NOT import from or modify any pipeline module, and must work on
+artifacts that ALREADY EXIST with zero pipeline changes.
+
+You have already done the discovery for this task. Your findings stand:
+  - DEMO_WALKTHROUGH.md does not exist in this repo. Ignore it entirely.
+    Fix E4's [0.625, 0.729] is authoritative for the delta L2 [OK] boundary.
+  - Tee-Object logs are UTF-16LE with BOM. Decode explicitly.
+  - Client logs contain ANSI/progress-bar escape residue.
+  - demo_r1_client1.log: 2,693 lines, 1,677 of them physician-loop noise.
+  - The T1/T3 Tee-Object captures are now in the runbook
+    (demo_db_reset.log, demo_enroll.log).
+  - Real durations exist only for [4/7], [5/7], [7/7], and the orchestrator's
+    startup latency. [1/7], [3/7], [6/7] have none.
+  - Report states are detected by three markers in priority order:
+    "Narrative unavailable" / "Cohort narrative unavailable"  ->  LLM failed
+    "Result: PASSED"                                          ->  passed
+    "Result: WARNING"                                         ->  warning
+
+=== PART 1: FOUR REMAINING QUESTIONS. Report, then STOP. ===
+
+1. The [1/7] block shows "MongoDB up, port 27017" and "Data path
+   D:\MongoDB\data". The T1 Tee-Object only wraps the reset script call — the
+   pymongo getCmdLineOpts check is a separate command and is NOT captured.
+   Can you get both from a live MongoDB query at render time instead (you are
+   already doing a live query for [6/7])? If yes, do that. If not, they are
+   MISSING.
+
+2. The [1/7] block shows "Blank stdin 260 lines ready". That file is created
+   in a separate T1 command, also not captured. Can the renderer just count
+   lines in trainer_outputs/demo_blank_stdin.txt directly on disk? Confirm.
+
+3. The [1/7] block shows "Untouched libraryDB (unrelated)". Is that string
+   actually in the reset script's output, or is it something I wrote in the
+   runbook prose? If the script does not print it, tell me — I do not want a
+   line asserting something the tool never verified.
+
+4. For [4/7]'s "Frozen (MentalBERT, never leaves device) 109,482,240" — the
+   layout shows no EXPECTED value for that row, just [OK]. Confirm you can
+   source the actual number from the log, and tell me what you will compare it
+   against.
+
+Report these four. STOP. Wait for approval.
+
+=== PART 2: IMPLEMENT (after approval) ===
+
+Modes:
+  --stage db|server|enroll|client|aggregate|verify|reports
+  --client <logfile>                one client card
+  --compare <log1> <log2> <log3>    three-client side-by-side
+  --session --round N               all blocks, in order
+  --full                            disable all noise suppression
+
+Match the layout at the bottom EXACTLY: 80 columns, '=' section rules, '-'
+sub-rules, [OK] / [~] / [!!] / [--] verdict tags, ASCII only. No ANSI colour
+by default. No box-drawing characters. Column alignment must match.
+
+TEN RULES THAT MATTER MORE THAN THE LAYOUT:
+
+(1) EVERY NUMBER IS READ FROM ARTIFACTS AT RENDER TIME. The numbers in the
+    layout below are ILLUSTRATIVE ONLY — they come from one past session. My
+    most recent live run measured F1 0.5000 (not 0.5517), text attribution
+    0.9243 (not 0.8986), noise 451.65 (not 449.96), delta L2 0.6730 (not
+    0.7658), and the clinical checker caught 4.13 (not 94.56/4.26). There is
+    no fixed init seed, so these vary legitimately every run.
+    If ANY of these appears as a literal in your source, that is a bug:
+    0.5517, 0.5333, 0.5484, 0.8986, 0.0427, 0.0587, 449.96, 451.02, 448.77,
+    0.765762, 0.741318, 0.752904, 2.2265, 1.0589, 385.09, 143532,
+    b487b6aaef2c9e48, a3f9...e21c, 1,472,104, 94.56, 4.26, 71.4s, 6.2s, 4.8s,
+    3.1s, 14.2s, 1.1s, 176.9s, 0.024.
+
+(2) MISSING IS NEVER SILENT. Anything not found renders [!!] MISSING. My
+    current round-1 session is INCOMPLETE — only client1 exists, no client2,
+    no client3, no aggregation. Those blocks must render MISSING, not be
+    skipped and not be faked.
+
+(3) SUPPRESSION IS NEVER SILENT. Print a SUPPRESSED block with per-category
+    counts, four categories: physician-loop lines, per-step training
+    diagnostics, ANSI/progress-bar escape residue, and the dp_updates file
+    listing if it appears. A line matching ANY known marker string is never
+    suppressible — assert against that. --full disables suppression.
+
+(4) DELTA L2 GETS THREE TIERS: [OK] inside Fix E4's [0.625, 0.729]; [~]
+    outside it but under the 0.85 clip threshold, with the explanation line
+    printed as in the layout; [!!] at or above 0.85 or near zero. My two real
+    measurements were 0.7658 (outside) and 0.6730 (inside) — both legitimate.
+
+(5) DURATIONS: use only the real ones. [1/7], [3/7], [6/7] render their
+    duration position blank. Never estimate, never substitute.
+
+(6) BLOCK [7/7] uses the three-marker priority detection above. It must
+    distinguish PASSED / WARNING / LLM-UNAVAILABLE per report. When a
+    narrative is missing it must NOT print "PASSED", and must NOT print the
+    "proves the checker is not simply flagging everything" line, since that
+    claim depends on the privacy report having actually passed. My current
+    round-1 reports are in two different states — privacy LLM-unavailable,
+    clinical WARNING — verify against exactly that.
+
+(7) [7/7] prints the FULL on-disk path of both .md files, resolved at render
+    time from the real home directory. Not a placeholder.
+
+(8) [6/7] is a LIVE MongoDB query, not a log grep.
+
+(9) THESE PRINT VERBATIM AND ARE NEVER SUPPRESSED:
+    - GlobalModel:SKIP is correct in round 1
+    - local metrics are LOCAL and PRE-DP and say nothing about aggregated
+      global utility
+    - XAI is COHORT-level; no per-patient claim is made or supported
+    - XAI attribution is never uploaded
+    - the trimmed_mean-at-n=3 honest note in [5/7]
+    - "The AI never left this laptop" and "The AI never saw individual
+      patients" in [7/7]
+
+(10) EVERY BLOCK KEEPS ITS PLAIN-ENGLISH EXPLANATION under the rule, exactly
+     as in the layout. That is the entire point of this script.
+
+=== ABSOLUTE CONSTRAINTS ===
+- Presentation only. No computed value changes anywhere.
+- Do not modify trainer_mentalbert_privacy.py, run_client_multimodal.py,
+  enroll_step5.py, reset_all_federated_dbs.py, either LLM agent, or
+  ollama_narration_utils.py. If you believe one MUST change, STOP and tell me
+  which and why.
+- Do not touch security, TPM, crypto, gRPC, or Rust code.
+- Do not touch training, label, DP, or split paths.
+- Never modify or clean a raw log. Strip escape residue in the renderer only.
+- No new dependencies. Stdlib plus pymongo (already used).
+
+=== VERIFICATION ===
+1. Run --session --round 1 against my existing artifacts.
+2. Independently grep every displayed value out of the raw logs, the two .md
+   reports, and MongoDB by hand. Diff against what the renderer printed.
+   Every value must match exactly.
+3. grep your own source for every literal listed in Rule 1. Report any hit.
+4. Confirm clients 2 and 3 and aggregation render MISSING, not skipped.
+5. Confirm [7/7] reports privacy as LLM-unavailable and clinical as WARNING.
+6. Confirm UTF-16LE logs decode correctly and no escape residue reaches
+   the output.
+7. Report every mismatch including harmless ones, every MISSING field, and
+   the suppressed-line count by category.
+
+=== TARGET LAYOUT — MATCH THIS EXACTLY ===
+
+================================================================================
+ [1/7]  DATABASE                                                    OK
+================================================================================
+ MongoDB          up, port 27017
+ Data path        D:\MongoDB\data                    (D: not C:)     [OK]
+ Reset            all project collections empty                      [OK]
+ Untouched        libraryDB (unrelated)
+ Blank stdin      260 lines ready                                    [OK]
+--------------------------------------------------------------------------------
+ Round counter starts at 1. Clean slate confirmed.
+================================================================================
+
+================================================================================
+ [2/7]  RUST ORCHESTRATOR                                           OK    4.8s
+================================================================================
+ Database         federated_multimodal                               [OK]
+ Recovery state   Round 1: verified_updates=0, global_model=absent   [OK]
+ Transport        mTLS on 0.0.0.0:50051                              [OK]
+ Enrollment OTP   143532                          expires in 10 min
+--------------------------------------------------------------------------------
+ mTLS = BOTH sides present certificates, not just the server.
+ verified_updates=0 confirms the reset actually took effect.
+================================================================================
+
+================================================================================
+ [3/7]  DEVICE ENROLLMENT                                           OK
+================================================================================
+ TPM public key   177 bytes read from hardware chip                  [OK]
+ Client key       RSA-2048 generated, CSR sent                       [OK]
+ OTP matched      143532                                             [OK]
+ Certificate      client.pem, 1480 bytes                             [OK]
+ Fingerprint      b487b6aaef2c9e48
+--------------------------------------------------------------------------------
+ The private key NEVER exists as a file. It lives inside the TPM chip.
+ An attacker cannot copy it and impersonate this machine.
+================================================================================
+
+================================================================================
+ [4/7]  CLIENT 1 of 3                                          SUCCESS   71.4s
+================================================================================
+
+ DATA                                                     ACTUAL      EXPECTED
+ ------------------------------------------------------------------------------
+ Labels from parquet (real PHQ-8)                         186         186   [OK]
+ Labels from model fallback (must be zero)                0           0     [OK]
+ Distribution                                             55 / 131    55/131[OK]
+ Train / eval split                                       149 / 37    149/37[OK]
+ Partition mode                                           full        full  [OK]
+
+ MODEL                                                    ACTUAL      EXPECTED
+ ------------------------------------------------------------------------------
+ Trainable (only these are trained + noised + sent)       281,254     281,254[OK]
+ Frozen (MentalBERT, never leaves device)                 109,482,240       [OK]
+ Batch  text / audio / video                    (8,512) (8,154) (8,84)      [OK]
+
+ TRAINING                                                 ACTUAL      EXPECTED
+ ------------------------------------------------------------------------------
+ Learning rate                                            1.0e-04     1.0e-04[OK]
+ Loss  epoch 1 -> 10                              2.2265 -> 1.0589  falling [OK]
+ F1  (LOCAL, PRE-DP, on 37 held-out)                      0.5517      ~0.55 [OK]
+
+ XAI  - INTEGRATED GRADIENTS                              ACTUAL
+ ------------------------------------------------------------------------------
+ Modality split  text / audio / vision            0.8986 / 0.0427 / 0.0587  [OK]
+ Samples attributed                                       37 in 385.09s
+ Uploaded?                                                NO - local disk only
+
+ PRIVACY                                                  ACTUAL      EXPECTED
+ ------------------------------------------------------------------------------
+ Delta L2 (the genuine learning signal)                   0.765762   .625-.729[~]
+ Safety clamp engaged                                     no          no    [OK]
+ Clipping applied  (0.766 < 0.85 threshold)               False       False [OK]
+ Noise added                                              449.961853  ~450  [OK]
+ Epsilon  (privacy cost, target <= 8)                     5.302585  5.302585[OK]
+
+ TRANSPORT                                                ACTUAL      EXPECTED
+ ------------------------------------------------------------------------------
+ Encrypted payload  (AES-256-GCM)                    1,506,992 B  1,506,992 [OK]
+ mTLS                                                     PASS        PASS  [OK]
+ TPM signature                                            72 bytes signed   [OK]
+
+ STAGES   Metadata:PASS  GlobalModel:SKIP  Lda:PASS  Training:PASS
+          Dp:PASS  Encryption:PASS  TpmSigning:PASS  Receipt:PASS
+--------------------------------------------------------------------------------
+ [~] Delta L2 0.766 is above the calibration range but well under the 0.85
+     clip threshold. Clipping correctly did not fire. Run-to-run variation.
+ GlobalModel:SKIP is CORRECT in round 1 - nothing exists to warm-start from.
+================================================================================
+
+================================================================================
+ THREE CLIENTS - SIDE BY SIDE                                    Mode A / full
+================================================================================
+                          CLIENT 1        CLIENT 2        CLIENT 3
+ ------------------------------------------------------------------------------
+ Delta L2                 0.765762        0.741318        0.752904
+ Noise norm               449.96          451.02          448.77
+ Epsilon                  5.302585        5.302585        5.302585
+ Payload                  1,506,992       1,506,992       1,506,992
+ F1 (local, pre-DP)       0.5517          0.5333          0.5484
+ Status                   SUCCESS         SUCCESS         SUCCESS
+ ------------------------------------------------------------------------------
+ Delta L2 spread: 0.024 - small, as expected in Mode A (all three train on the
+ same 149 records). In Mode B (genuine sharding) expect ~3x this spread.
+================================================================================
+
+================================================================================
+ [5/7]  SERVER AGGREGATION                                          OK   14.2s
+================================================================================
+ Trigger          3 accepted updates reached
+ Algorithm        trimmed_mean, trim_ratio 0.1
+ Result           Round 1 complete - 3 updates aggregated             [OK]
+ Global model     hash a3f9...e21c, action CREATED                    [OK]
+ Next round       Round 2 ready, state=Collecting                     [OK]
+--------------------------------------------------------------------------------
+ HONEST NOTE: at n=3, trimmed_mean drops the highest and lowest per coordinate,
+ leaving 1 of 3 - so it is a coordinate-wise MEDIAN, not an average, and gives
+ no Byzantine robustness at this client count. Measured: plain mean 260.25 vs
+ trimmed_mean 301.80 on identical data - mean is better, matching the sqrt(3)
+ prediction to 0.2%. One-line change at server.rs:1499, deliberately not made.
+================================================================================
+
+================================================================================
+ [6/7]  DATABASE VERIFICATION                                       OK
+================================================================================
+ model_updates    3          3 clients uploaded                       [OK]
+ receipts         3          1 signed receipt per update              [OK]
+ global_models    1          1 aggregated model produced              [OK]
+ GridFS           global_model_r1, 1,472,104 bytes                    [OK]
+--------------------------------------------------------------------------------
+ THREE IN, ONE OUT. That is federated learning working, proven at the
+ database level - not from a log line.
+================================================================================
+
+================================================================================
+ [7/7]  AI REPORTS                                                  OK  176.9s
+================================================================================
+
+ Two reports were written by an AI assistant running entirely on this laptop.
+
+   1. PRIVACY REPORT   - for an auditor. Did we protect the data properly?
+   2. CLINICAL REPORT  - for a doctor. What did the model find, overall?
+
+ ------------------------------------------------------------------------------
+ WAS ANYTHING MADE UP?
+ ------------------------------------------------------------------------------
+ Every number the AI wrote was automatically checked against our real
+ recorded results.
+
+   Privacy report     PASSED    every number was real
+   Clinical report    CAUGHT 2  the AI wrote 94.56 and 4.26; neither was real
+
+ The clinical report's warning is the system WORKING, not failing. The AI
+ tried to state a figure of 94.56 when the real one was 89.86. Our checker
+ caught it before a doctor could read it.
+
+ The privacy report passed on the very same run, which proves the checker is
+ not simply flagging everything.
+
+ ------------------------------------------------------------------------------
+ WHERE DID THE FACTS COME FROM?
+ ------------------------------------------------------------------------------
+ The AI was given a small library of 17 reference documents to quote from.
+
+   Contains no patient data at all
+   6 documents were used for this report
+   4 of those are marked UNVERIFIED and labelled as such in the report
+
+ ------------------------------------------------------------------------------
+ TWO SAFETY RULES WE BUILT IN
+ ------------------------------------------------------------------------------
+ The AI never left this laptop.       No internet. No external company.
+ The AI never saw individual patients. Only group-level totals were given to
+                                       it, so it CANNOT comment on any one
+                                       person even if asked.
+
+ ------------------------------------------------------------------------------
+ YOUR REPORTS ARE HERE
+ ------------------------------------------------------------------------------
+   <full resolved path to round_N_privacy_report.md>
+   <full resolved path to round_N_clinical_report.md>
+================================================================================
