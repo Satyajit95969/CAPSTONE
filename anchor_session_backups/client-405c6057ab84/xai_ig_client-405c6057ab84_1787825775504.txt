@@ -1,0 +1,213 @@
+==============================================================================
+PHASE A XAI REPORT - INTEGRATED GRADIENTS MODALITY & TOKEN ATTRIBUTION
+==============================================================================
+
+SCOPE: this attribution is computed on the LOCAL, PRE-DP model (post-fine-tuning, before clip/noise/DP, before encryption/upload) - the model that reaches roughly F1~0.57 on this client's held-out split. It is NOT computed on the aggregated global model produced under differential privacy: that model is degenerate on this corpus (F1=0, single-class predictions on all 37 held-out records - see Steps 12-18 in docs/IMPLEMENTATION_NOTES.md), so attribution on it would explain nothing meaningful. This is a deliberate, documented scope choice, not an oversight. Nothing in this report left the client device: it is not part of the uploaded payload, any receipt, or any gRPC message, and it has no effect on epsilon or the DP-noised delta.
+
+session_id      : client-405c6057ab84
+generated_at    : 2026-08-27T10:16:15Z
+n_steps         : 25
+num_samples     : 37
+eval_metrics    : {'accuracy': 0.6486486486486487, 'precision': 0.4444444444444444, 'recall': 0.7272727272727273, 'f1': 0.5517241379310345, 'mae': 4.9822078524409115}
+baseline_kind   : in-distribution mean vectors (Step A5) - text: mean of real attended-token embeddings over train; audio/vision: mean feature vector over train. Replaces the earlier zero/PAD baseline found in Step A4 to bias attribution toward audio's larger raw scale.
+baseline_l2_norms: {'text_mean_embedding': 4.615362167358398, 'audio_mean': 6356.642578125, 'vision_mean': 568.5192260742188}
+
+------------------------------------------------------------------------------
+AGGREGATE MODALITY ATTRIBUTION (mean over held-out set)
+------------------------------------------------------------------------------
+  raw        : text=0.933338  audio=0.044341  vision=0.061005
+  normalized : text=0.8986  audio=0.0427  vision=0.0587
+
+  per-sample variability of normalized scores (mean / std / min / max):
+    text   : mean=0.8910  std=0.0482  min=0.7810  max=0.9763
+    audio  : mean=0.0454  std=0.0206  min=0.0124  max=0.1126
+    vision : mean=0.0636  std=0.0350  min=0.0113  max=0.1716
+
+------------------------------------------------------------------------------
+PER-SAMPLE DETAIL (37 records)
+------------------------------------------------------------------------------
+
+[0] record=301  true_label=0  pred_pos_prob=0.4799
+    normalized: text=0.8988 audio=0.0358 vision=0.0654
+    raw       : text=1.070512 audio=0.042582 vision=0.077885
+    top tokens: [CLS](-0.1904), of(0.0323), ann(0.0318), for(0.0162), in(0.0152), ##oy(-0.0137), just(-0.0128), example(-0.0108), doing(0.0096), stupid(0.0096)
+
+[1] record=302  true_label=0  pred_pos_prob=0.5599
+    normalized: text=0.9138 audio=0.0265 vision=0.0597
+    raw       : text=1.055416 audio=0.030577 vision=0.068967
+    top tokens: [CLS](-0.1774), reserved(-0.0706), mm(-0.0684), myself(0.0496), [SEP](-0.0302), really(0.0105), sort(-0.0085), of(-0.0073), to(0.0069), california(-0.0069)
+
+[2] record=306  true_label=0  pred_pos_prob=0.4005
+    normalized: text=0.8392 audio=0.0767 vision=0.0841
+    raw       : text=0.860201 audio=0.078650 vision=0.086161
+    top tokens: [CLS](-0.1967), of(0.0118), ##leg(-0.0104), [SEP](-0.0089), accomplishment(0.0084), market(0.0080), a(0.0075), of(0.0073), uh(0.0069), weather(0.0069)
+
+[3] record=316  true_label=0  pred_pos_prob=0.5427
+    normalized: text=0.8793 audio=0.0569 vision=0.0639
+    raw       : text=0.765856 audio=0.049524 vision=0.055635
+    top tokens: [CLS](-0.1085), nephew(-0.0240), [SEP](-0.0176), of(0.0172), movie(0.0106), i(0.0103), i(0.0097), of(0.0071), when(0.0065), <(-0.0063)
+
+[4] record=318  true_label=0  pred_pos_prob=0.5823
+    normalized: text=0.8172 audio=0.0446 vision=0.1382
+    raw       : text=0.659735 audio=0.036027 vision=0.111531
+    top tokens: [CLS](-0.0813), [SEP](-0.0124), yes(-0.0112), of(0.0091), um(-0.0068), los(0.0066), angeles(0.0061), cause(0.0056), big(-0.0054), laying(-0.0052)
+
+[5] record=326  true_label=0  pred_pos_prob=0.5493
+    normalized: text=0.7810 audio=0.0474 vision=0.1716
+    raw       : text=0.752493 audio=0.045627 vision=0.165325
+    top tokens: [CLS](-0.1268), [SEP](-0.0186), of(0.0075), laughter(0.0062), fly(0.0062), i(0.0060), um(-0.0058), at(-0.0058), marines(0.0057), guitar(-0.0056)
+
+[6] record=329  true_label=0  pred_pos_prob=0.5852
+    normalized: text=0.8031 audio=0.0678 vision=0.1290
+    raw       : text=0.812111 audio=0.068590 vision=0.130458
+    top tokens: [CLS](-0.1795), of(0.0206), [SEP](-0.0199), san(-0.0174), later(0.0083), that(-0.0083), that(0.0083), laughter(0.0065), to(0.0062), roller(0.0061)
+
+[7] record=334  true_label=0  pred_pos_prob=0.5018
+    normalized: text=0.9473 audio=0.0301 vision=0.0227
+    raw       : text=1.120289 audio=0.035571 vision=0.026815
+    top tokens: [CLS](-0.2940), a(0.0227), okay(-0.0198), ninety(0.0187), i(0.0175), good(0.0173), little(0.0156), [SEP](-0.0153), washington(0.0151), yes(0.0149)
+
+[8] record=335  true_label=1  pred_pos_prob=0.4407
+    normalized: text=0.9044 audio=0.0469 vision=0.0487
+    raw       : text=0.892228 audio=0.046297 vision=0.048064
+    top tokens: [CLS](0.0607), [SEP](-0.0254), make(0.0164), of(-0.0142), mad(-0.0129), ind(0.0126), like(0.0113), career(0.0101), en(-0.0099), ##ly(-0.0082)
+
+[9] record=338  true_label=1  pred_pos_prob=0.5804
+    normalized: text=0.9021 audio=0.0492 vision=0.0487
+    raw       : text=0.791038 audio=0.043122 vision=0.042733
+    top tokens: [CLS](-0.2072), veterans(0.0136), of(0.0128), angeles(0.0070), wow(-0.0066), [SEP](0.0066), who(0.0057), the(0.0056), >(-0.0055), for(-0.0055)
+
+[10] record=347  true_label=1  pred_pos_prob=0.6257
+    normalized: text=0.8014 audio=0.0852 vision=0.1134
+    raw       : text=0.536844 audio=0.057048 vision=0.075976
+    top tokens: [CLS](0.0148), appointment(0.0107), other(0.0102), mm(-0.0082), um(-0.0076), a(-0.0062), of(0.0061), [SEP](-0.0060), yes(-0.0059), criminal(-0.0053)
+
+[11] record=349  true_label=0  pred_pos_prob=0.4581
+    normalized: text=0.9302 audio=0.0240 vision=0.0458
+    raw       : text=0.936893 audio=0.024198 vision=0.046153
+    top tokens: [CLS](-0.1510), adventure(-0.0202), i(0.0154), [SEP](-0.0131), on(-0.0114), been(0.0106), here(0.0104), uh(0.0097), negative(0.0090), work(-0.0087)
+
+[12] record=351  true_label=1  pred_pos_prob=0.5447
+    normalized: text=0.8978 audio=0.0473 vision=0.0549
+    raw       : text=0.695297 audio=0.036635 vision=0.042546
+    top tokens: [CLS](-0.0930), um(-0.0155), of(0.0122), um(-0.0097), there(-0.0090), <(-0.0075), um(-0.0073), of(0.0070), um(0.0070), yes(-0.0069)
+
+[13] record=352  true_label=1  pred_pos_prob=0.5632
+    normalized: text=0.9401 audio=0.0285 vision=0.0315
+    raw       : text=0.909189 audio=0.027539 vision=0.030418
+    top tokens: [CLS](-0.1679), >(-0.0168), pretty(0.0139), i(0.0125), i(0.0123), [SEP](-0.0113), from(0.0106), <(-0.0092), city(-0.0090), who(0.0090)
+
+[14] record=355  true_label=1  pred_pos_prob=0.4570
+    normalized: text=0.9465 audio=0.0192 vision=0.0342
+    raw       : text=1.618534 audio=0.032912 vision=0.058557
+    top tokens: [CLS](-0.2009), o(-0.0727), clock(-0.0430), has(0.0414), of(-0.0380), couldn(0.0375), t(0.0307), s(-0.0306), of(-0.0276), she(0.0243)
+
+[15] record=364  true_label=0  pred_pos_prob=0.4341
+    normalized: text=0.8807 audio=0.0425 vision=0.0768
+    raw       : text=1.035291 audio=0.049959 vision=0.090338
+    top tokens: [CLS](-0.1643), [SEP](0.0842), they(0.0201), california(0.0184), the(0.0173), until(0.0150), high(0.0138), really(0.0127), uh(0.0118), borders(-0.0104)
+
+[16] record=374  true_label=0  pred_pos_prob=0.4206
+    normalized: text=0.9118 audio=0.0409 vision=0.0473
+    raw       : text=0.727685 audio=0.032647 vision=0.037779
+    top tokens: [CLS](-0.0980), [SEP](-0.0196), of(0.0195), film(0.0137), of(0.0118), of(-0.0115), bad(0.0099), that(0.0081), anymore(-0.0069), laughter(0.0068)
+
+[17] record=377  true_label=1  pred_pos_prob=0.4039
+    normalized: text=0.8595 audio=0.0679 vision=0.0726
+    raw       : text=0.647537 audio=0.051127 vision=0.054717
+    top tokens: [CLS](-0.1058), [SEP](-0.0142), client(0.0128), cruz(0.0075), ireland(0.0062), ireland(-0.0054), culture(-0.0051), me(0.0050), i(0.0049), morocco(0.0049)
+
+[18] record=388  true_label=1  pred_pos_prob=0.6140
+    normalized: text=0.8696 audio=0.0586 vision=0.0718
+    raw       : text=0.862719 audio=0.058152 vision=0.071268
+    top tokens: [CLS](-0.1782), mm(-0.0148), yes(-0.0135), <(-0.0126), of(0.0090), to(0.0083), of(0.0081), uh(0.0079), shy(0.0070), of(0.0070)
+
+[19] record=393  true_label=0  pred_pos_prob=0.5714
+    normalized: text=0.8420 audio=0.0587 vision=0.0993
+    raw       : text=0.726298 audio=0.050612 vision=0.085669
+    top tokens: [CLS](-0.1083), [SEP](-0.0612), <(-0.0114), >(-0.0076), california(0.0068), c(0.0065), um(0.0060), los(0.0060), i(0.0059), like(0.0059)
+
+[20] record=399  true_label=0  pred_pos_prob=0.4764
+    normalized: text=0.8787 audio=0.0369 vision=0.0844
+    raw       : text=0.608172 audio=0.025521 vision=0.058425
+    top tokens: [CLS](-0.0909), grown(-0.0065), [SEP](-0.0065), guitar(0.0064), <(0.0061), with(0.0051), from(-0.0050), and(0.0049), far(-0.0048), beaches(0.0045)
+
+[21] record=403  true_label=0  pred_pos_prob=0.5375
+    normalized: text=0.8992 audio=0.0757 vision=0.0251
+    raw       : text=1.161694 audio=0.097820 vision=0.032415
+    top tokens: [CLS](-0.2180), [SEP](-0.1237), of(0.0455), seventeen(0.0299), that(0.0226), i(0.0194), i(0.0183), m(0.0108), at(-0.0103), <(-0.0099)
+
+[22] record=404  true_label=0  pred_pos_prob=0.4925
+    normalized: text=0.8853 audio=0.0386 vision=0.0761
+    raw       : text=0.883119 audio=0.038515 vision=0.075950
+    top tokens: [CLS](-0.1742), of(0.0129), [SEP](-0.0115), pain(-0.0114), of(0.0112), of(0.0097), of(0.0096), s(0.0078), but(0.0070), movies(0.0064)
+
+[23] record=411  true_label=0  pred_pos_prob=0.3784
+    normalized: text=0.9016 audio=0.0622 vision=0.0362
+    raw       : text=0.809552 audio=0.055873 vision=0.032489
+    top tokens: [CLS](-0.1616), of(0.0505), [SEP](-0.0353), of(-0.0140), something(-0.0101), courageous(-0.0072), a(-0.0063), of(0.0061), but(0.0058), i(0.0054)
+
+[24] record=415  true_label=0  pred_pos_prob=0.4668
+    normalized: text=0.9329 audio=0.0279 vision=0.0392
+    raw       : text=1.100936 audio=0.032881 vision=0.046306
+    top tokens: [CLS](-0.1868), clothes(0.0759), <(-0.0285), for(0.0241), of(0.0225), musically(-0.0205), [SEP](-0.0194), ##h(0.0148), sisters(0.0133), i(0.0109)
+
+[25] record=441  true_label=1  pred_pos_prob=0.5688
+    normalized: text=0.9644 audio=0.0210 vision=0.0146
+    raw       : text=2.113102 audio=0.046007 vision=0.031884
+    top tokens: [CLS](0.1922), ##rita(0.1080), eighteen(-0.1001), [SEP](-0.0826), ir(0.0689), ##te(0.0540), the(0.0327), heck(0.0308), of(-0.0275), policemen(-0.0241)
+
+[26] record=442  true_label=0  pred_pos_prob=0.3513
+    normalized: text=0.8839 audio=0.0423 vision=0.0738
+    raw       : text=0.760750 audio=0.036437 vision=0.063528
+    top tokens: [CLS](-0.1397), [SEP](-0.0243), of(-0.0085), uh(0.0080), sixteen(-0.0077), i(0.0072), lived(-0.0067), gets(-0.0063), twenty(-0.0062), laughter(0.0060)
+
+[27] record=448  true_label=1  pred_pos_prob=0.5377
+    normalized: text=0.9560 audio=0.0167 vision=0.0273
+    raw       : text=0.978956 audio=0.017066 vision=0.027987
+    top tokens: [CLS](-0.1227), >(0.0256), california(0.0115), around(0.0111), ##n(0.0106), [SEP](0.0101), point(0.0099), of(0.0097), era(0.0094), <(-0.0092)
+
+[28] record=451  true_label=0  pred_pos_prob=0.3526
+    normalized: text=0.9239 audio=0.0288 vision=0.0473
+    raw       : text=0.830380 audio=0.025848 vision=0.042519
+    top tokens: [CLS](-0.1248), [SEP](-0.0315), of(-0.0133), regular(-0.0132), i(0.0104), friends(0.0080), enjoying(-0.0076), i(0.0075), moments(-0.0075), when(0.0073)
+
+[29] record=452  true_label=0  pred_pos_prob=0.5411
+    normalized: text=0.9763 audio=0.0124 vision=0.0113
+    raw       : text=2.015609 audio=0.025627 vision=0.023380
+    top tokens: [CLS](-0.5322), cell(0.0762), [SEP](0.0608), using(0.0313), answered(-0.0271), a(0.0224), i(0.0218), film(0.0195), >(-0.0190), no(0.0158)
+
+[30] record=461  true_label=1  pred_pos_prob=0.5612
+    normalized: text=0.8761 audio=0.0454 vision=0.0786
+    raw       : text=0.808337 audio=0.041844 vision=0.072507
+    top tokens: [CLS](-0.1182), in(0.0117), keeping(0.0098), about(0.0094), lucky(-0.0092), emotions(-0.0084), weather(0.0075), kids(-0.0075), good(-0.0068), shy(0.0066)
+
+[31] record=469  true_label=0  pred_pos_prob=0.3734
+    normalized: text=0.7990 audio=0.1126 vision=0.0884
+    raw       : text=0.793410 audio=0.111812 vision=0.087751
+    top tokens: [CLS](-0.1455), of(0.0236), been(0.0093), in(0.0080), eh(0.0079), >(-0.0078), of(0.0068), rude(0.0064), medication(0.0062), um(0.0061)
+
+[32] record=479  true_label=0  pred_pos_prob=0.4931
+    normalized: text=0.8819 audio=0.0425 vision=0.0756
+    raw       : text=0.931108 audio=0.044896 vision=0.079774
+    top tokens: [CLS](-0.1998), of(0.0163), of(0.0159), of(0.0149), sell(0.0136), um(0.0093), ##h(0.0080), um(0.0072), um(0.0071), uncle(0.0065)
+
+[33] record=480  true_label=0  pred_pos_prob=0.4015
+    normalized: text=0.9396 audio=0.0338 vision=0.0266
+    raw       : text=0.855351 audio=0.030772 vision=0.024234
+    top tokens: [CLS](-0.1633), [SEP](-0.0362), of(-0.0163), m(0.0138), <(0.0105), ##h(0.0104), i(0.0097), as(-0.0073), to(0.0060), probably(0.0058)
+
+[34] record=482  true_label=0  pred_pos_prob=0.4440
+    normalized: text=0.9417 audio=0.0314 vision=0.0269
+    raw       : text=0.866665 audio=0.028859 vision=0.024760
+    top tokens: [CLS](-0.1903), of(0.0317), [SEP](-0.0230), i(0.0127), i(0.0115), i(0.0106), of(0.0086), i(0.0082), of(-0.0074), of(0.0067)
+
+[35] record=485  true_label=0  pred_pos_prob=0.5012
+    normalized: text=0.8887 audio=0.0557 vision=0.0556
+    raw       : text=0.722047 audio=0.045247 vision=0.045173
+    top tokens: [CLS](-0.1166), [SEP](-0.0110), >(-0.0109), of(0.0081), sigh(-0.0080), up(0.0073), louis(-0.0067), but(0.0066), from(0.0063), just(0.0062)
+
+[36] record=489  true_label=0  pred_pos_prob=0.4711
+    normalized: text=0.8727 audio=0.0407 vision=0.0865
+    raw       : text=0.818151 audio=0.038199 vision=0.081095
+    top tokens: [CLS](-0.1582), san(-0.0268), ##h(0.0131), i(0.0109), of(0.0101), passionate(0.0097), about(0.0084), ##is(0.0081), for(0.0076), ob(0.0066)

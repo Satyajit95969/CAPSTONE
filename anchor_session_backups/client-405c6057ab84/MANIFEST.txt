@@ -1,0 +1,47 @@
+ANCHOR SESSION BACKUP (repo-local mirror) — client-405c6057ab84
+
+Full backup, with checksums and the full "what's not recoverable" writeup,
+lives at ~/.federated/data/anchor_session_backups/client-405c6057ab84/
+(outside this repo, since it's runtime data, not source). This directory is
+a repo-tracked mirror of the small, human/machine-readable subset of that
+backup, so the anchor session survives even if the external copy or the
+whole ~/.federated tree is ever lost - the reason this exists at all is that
+mentalbert_privacy_subset.pt (the trained checkpoint for this session) was
+ALREADY gone, overwritten in place by later client rounds, by the time this
+was noticed. See docs/IMPLEMENTATION_NOTES.md, "Accepted, deferred:
+checkpoint versioning" section, for the full story and the proposed fix.
+
+WHY THIS SESSION: the only client round on disk whose recorded metrics
+match the mentor-demo target numbers exactly (accuracy 0.6486486486486487,
+precision 0.4444444444444444, recall 0.7272727272727273, f1
+0.5517241379310345) AND whose own local DP receipt independently matches
+the "what happens after DP" numbers (l2_norm_before=0.7657614350318909,
+l2_norm_after=449.96197509765625, ratio=587.6007259087384x).
+
+INCLUDED here (identical bytes to the external backup):
+  xai_ig_client-405c6057ab84_1787825775504.json  - full Phase A report:
+    eval_metrics, aggregate modality split, 37-record per_sample array.
+    This is what scripts/demo_predictions.py reads.
+  xai_ig_client-405c6057ab84_1787825775504.txt   - human-readable rendering.
+  receipt_a5ac5fc9a47447eea925f267ec9d2ef7.json  - local DP receipt (clip
+    norm, noise multiplier, mechanism, l2 before/after, epsilon spent).
+
+DELIBERATELY EXCLUDED from this repo-local copy:
+  dp_gaussian_1787825776157.pt.enc  - the AES-GCM-encrypted DP-noised delta
+    this session produced. Present in the EXTERNAL backup only
+    (~/.federated/data/anchor_session_backups/client-405c6057ab84/). Not
+    committed here because it is opaque ciphertext - unreadable without
+    SecureStore key material, which must never be committed (see CLAUDE.md's
+    "do not commit ... master.key" rule) - so committing it to git would add
+    ~1.5MB of binary weight to the repository for zero practical benefit.
+
+NOT RECOVERABLE anywhere (see the external MANIFEST.txt for the full
+explanation): the trained model checkpoint itself
+(mentalbert_privacy_subset.pt), a session-specific metrics.json, and this
+session's MongoDB records (model_updates/receipts/GridFS) - the database has
+been reset and reused since this session ran.
+
+scripts/demo_predictions.py's own lookup logic is unchanged by this file's
+existence - it still checks the external ~/.federated backup first, then the
+live explain_logs/ path. This repo-local copy is for version-control
+durability and audit trail, not wired into the script's runtime search.

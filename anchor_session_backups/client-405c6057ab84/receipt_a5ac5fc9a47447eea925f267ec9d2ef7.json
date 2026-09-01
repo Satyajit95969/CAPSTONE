@@ -1,0 +1,21 @@
+{
+  "agent": "dp-agent",
+  "session_id": "client-405c6057ab84",
+  "operation": "dp_process_update",
+  "params": {
+    "clip_norm": 0.85,
+    "clip_applied": false,
+    "noise_multiplier": 1.0,
+    "mechanism": "gaussian",
+    "delta": 1e-05,
+    "l2_norm_before": 0.7657614350318909,
+    "l2_norm_after": 449.96197509765625,
+    "epsilon_spent": 5.302585092994046,
+    "parent_receipt": null
+  },
+  "outputs": [
+    "file://C:\\Users\\satya\\.federated\\data\\secure_store\\dp_updates\\dp_gaussian_1787825776157.pt.enc"
+  ],
+  "timestamp": "2026-08-27T10:16:16.171893Z",
+  "signature": "STioYKTTpM/6TObXO/nviSyYFvb92cXhTQkzKGfi7LY="
+}
