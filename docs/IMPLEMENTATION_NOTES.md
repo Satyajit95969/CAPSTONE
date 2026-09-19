@@ -1787,3 +1787,94 @@ documented at production scale (281,254-dim noise vector).
   this change, since both files still read `os.environ.get(..., <new
   default>)`.
 
+---
+
+## Tighter RDP->DP accounting + second noise reduction: 0.8 -> 0.75 (2026-09-20)
+
+Follow-up to the noise reduction above. The classic RDP->DP conversion
+(`_rdp_to_dp()`, Mironov 2017: `eps = min_alpha[alpha/(2*sigma^2) +
+log(1/delta)/(alpha-1)]`, minimized over integer alpha in [2,257)) is a known
+loose bound. Two tighter, well-established alternatives were evaluated
+before touching anything:
+
+- **(ii) Canonne-Kamath-Steinke tightening** (NeurIPS 2020, Prop. 12,
+  building on Balle et al. 2020 AISTATS and Asoodeh et al. 2020): adds a
+  `log((alpha-1)/alpha)` term and replaces `log(1/delta)` with
+  `-(log(delta)+log(alpha))`, provably <= the classic bound for every alpha.
+  Minimized at a *continuous* alpha (~4.576 at sigma=0.8, not an integer),
+  so implemented with `scipy.optimize.minimize_scalar` (bounded Brent's
+  method) rather than the classic function's integer grid - see
+  `_rdp_to_dp_tight()` in `dp_agent.py` for the full derivation and formula.
+- **(iii) Analytic Gaussian mechanism** (Balle & Wang, ICML 2018): the
+  *exact* (eps,delta) for a pure Gaussian mechanism (not an RDP bound at
+  all), via `delta(eps) = Phi(mu/2 - eps/mu) - e^eps*Phi(-mu/2 - eps/mu)`,
+  `mu = 1/sigma`, solved by bisection. Implemented with
+  `scipy.special.log_ndtr` for numerical stability (a naive `math.erf` +
+  `math.exp(eps)` implementation overflows for large eps).
+
+**Three-method comparison** (delta=1e-5; sensitivity=clip_norm cancels out
+of all three formulas, so each depends only on sigma and delta):
+
+| sigma | (i) classic (current) | (ii) tighter RDP | (iii) analytic Gaussian (exact) |
+|---|---|---|---|
+| 0.50 | 11.756463 | 10.724824 | 9.997256 |
+| 0.60 | 9.393197 | 8.603231 | 8.003691 |
+| 0.65 | 8.571370 | 7.819462 | 7.268511 |
+| 0.70 | 7.919274 | 7.162095 | 6.652488 |
+| 0.75 | 7.322676 | 6.603254 | 6.129245 |
+| 0.80 | 6.784481 | 6.122631 | 5.679587 |
+| 0.90 | 5.964651 | 5.339144 | 4.947319 |
+| 1.00 | 5.302585 | 4.728387 | 4.377178 |
+
+**Method chosen: (ii) tighter RDP, not (iii) analytic Gaussian - a
+deliberate trade against the mathematically tighter option.** (iii) is
+exact only for a *single* Gaussian mechanism application; it does not
+compose additively across rounds the way RDP does. This project has a known
+open defect: privacy accounting is per-round only, with no cumulative
+epsilon tracked across rounds. RDP composes trivially when that gets fixed
+(sum `alpha/(2*sigma_r^2)` across rounds, convert once at the end via either
+`_rdp_to_dp()` or `_rdp_to_dp_tight()`). Using the analytic Gaussian
+mechanism per-round and summing the resulting epsilons across rounds would
+be a **double-conversion error**, not a valid composition. (ii) was chosen
+specifically so this future fix stays correct instead of requiring a second
+accounting migration.
+
+**Sigma chosen: 0.75, not 0.70 - because the margin target is evaluated
+under the method actually in use.** Under (ii), sigma=0.70 gives
+eps=7.162095, only ~10.47% margin under the eps<=8 target - thinner than
+wanted. sigma=0.75 gives eps=6.603254, ~17.5% margin. (An earlier version of
+this exercise, using method (iii) as the yardstick, would have recommended
+sigma=0.70 - that recommendation does not carry over now that (ii) is the
+adopted method, since the two methods rank sigma values by different
+margins.)
+
+**Live verification** (one real client round end-to-end, session
+`client-c959272d18a2`, receipt `receipt_f3ad77e6efcd43019f349aa56864c322.json`):
+
+| quantity | measured | predicted | old method (i), same run |
+|---|---|---|---|
+| noise_multiplier | 0.75 | 0.75 | - |
+| l2_norm_before (signal) | 0.6900 | ~0.6-0.77 (historical range) | unaffected - confirms only noise changed |
+| l2_norm_after | 338.6191 | 450.81 x 0.75 = 338.11 (0.15% error, matches the Fix E4 empirical scaling law) | - |
+| epsilon_spent (live, method ii) | 6.603254 | 6.603254 | 7.322676 (classic, same sigma - shown for audit, not what's reported) |
+
+Local eval this run: accuracy=0.4054, precision=0.3103, recall=0.8182,
+f1=0.4500. This is the same "noise dominates -> biased-positive collapse"
+pattern already documented earlier in this file (Step 16 round 2:
+F1=0.4583, `prob_positive_distribution` saturated) - high recall, low
+precision, mid-0.4x F1 - not a new failure mode. Noise norm (338.62) still
+overwhelms signal (0.69) by ~490x even at sigma=0.75, so this collapse
+pattern is expected to persist regardless of accounting method; nothing
+outside the accounting math moved.
+
+**Files changed** (same two as the first noise reduction, kept in sync):
+- `installer/runtime/agents/dp/dp_agent.py`: added `_rdp_to_dp_tight()`
+  (new function; `_rdp_to_dp()` kept intact and callable for reproducing
+  historical/classic numbers), switched `process_local_update()`'s live
+  `epsilon_spent` computation to call it, updated the `noise_multiplier`
+  class default `0.8 -> 0.75`, updated the "Accounting method" report line.
+- `runtime/pipeline.py`: `DP_NOISE_MULTIPLIER` fallback literal `"0.8" ->
+  "0.75"`.
+- `dp_agent/dp_agent.py` (the separate research harness/dead-code file
+  documented above) was **not** touched, per instruction.
+
