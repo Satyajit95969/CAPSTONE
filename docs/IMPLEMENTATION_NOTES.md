@@ -1704,3 +1704,86 @@ into this repo at `anchor_session_backups/client-405c6057ab84/`) exist as the
 interim workaround - reading a specific session's persisted `per_sample`
 data rather than depending on the checkpoint still being on disk.
 
+---
+
+## Confirmed dead code: `installer/runtime/pipeline.py` (2026-09-20)
+
+While tracing the live call chain to lower `noise_multiplier` (see "Noise
+reduction" below), confirmed `installer/runtime/pipeline.py` - a second,
+separate `pipeline.py` that hardcodes `DPAgent(clip_norm=1.0,
+noise_multiplier=1.0, ...)` - is **imported by nothing anywhere in this
+codebase**. Searched both `from installer.runtime.pipeline import` /
+`from installer.runtime import pipeline` and, separately, `from pipeline
+import` / `import pipeline` (the form it would take if only
+`installer/runtime` were on `sys.path`, as some callers do): zero hits
+either way.
+
+The actual live pipeline is the top-level `runtime/pipeline.py`, reached via
+`run_client_multimodal.py` -> `runtime.federated_client` ->
+`from runtime.pipeline import run_pipeline`. It reads `clip_norm`/
+`noise_multiplier` from `DP_CLIP_NORM`/`DP_NOISE_MULTIPLIER` env vars
+(defaults `"0.85"`/`"0.8"` as of this entry), matching every real DP receipt
+on disk. `installer/runtime/pipeline.py`'s hardcoded `1.0`/`1.0` values were
+never live - not a second production path, not stale-but-reachable, just
+unreferenced. Left as-is (not deleted) per instruction, noted here so nobody
+spends time on it later thinking it's real.
+
+---
+
+## Noise reduction: `noise_multiplier` 1.0 -> 0.8 (2026-09-20)
+
+Historical delta L2 (the real training signal) never exceeds 0.7658 across
+219 recorded DP operations (`~/.federated/data/receipts/receipt_*.json`,
+every `dp_process_update` receipt this project has ever produced) - DP noise
+at the old `noise_multiplier=1.0` (mean noise norm 450.81 across 110
+gaussian-mechanism receipts at `clip_norm=0.85`) was swamping that signal by
+~590x. `clip_norm` (0.85) is untouched by this change - clipping has never
+fired in this project's history (confirmed: `clip_applied` is `False` in
+all 219 receipts) and remains unrelated to noise scale by design.
+
+**Sigma -> epsilon**, computed via the real `_rdp_to_dp()` in
+`installer/runtime/agents/dp/dp_agent.py` (not reimplemented):
+
+| sigma | epsilon |
+|---|---|
+| 1.0 (old) | 5.302585 |
+| 0.9 | 5.964651 |
+| 0.8 (new) | 6.784481 |
+| 0.7 | 7.919274 (only ~1% margin under 8 - rejected) |
+| 0.6 | 9.393197 (already exceeds 8) |
+| 0.5 | 11.756463 |
+
+`sigma=0.8` chosen: eps=6.784481, ~15% margin under the eps<=8 target -
+comfortable without being the tightest possible value.
+
+**Linear noise-scaling, confirmed empirically** from real historical
+receipts before this change (not assumed from theory alone): grouped every
+gaussian-mechanism receipt at `clip_norm=0.85` by `noise_multiplier`, using
+`l2_after` as a proxy for noise norm (valid since `l2_before` ~0.6 is
+negligible next to noise ~450):
+
+| sigma | n | mean l2_after | predicted (sigma=1.0 mean x ratio) | error |
+|---|---|---|---|---|
+| 1.0 | 110 | 450.8117 | - | - |
+| 0.5 | 2 | 225.0669 | 225.4058 | -0.150% |
+| 0.25 | 1 | 112.5117 | 112.7029 | -0.170% |
+
+Matches prediction to within 0.17% - confirms `add_noise()`'s
+`scale = noise_multiplier * sensitivity` (`dp_agent.py:152`) behaves as
+documented at production scale (281,254-dim noise vector).
+
+**Two files changed, one left alone by design**:
+- `runtime/pipeline.py:473` - the `DP_NOISE_MULTIPLIER` fallback literal,
+  `"1.0"` -> `"0.8"`. This is the value that actually reaches every live
+  client run (the caller always passes it explicitly to `DPAgent`) -
+  the real fix.
+- `installer/runtime/agents/dp/dp_agent.py:97` - the `DPAgent.__init__`
+  default, `1.0` -> `0.8`. Has no live effect on its own (the caller above
+  always overrides it), changed only so the class's own default doesn't
+  silently disagree with what's actually running.
+- `DP_CLIP_NORM`/`DP_NOISE_MULTIPLIER` env vars still override both
+  defaults when explicitly set (used by research scripts like
+  `run_step12_combo.py`, `run_step13_combo.py`) - verified unaffected by
+  this change, since both files still read `os.environ.get(..., <new
+  default>)`.
+
