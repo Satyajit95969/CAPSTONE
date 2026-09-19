@@ -94,7 +94,7 @@ class DPAgent:
     def __init__(
         self,
         clip_norm: float = 0.85,  # Fix E4 recalibration: measured delta sensitivity shifted with lr/epochs (N=30, max=0.7294, was max=0.1177 under the old regime) — see scripts/calibrate_clip_norm.py
-        noise_multiplier: float = 1.0,
+        noise_multiplier: float = 0.8,  # Noise reduction (2026-09-20): lowered from 1.0; eps=6.784481 via _rdp_to_dp(), comfortable margin under eps<=8. The live caller (runtime/pipeline.py) always passes this explicitly via DP_NOISE_MULTIPLIER (default "0.8") — kept in sync here so this default doesn't silently disagree with what's actually live.
         mechanism: str = "gaussian",
         secure_store_dir: str = str(_DP_STORE_DIR),
         receipts_dir: str = str(_DP_RECEIPT_DIR),
