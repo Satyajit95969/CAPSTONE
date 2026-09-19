@@ -41,6 +41,7 @@ SECURITY FIX:
 import os, io, time, math, torch
 from pathlib import Path
 from typing import Optional, Dict, Any
+from scipy.optimize import minimize_scalar
 
 from core.centralised_receipts import CentralReceiptManager
 from core.centralized_secure_store import SecureStore
@@ -86,6 +87,60 @@ def _rdp_to_dp(noise_multiplier: float, clip_norm: float,
     return best_eps
 
 
+def _rdp_to_dp_tight(noise_multiplier: float, delta: float = _DEFAULT_DELTA) -> float:
+    """
+    Tighter RDP -> (epsilon, delta)-DP conversion (2026-09-20).
+
+    Source: Canonne, Kamath & Steinke, "The Discrete Gaussian for
+    Differential Privacy" (NeurIPS 2020), Prop. 12 - itself building on
+    Balle, Barthe, Gaboardi, Hsu & Sato, "Hypothesis Testing Interpretations
+    and Renyi Differential Privacy" (AISTATS 2020) and Asoodeh et al. (2020).
+
+    If a mechanism is (alpha, eps_rdp(alpha))-RDP for real alpha > 1, it is
+    (eps, delta)-DP for any delta in (0,1) at:
+
+        eps(alpha) = eps_rdp(alpha) + log((alpha-1)/alpha)
+                     - (log(delta) + log(alpha)) / (alpha - 1)
+
+    This is provably <= the classic conversion used by _rdp_to_dp() above
+    (eps_rdp(alpha) + log(1/delta)/(alpha-1)) for every alpha, hence
+    "tighter". _rdp_to_dp() is kept intact (not replaced) so the historical
+    epsilon numbers it produced remain exactly reproducible.
+
+    For our Gaussian mechanism, std = noise_multiplier * sensitivity, so
+    eps_rdp(alpha) = alpha / (2 * noise_multiplier^2) - sensitivity cancels
+    out of the ratio exactly as it does for _rdp_to_dp() (see module
+    docstring); this conversion is valid for our exact setting: a pure
+    Gaussian mechanism, single composition (T=1) per round.
+
+    Unlike the classic bound, this tighter one is minimised at a
+    *continuous* alpha (e.g. alpha* ~= 4.576 at noise_multiplier=0.8, not an
+    integer), so the classic function's `range(2, 257)` integer grid is not
+    sufficient here. We use scipy.optimize.minimize_scalar (bounded Brent's
+    method) over alpha in (1, 512] rather than a hand-rolled grid search:
+    scipy is already a project dependency (requirements.txt), Brent's method
+    finds the continuous optimum to high precision without picking an
+    arbitrary grid resolution, and 512 comfortably covers the optimal alpha
+    for every noise_multiplier this project uses (down to ~0.5).
+    """
+    if noise_multiplier <= 0:
+        return float("inf")
+
+    def eps_of_alpha(alpha: float) -> float:
+        eps_rdp = alpha / (2.0 * noise_multiplier ** 2)
+        return (
+            eps_rdp
+            + math.log((alpha - 1) / alpha)
+            - (math.log(delta) + math.log(alpha)) / (alpha - 1)
+        )
+
+    result = minimize_scalar(
+        eps_of_alpha, bounds=(1.0 + 1e-9, 512.0), method="bounded",
+        options={"xatol": 1e-10},
+    )
+    return float(result.fun)
+
+
 class DPAgent:
     SUPPORTED_MECHANISMS = {
         "gaussian", "laplace", "uniform", "exponential", "student_t", "none"
@@ -94,7 +149,7 @@ class DPAgent:
     def __init__(
         self,
         clip_norm: float = 0.85,  # Fix E4 recalibration: measured delta sensitivity shifted with lr/epochs (N=30, max=0.7294, was max=0.1177 under the old regime) — see scripts/calibrate_clip_norm.py
-        noise_multiplier: float = 0.8,  # Noise reduction (2026-09-20): lowered from 1.0; eps=6.784481 via _rdp_to_dp(), comfortable margin under eps<=8. The live caller (runtime/pipeline.py) always passes this explicitly via DP_NOISE_MULTIPLIER (default "0.8") — kept in sync here so this default doesn't silently disagree with what's actually live.
+        noise_multiplier: float = 0.75,  # Noise reduction (2026-09-20): lowered from 0.8 to 0.75 after switching live accounting to _rdp_to_dp_tight() (Canonne-Kamath-Steinke); eps=6.603254 at sigma=0.75 under the tighter method, ~17.5% margin under eps<=8 (sigma=0.7 was rejected: only ~10.47% margin under the tighter method). The live caller (runtime/pipeline.py) always passes this explicitly via DP_NOISE_MULTIPLIER (default "0.75") — kept in sync here so this default doesn't silently disagree with what's actually live.
         mechanism: str = "gaussian",
         secure_store_dir: str = str(_DP_STORE_DIR),
         receipts_dir: str = str(_DP_RECEIPT_DIR),
@@ -270,10 +325,20 @@ class DPAgent:
         self.store.encrypt_write("file://" + out_path, out_bytes)
 
         # FIX-DP-1: compute real epsilon via RDP accountant
+        # 2026-09-20: switched live accounting from the classic Mironov 2017
+        # conversion (_rdp_to_dp(), still intact above for reproducing the
+        # historical numbers) to the tighter Canonne-Kamath-Steinke
+        # conversion (_rdp_to_dp_tight()) - see its docstring for the
+        # formula, source, and validity argument. Chosen over the
+        # mathematically tighter analytic Gaussian mechanism (Balle & Wang
+        # 2018) specifically because RDP composes additively across rounds
+        # (sum alpha/(2*sigma_r^2), convert once) while the analytic
+        # Gaussian's exact (eps,delta) does not - this project has a known
+        # open defect where per-round accounting isn't yet summed across
+        # rounds, and this choice keeps that future fix correct instead of
+        # requiring a second migration. See docs/IMPLEMENTATION_NOTES.md.
         if self.mechanism == "gaussian" and self.noise_multiplier > 0:
-            epsilon_spent = _rdp_to_dp(
-                self.noise_multiplier, self.clip, self.delta
-            )
+            epsilon_spent = _rdp_to_dp_tight(self.noise_multiplier, self.delta)
         else:
             # Non-Gaussian mechanisms: use a conservative upper bound
             epsilon_spent = float("inf") if self.mechanism == "none" else 10.0
@@ -281,7 +346,7 @@ class DPAgent:
         rpt.subheader("STEP 4 - PRIVACY ACCOUNTING")
         rpt.kv("Delta (δ)", self.delta, indent=2)
         rpt.kv("Epsilon (ε)", f"{epsilon_spent:.6f}" if math.isfinite(epsilon_spent) else "inf", indent=2)
-        rpt.kv("Accounting method", "RDP (Mironov 2017), single composition T=1", indent=2)
+        rpt.kv("Accounting method", "Tighter RDP->DP (Canonne-Kamath-Steinke 2020), single composition T=1", indent=2)
         rpt.kv("DP execution time", f"{(time.time() - ts_start):.4f} sec", indent=2)
         rpt.ok("Differential privacy applied")
 

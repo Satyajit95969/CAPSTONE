@@ -469,12 +469,15 @@ def run_pipeline(
     # Step 12: overridable so the privacy-utility comparison can run a
     # genuine no-privacy arm (DP_MECHANISM=none or DP_NOISE_MULTIPLIER=0)
     # through the exact same pipeline code path as the DP arm.
-    # Noise reduction (2026-09-20): lowered from 1.0 to 0.8 - real historical
-    # delta L2 never exceeds 0.77 (see docs/IMPLEMENTATION_NOTES.md), so noise
-    # was swamping signal by ~590x. sigma=0.8 -> epsilon=6.784481 via
-    # _rdp_to_dp(), verified with a comfortable margin under the eps<=8
-    # target (unlike sigma=0.7's eps=7.919, ~1% margin). clip_norm unchanged.
-    dp_noise_multiplier = float(os.environ.get("DP_NOISE_MULTIPLIER", "0.8"))
+    # Noise reduction (2026-09-20): lowered from 1.0 to 0.8, then to 0.75
+    # after switching live accounting to _rdp_to_dp_tight() (Canonne-Kamath-
+    # Steinke tightening, see dp_agent.py). Real historical delta L2 never
+    # exceeds 0.77 (see docs/IMPLEMENTATION_NOTES.md), so noise was swamping
+    # signal by ~590x at the old sigma=1.0. sigma=0.75 -> epsilon=6.603254
+    # under the tighter method, ~17.5% margin under the eps<=8 target
+    # (sigma=0.7 rejected: only ~10.47% margin under the tighter method).
+    # clip_norm unchanged.
+    dp_noise_multiplier = float(os.environ.get("DP_NOISE_MULTIPLIER", "0.75"))
     dp_mechanism = os.environ.get("DP_MECHANISM", "gaussian")
     dp_agent = DPAgent(
         clip_norm=dp_clip_norm,
