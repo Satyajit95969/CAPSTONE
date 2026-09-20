@@ -1878,3 +1878,98 @@ outside the accounting math moved.
 - `dp_agent/dp_agent.py` (the separate research harness/dead-code file
   documented above) was **not** touched, per instruction.
 
+---
+
+## 14-run sigma comparison: collapse-mode distribution is sigma-independent (2026-09-20)
+
+Follow-up investigation after the sigma=0.75 switch above, prompted by two
+single runs at sigma=0.75 landing far apart (F1 0.4500 and 0.0000) versus
+the anchor session's F1=0.5517. Ran 7 more client rounds at sigma=0.75 (for
+7 total) and, as a control with **no code changes** (`DP_NOISE_MULTIPLIER=1.0`
+env var only, same code path), 7 client rounds at the original sigma=1.0.
+Model, training loop, LR, epochs, data, splits and clip_norm were untouched
+throughout - only the noise_multiplier env var varied.
+
+**sigma=0.75 (7 runs):**
+
+| run | accuracy | precision | recall | F1 | delta L2 | collapse mode |
+|---|---|---|---|---|---|---|
+| 1 | 0.4054 | 0.3103 | 0.8182 | 0.4500 | 0.6900 | predict-mostly-positive |
+| 2 | 0.7027 | 0.0000 | 0.0000 | 0.0000 | 0.6837 | predict-all-negative |
+| 3 | 0.7027 | 0.0000 | 0.0000 | 0.0000 | 0.7732 | predict-all-negative |
+| 4 | 0.7027 | 0.0000 | 0.0000 | 0.0000 | 0.7180 | predict-all-negative |
+| 5 | 0.7027 | 0.0000 | 0.0000 | 0.0000 | 0.7296 | predict-all-negative |
+| 6 | 0.7027 | 0.0000 | 0.0000 | 0.0000 | 0.4044 | predict-all-negative |
+| 7 | 0.7027 | 0.0000 | 0.0000 | 0.0000 | 0.4117 | predict-all-negative |
+
+F1 distribution: mean=0.0643, median=0.0000, min=0.0000, max=0.4500,
+stdev=0.1701 (sample). Collapse tally: 6/7 predict-all-negative, 1/7
+predict-mostly-positive, 0/7 genuine discrimination.
+
+**sigma=1.00 (7 runs, control, `DP_NOISE_MULTIPLIER=1.0`):**
+
+| run | accuracy | precision | recall | F1 | delta L2 | collapse mode |
+|---|---|---|---|---|---|---|
+| 1 | 0.7027 | 0.0000 | 0.0000 | 0.0000 | 0.3949 | predict-all-negative |
+| 2 | 0.2973 | 0.2973 | 1.0000 | 0.4583 | 0.4828 | predict-all-positive |
+| 3 | 0.2973 | 0.2973 | 1.0000 | 0.4583 | 0.4840 | predict-all-positive |
+| 4 | 0.2973 | 0.2973 | 1.0000 | 0.4583 | 0.4933 | predict-all-positive |
+| 5 | 0.2973 | 0.2973 | 1.0000 | 0.4583 | 0.6922 | predict-all-positive |
+| 6 | 0.2973 | 0.2973 | 1.0000 | 0.4583 | 0.6912 | predict-all-positive |
+| 7 | 0.2973 | 0.2973 | 1.0000 | 0.4583 | 0.6969 | predict-all-positive |
+
+F1 distribution: mean=0.3928, median=0.4583, min=0.0000, max=0.4583,
+stdev=0.1732 (sample). Collapse tally: 6/7 predict-all-positive, 1/7
+predict-all-negative, 0/7 genuine discrimination.
+
+**Verdict: collapse rate is sigma-independent.** 6 of 7 runs collapsed into
+a degenerate single-class predictor at *both* sigma=0.75 and sigma=1.0 -
+identical 85.7% collapse rate. Zero runs at either sigma achieved genuine
+discrimination. Reducing sigma (0.8 -> 0.75, see above) did not push this
+pipeline from "mostly works" to "mostly collapses" - it was already
+collapsing 6/7 of the time at the original sigma=1.0.
+
+The mean-F1 gap between the two groups (0.0643 vs 0.3928) is **not**
+evidence that sigma=1.0 performs better - it is an artifact of which
+degenerate mode happened to dominate each group of 7. The two collapse
+modes are not symmetric in F1 on this eval split's fixed 29.73% positive
+base rate (37 held-out patients, `stratified_split()`, seed=42): predict-
+all-positive always scores precision=0.2973 (the base rate), recall=1.0000,
+F1=**0.4583** exactly; predict-all-negative always scores precision=recall=
+F1=**0.0000** exactly (see also lines 209/213/215/436/537-539/595/694/996-997
+above, where these same two exact values recur every time either collapse
+mode fires, across unrelated earlier experiments). Which mode a run falls
+into looks like a coin flip (no fixed init seed) - both groups landed on
+both modes at least once.
+
+**This directly re-contextualizes the anchor session
+(`client-405c6057ab84`, F1=0.5517241379310345,
+accuracy=0.6486486486486487) used throughout `scripts/demo_predictions.py`
+and the mentor-demo materials.** 0.5517 exceeds *both* degenerate-mode
+ceilings (0.4583). It is the ONE run, across these 14 plus the anchor
+session itself (15 total; "14+" is used in the disclosure text below as the
+conservative denominator excluding the anchor), that achieved genuine
+class discrimination rather than landing in either collapse basin. Treating
+it as representative of typical pipeline behavior would be wrong - it is
+the outlier that got shown precisely because it looks good, which is
+exactly what makes it unrepresentative of the other 14 runs measured here.
+
+**Machine-readable summary for `scripts/demo_predictions.py`'s
+representativeness disclosure block** (parsed at runtime, not hardcoded in
+the script - see that file's `_load_disclosure_facts()`):
+
+```
+DISCLOSURE_ANCHOR_SESSION_ID: client-405c6057ab84
+DISCLOSURE_ANCHOR_F1: 0.5517
+DISCLOSURE_TOTAL_OTHER_RUNS: 14
+DISCLOSURE_SIGMA_A: 0.75
+DISCLOSURE_SIGMA_A_RUNS: 7
+DISCLOSURE_SIGMA_A_COLLAPSED: 6
+DISCLOSURE_SIGMA_B: 1.00
+DISCLOSURE_SIGMA_B_RUNS: 7
+DISCLOSURE_SIGMA_B_COLLAPSED: 6
+DISCLOSURE_POSITIVE_COLLAPSE_F1: 0.4583
+DISCLOSURE_NEGATIVE_COLLAPSE_F1: 0.0000
+DISCLOSURE_BASE_RATE_POSITIVE_PCT: 29.73
+```
+
