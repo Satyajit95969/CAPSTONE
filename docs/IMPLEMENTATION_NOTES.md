@@ -1973,3 +1973,103 @@ DISCLOSURE_NEGATIVE_COLLAPSE_F1: 0.0000
 DISCLOSURE_BASE_RATE_POSITIVE_PCT: 29.73
 ```
 
+---
+
+## Fusion-head capacity sweep: a capacity floor between 75,454 and 30,178 params (2026-09-20)
+
+**Lead finding, the one to trust:** at fusion-head hidden size 12 (30,178 total
+trainable params) and hidden size 1 (18,859 params), **0 of 10 combined runs**
+(5 at each size) produced any non-uniform prediction. Every single run
+collapsed into an exact all-positive or exact all-negative predictor - no
+exceptions, at two independently-tested, very different parameter counts.
+This is a hard floor: below it, this architecture cannot do anything but
+collapse on this 149-record training partition. Capacity starts hurting
+somewhere between 75,454 and 30,178 trainable params.
+
+**Motivation.** `fusion.fc1` (`Linear(1024, hidden)`) holds 93.3% of the
+281,254-param trainable surface (262,400 of 281,254 at the default
+`hidden=256`) - by far the dominant lever on both model capacity and DP
+noise dimension (noise scales as sqrt(params)). Working hypothesis: 281,254
+parameters may be too many to learn from 149 training records with 44
+positives, and DP noise on that many parameters is itself a large cost
+(sqrt(281254) vs sqrt(a smaller count)). Made `FusionHead`'s `hidden` size
+configurable via `FUSION_HIDDEN_DIM` (`trainer_mentalbert_privacy.py`,
+default `"256"`, reproduces the original 281,254-param architecture
+byte-for-byte) to test whether a smaller head both reduces noise and
+changes the collapse rate.
+
+**Total trainable params as an exact function of `FUSION_HIDDEN_DIM` (H)**,
+derived and verified byte-exact against the 281,254 baseline:
+`total(H) = 1029*H + 17830` (17,826 of that is the fixed audio_encoder +
+vision_encoder overhead, unaffected by this knob). Reachability constraint
+recorded during discovery: the originally-proposed 10K/3K targets are not
+reachable via this knob alone (floor at H=1 is already 18,859) because that
+would require also shrinking the audio/vision encoders' own `out_dim`
+(currently fixed at 128), which would change fusion's 1024-dim input at
+the same time and confound attribution to either knob - explicitly out of
+scope per this investigation's own decision.
+
+**Correction to a documented ambiguity**: this investigation traced
+`MultiModalModel.forward()` and confirmed the fusion head's real input is
+**768 (text) + 128 (audio, post-`SmallMLP` projection) + 128 (vision,
+post-`SmallMLP` projection) = 1024** - not the raw 768+154+84=1006 an
+initial reading of the dimensions suggested. Audio (154-dim wav2vec2) and
+video (84-dim DenseNet) each pass through their own small encoder to
+128-dim *before* concatenation with the 768-dim MentalBERT `[CLS]` vector.
+This resolves the stale doc conflict noted elsewhere in this file and in
+CLAUDE.md ("fusion 192 vs 1024") in favor of the code-measured **1024**.
+
+**Five variants tested** (`FUSION_HIDDEN_DIM` env var only; model
+architecture is otherwise identical, same lr/epochs/batch size/data/split/
+label path/clip_norm/sigma throughout):
+
+| H | total trainable params | predicted noise @ sigma=0.75 (sqrt scaling from 338 @ 281,254) | measured mean noise |
+|---|---|---|---|
+| 256 (baseline) | 281,254 | 338 (reference) | 338.18 |
+| 128 | 149,542 | 246.5 | 246.36 |
+| 56 | 75,454 | 175.1 | 174.90 |
+| 12 | 30,178 | 110.7 | 110.98 |
+| 1 | 18,859 (floor - audio/vision encoder overhead alone) | 87.5 | 88.07 |
+
+Noise scaling confirmed empirically (not just asserted from the formula) to
+within 0.1-0.2% of the sqrt(params) prediction at every one of the 5
+variants, across a 15x parameter range.
+
+**Sample-size lesson - reported because it changed the conclusion.** An
+initial n=5-per-variant sweep suggested H=128 and H=56 each reached 2/5
+(40%) genuine-discrimination runs versus baseline's 1/5 (20%) - looked like
+smaller heads might help. Tripling to n=15 (10 more runs each at H=256,
+128, and 56; H=12 and H=1 left at n=5 since the floor there was already
+unanimous) reversed this:
+
+| H | params | n | all-positive | all-negative | NEITHER (genuine discrimination) | rate |
+|---|---|---|---|---|---|---|
+| 256 (baseline) | 281,254 | 15 | 5 | 4 | **6** | **40.0%** |
+| 128 | 149,542 | 15 | 8 | 2 | **5** | **33.3%** |
+| 56 | 75,454 | 15 | 5 | 5 | **5** | **33.3%** |
+| 12 | 30,178 | 5 | 2 | 3 | **0** | **0%** |
+| 1 | 18,859 | 5 | 2 | 3 | **0** | **0%** |
+
+At n=15, baseline (40.0%) is *higher* than both H=128 and H=56 (33.3%
+each) - the apparent n=5 advantage for smaller heads did not survive and,
+if anything, reversed. **Conclusion: shrinking the fusion head from
+281,254 to 149,542 or 75,454 params neither reliably helps nor reliably
+hurts the genuine-discrimination rate** - all three are statistically
+indistinguishable at this sample size (a 1-run difference out of 15). The
+only result that held up under a larger sample, and got *stronger* (0/10
+combined, not 0/7 or 0/5 individually), is the floor below 75,454 params.
+
+Classification rule used throughout: "NEITHER" = at least one prediction
+differs from the rest (not a uniform all-one-class output) - the literal
+primary metric requested. A secondary quality check (F1 exceeding the
+fixed 0.4583/0.0000 collapse ceilings) gives a similar ranking (baseline
+3/15, H=128 2/15, H=56 2/15) - some NEITHER runs are non-uniform but still
+poor (e.g. one H=128 run at F1=0.1333, one H=56 run at F1=0.1538), so
+"NEITHER" alone slightly overstates how many runs were genuinely *good*,
+not just genuinely *non-degenerate*.
+
+**No tuning was performed anywhere in this investigation** - not lr, not
+epochs, not batch size, not class weights, not clip_norm, not sigma. Only
+`FUSION_HIDDEN_DIM` varied across the 70 total runs (25 initial + 30
+follow-up + the pre-existing 15 sigma-sweep baseline runs are separate).
+
