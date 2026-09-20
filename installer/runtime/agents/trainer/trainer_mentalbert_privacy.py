@@ -72,12 +72,20 @@ FREEZE_TEXT_ENCODER = os.environ.get("FREEZE_TEXT_ENCODER", "true").strip().lowe
 # constructor default (256). fc1 (Linear(1024, hidden)) holds 93.3% of the
 # 281,254 trainable params (262,400 of 281,254 at hidden=256) - the single
 # highest-leverage capacity knob, and DP noise norm scales as sqrt(total
-# trainable params), so this also controls DP noise. Overridable so a sweep
-# can vary it without editing code; default "256" reproduces today's
-# 281,254-param architecture byte-for-byte. Total trainable params as a
-# function of this value: 1029*FUSION_HIDDEN_DIM + 17830 (audio_encoder +
-# vision_encoder fixed overhead = 17,826; verified exact at hidden=256).
-FUSION_HIDDEN_DIM = int(os.environ.get("FUSION_HIDDEN_DIM", "256"))
+# trainable params), so this also controls DP noise. Total trainable params
+# as a function of this value: 1029*FUSION_HIDDEN_DIM + 17830 (audio_encoder
+# + vision_encoder fixed overhead = 17,826; verified exact at hidden=256).
+#
+# Default changed 256 -> 56 (2026-09-20) after a 70-run sweep
+# (docs/IMPLEMENTATION_NOTES.md, "Fusion-head capacity sweep"): at n=15,
+# hidden=56 (75,454 params) and hidden=256 (281,254 params) are
+# statistically indistinguishable on genuine-discrimination rate (5/15 vs
+# 6/15 - a one-run difference, within sampling noise). hidden=256 scored
+# marginally higher (40.0% vs 33.3%) - recorded honestly, not hidden -  but
+# since utility is equivalent, hidden=56 is preferred for 48% less DP noise
+# (174.90 vs 338.18 measured) at 3.7x fewer parameters. Overridable; set to
+# "256" to reproduce the old architecture/historical runs byte-for-byte.
+FUSION_HIDDEN_DIM = int(os.environ.get("FUSION_HIDDEN_DIM", "56"))
 
 # Phase A / STEP A2: Integrated-Gradients attribution over the LOCAL, PRE-DP
 # model on held-out data (docs/IMPLEMENTATION_NOTES.md - Phase A design).
