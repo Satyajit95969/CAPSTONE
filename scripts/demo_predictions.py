@@ -48,17 +48,18 @@ from pathlib import Path
 
 IMPLEMENTATION_NOTES_PATH = Path(__file__).resolve().parent.parent / "docs" / "IMPLEMENTATION_NOTES.md"
 
-# Keys read from IMPLEMENTATION_NOTES.md's "14-run sigma comparison" section
-# for the mandatory representativeness disclosure (block1b, below). Not
-# hardcoded here - see _load_disclosure_facts().
+# Keys read from IMPLEMENTATION_NOTES.md's "Fusion-head capacity sweep"
+# section (2026-09-20 - supersedes the earlier 14-run sigma comparison,
+# whose 6/7-collapse figure was itself a small-sample artifact) for the
+# mandatory representativeness disclosure (block1b, below). Not hardcoded
+# here - see _load_disclosure_facts().
 _DISCLOSURE_KEYS = (
-    "DISCLOSURE_TOTAL_OTHER_RUNS",
-    "DISCLOSURE_SIGMA_A",
-    "DISCLOSURE_SIGMA_A_RUNS",
-    "DISCLOSURE_SIGMA_A_COLLAPSED",
-    "DISCLOSURE_SIGMA_B",
-    "DISCLOSURE_SIGMA_B_RUNS",
-    "DISCLOSURE_SIGMA_B_COLLAPSED",
+    "DISCLOSURE_SWEEP_TOTAL_RUNS",
+    "DISCLOSURE_SWEEP_GENUINE_COUNT",
+    "DISCLOSURE_SWEEP_GENUINE_RATE_PCT",
+    "DISCLOSURE_SWEEP_BEST_RATE_PCT",
+    "DISCLOSURE_SWEEP_WORST_RATE_PCT",
+    "DISCLOSURE_SWEEP_BEST_RUN_F1",
     "DISCLOSURE_POSITIVE_COLLAPSE_F1",
     "DISCLOSURE_NEGATIVE_COLLAPSE_F1",
     "DISCLOSURE_BASE_RATE_POSITIVE_PCT",
@@ -185,7 +186,7 @@ def block1_scope_header(session_id: str) -> None:
 
 def _load_disclosure_facts() -> dict[str, str]:
     """Parses the machine-readable DISCLOSURE_* block from
-    docs/IMPLEMENTATION_NOTES.md's "14-run sigma comparison" section for
+    docs/IMPLEMENTATION_NOTES.md's "Fusion-head capacity sweep" section for
     block1b's mandatory representativeness disclosure, rather than
     hardcoding those figures in this script. Fails loudly - not a silent
     fallback - if the doc or any required key is missing: showing this
@@ -210,28 +211,26 @@ def _load_disclosure_facts() -> dict[str, str]:
     return facts
 
 
-def _fmt_sigma(raw: str) -> str:
-    v = float(raw)
-    return f"{v:.1f}" if v == int(v) else f"{v:g}"
-
-
 def block1b_representativeness_disclosure(session_id: str, recorded: dict) -> None:
     """Mandatory, never-suppressed disclosure of how representative this
-    session's result is against the 14-run sigma comparison documented in
-    IMPLEMENTATION_NOTES.md. This session's own F1 comes from its already-
-    loaded report (the actual ground truth for this run); every other
-    figure is read via _load_disclosure_facts(), not hardcoded."""
+    session's result is against the 55-run fusion-head capacity sweep
+    documented in IMPLEMENTATION_NOTES.md (2026-09-20; supersedes the
+    original 14-run sigma comparison, whose 0/7-genuine figure at each
+    sigma was itself a small-sample artifact - a fresh baseline batch and
+    a tripled sample both moved that number well above zero). This
+    session's own F1 comes from its already-loaded report (the actual
+    ground truth for this run); every sweep figure is read via
+    _load_disclosure_facts(), not hardcoded."""
     facts = _load_disclosure_facts()
     this_f1 = recorded["f1"]
     pos_ceiling = float(facts["DISCLOSURE_POSITIVE_COLLAPSE_F1"])
     neg_ceiling = float(facts["DISCLOSURE_NEGATIVE_COLLAPSE_F1"])
-    total_other_runs = facts["DISCLOSURE_TOTAL_OTHER_RUNS"]
-    sigma_a = _fmt_sigma(facts["DISCLOSURE_SIGMA_A"])
-    sigma_b = _fmt_sigma(facts["DISCLOSURE_SIGMA_B"])
-    sigma_a_runs = facts["DISCLOSURE_SIGMA_A_RUNS"]
-    sigma_b_runs = facts["DISCLOSURE_SIGMA_B_RUNS"]
-    sigma_a_collapsed = facts["DISCLOSURE_SIGMA_A_COLLAPSED"]
-    sigma_b_collapsed = facts["DISCLOSURE_SIGMA_B_COLLAPSED"]
+    total_runs = facts["DISCLOSURE_SWEEP_TOTAL_RUNS"]
+    genuine_count = facts["DISCLOSURE_SWEEP_GENUINE_COUNT"]
+    genuine_rate = facts["DISCLOSURE_SWEEP_GENUINE_RATE_PCT"]
+    best_rate = facts["DISCLOSURE_SWEEP_BEST_RATE_PCT"]
+    worst_rate = facts["DISCLOSURE_SWEEP_WORST_RATE_PCT"]
+    best_run_f1 = float(facts["DISCLOSURE_SWEEP_BEST_RUN_F1"])
     base_rate = facts["DISCLOSURE_BASE_RATE_POSITIVE_PCT"]
     exceeds_both_ceilings = this_f1 > max(pos_ceiling, neg_ceiling)
 
@@ -240,26 +239,22 @@ def block1b_representativeness_disclosure(session_id: str, recorded: dict) -> No
     print(_line())
     print()
     if exceeds_both_ceilings:
-        print(f" This session ({session_id}, F1={this_f1:.4f}) is the ONE observed run")
-        print(f" in {total_other_runs}+ recorded runs that achieved genuine class")
-        print(" discrimination.")
+        print(f" This session ({session_id}, F1={this_f1:.4f}) achieved genuine class")
+        print(f" discrimination - consistent with roughly {genuine_rate}% of runs")
+        print(f" ({genuine_count} of {total_runs}) in a capacity sweep across fusion-head")
+        print(" sizes. This is an above-typical result, but NOT unique: at least one")
+        print(f" other measured run reached F1={best_run_f1:.4f}, exceeding this session.")
     else:
         print(f" This session ({session_id}, F1={this_f1:.4f}) does NOT exceed the fixed")
-        print(" degenerate-mode ceilings below - it is consistent with the collapse")
-        print(" pattern documented here, not the rare non-degenerate exception.")
+        print(" degenerate-mode ceilings below - it is consistent with the majority")
+        print(f" collapse pattern seen in {total_runs} measured runs ({genuine_count} of")
+        print(f" which, {genuine_rate}%, achieved genuine discrimination).")
     print()
-    if sigma_a_collapsed == sigma_b_collapsed:
-        print(f" In a controlled {total_other_runs}-run experiment ({sigma_a_runs} runs at")
-        print(f" sigma={sigma_a}, {sigma_b_runs} at sigma={sigma_b}), {sigma_a_collapsed} of {sigma_a_runs}")
-        print(" runs at BOTH sigmas collapsed into a degenerate single-class")
-        print(" predictor.")
-    else:
-        print(f" In a controlled {total_other_runs}-run experiment, {sigma_a_collapsed} of")
-        print(f" {sigma_a_runs} runs at sigma={sigma_a} and {sigma_b_collapsed} of {sigma_b_runs}")
-        print(f" runs at sigma={sigma_b} collapsed into a degenerate single-class")
-        print(" predictor.")
-    if exceeds_both_ceilings:
-        print(" Zero runs at either sigma matched this session.")
+    print(f" Across a {total_runs}-run sweep varying fusion-head size (same data, lr,")
+    print(" epochs, batch size, splits and DP settings throughout), the genuine-")
+    print(f" discrimination rate ranged from {worst_rate}% (smallest heads tested -")
+    print(f" total collapse, no exceptions) up to {best_rate}% depending on head size.")
+    print(" No head size tested reliably avoids collapse in most runs.")
     print()
     print(" The two degenerate modes have fixed scores on this eval split's")
     print(f" {base_rate}% positive base rate: predict-all-positive gives F1 exactly")
@@ -267,11 +262,8 @@ def block1b_representativeness_disclosure(session_id: str, recorded: dict) -> No
     print(f" exactly {facts['DISCLOSURE_NEGATIVE_COLLAPSE_F1']}.")
     if exceeds_both_ceilings:
         print(f" This session's {this_f1:.4f} exceeds both ceilings, which is what makes")
-        print(" it non-degenerate.")
-        print()
-        print(" Therefore this session is an outlier, shown because it is the one run")
-        print(" where the model genuinely discriminated - which is exactly what makes")
-        print(" it unrepresentative.")
+        print(" it non-degenerate - genuinely useful, but one good result among many")
+        print(" measured runs, not the sole exception to an otherwise-universal rule.")
     print()
 
 
