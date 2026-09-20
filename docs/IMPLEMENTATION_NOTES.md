@@ -1946,28 +1946,31 @@ both modes at least once.
 (`client-405c6057ab84`, F1=0.5517241379310345,
 accuracy=0.6486486486486487) used throughout `scripts/demo_predictions.py`
 and the mentor-demo materials.** 0.5517 exceeds *both* degenerate-mode
-ceilings (0.4583). It is the ONE run, across these 14 plus the anchor
-session itself (15 total; "14+" is used in the disclosure text below as the
-conservative denominator excluding the anchor), that achieved genuine
-class discrimination rather than landing in either collapse basin. Treating
-it as representative of typical pipeline behavior would be wrong - it is
-the outlier that got shown precisely because it looks good, which is
-exactly what makes it unrepresentative of the other 14 runs measured here.
+ceilings (0.4583) and remains above-typical. **Superseded by the larger,
+better-measured fusion-head sweep below (2026-09-20): the anchor is no
+longer "the ONE run" that discriminated** - that claim was itself a
+small-sample artifact of the original 14-run count. Across the 55-run
+fusion-head sweep, 16 runs (29.1%) achieved genuine discrimination, and one
+of them (`FUSION_HIDDEN_DIM=128`, run 24, F1=0.6207) **exceeded the anchor
+outright**. The anchor is still a good, above-typical result - it just
+isn't unique the way the original disclosure claimed.
 
 **Machine-readable summary for `scripts/demo_predictions.py`'s
 representativeness disclosure block** (parsed at runtime, not hardcoded in
-the script - see that file's `_load_disclosure_facts()`):
+the script - see that file's `_load_disclosure_facts()`; updated 2026-09-20
+to reflect the fusion-head sweep superseding the original 14-run sigma
+comparison, which is kept above for its own record but is no longer what
+the live disclosure quotes):
 
 ```
 DISCLOSURE_ANCHOR_SESSION_ID: client-405c6057ab84
 DISCLOSURE_ANCHOR_F1: 0.5517
-DISCLOSURE_TOTAL_OTHER_RUNS: 14
-DISCLOSURE_SIGMA_A: 0.75
-DISCLOSURE_SIGMA_A_RUNS: 7
-DISCLOSURE_SIGMA_A_COLLAPSED: 6
-DISCLOSURE_SIGMA_B: 1.00
-DISCLOSURE_SIGMA_B_RUNS: 7
-DISCLOSURE_SIGMA_B_COLLAPSED: 6
+DISCLOSURE_SWEEP_TOTAL_RUNS: 55
+DISCLOSURE_SWEEP_GENUINE_COUNT: 16
+DISCLOSURE_SWEEP_GENUINE_RATE_PCT: 29.1
+DISCLOSURE_SWEEP_BEST_RATE_PCT: 40.0
+DISCLOSURE_SWEEP_WORST_RATE_PCT: 0.0
+DISCLOSURE_SWEEP_BEST_RUN_F1: 0.6207
 DISCLOSURE_POSITIVE_COLLAPSE_F1: 0.4583
 DISCLOSURE_NEGATIVE_COLLAPSE_F1: 0.0000
 DISCLOSURE_BASE_RATE_POSITIVE_PCT: 29.73
