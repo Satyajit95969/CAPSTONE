@@ -68,6 +68,17 @@ MULTIMODAL_MAX_LEN = int(os.environ.get("MULTIMODAL_MAX_LEN", "512"))
 # "0"/"false" for an unfrozen A/B comparison run.
 FREEZE_TEXT_ENCODER = os.environ.get("FREEZE_TEXT_ENCODER", "true").strip().lower() not in ("0", "false", "no", "")
 
+# 2026-09-20 fusion-head capacity sweep: FusionHead.hidden was a hardcoded
+# constructor default (256). fc1 (Linear(1024, hidden)) holds 93.3% of the
+# 281,254 trainable params (262,400 of 281,254 at hidden=256) - the single
+# highest-leverage capacity knob, and DP noise norm scales as sqrt(total
+# trainable params), so this also controls DP noise. Overridable so a sweep
+# can vary it without editing code; default "256" reproduces today's
+# 281,254-param architecture byte-for-byte. Total trainable params as a
+# function of this value: 1029*FUSION_HIDDEN_DIM + 17830 (audio_encoder +
+# vision_encoder fixed overhead = 17,826; verified exact at hidden=256).
+FUSION_HIDDEN_DIM = int(os.environ.get("FUSION_HIDDEN_DIM", "256"))
+
 # Phase A / STEP A2: Integrated-Gradients attribution over the LOCAL, PRE-DP
 # model on held-out data (docs/IMPLEMENTATION_NOTES.md - Phase A design).
 # Default OFF: diagnostic-only, never required for training/upload to
@@ -329,7 +340,7 @@ class MultiModalModel(nn.Module):
         self.vision_encoder = SmallMLP(vision_dim, out_dim=128) if self.has_vision else None
 
         fusion_input_dim = bert_hidden + (128 if self.has_audio else 0) + (128 if self.has_vision else 0)
-        self.fusion = FusionHead(fusion_input_dim)
+        self.fusion = FusionHead(fusion_input_dim, hidden=FUSION_HIDDEN_DIM)
 
     def forward(self, input_ids, attention_mask, audio_vec=None, vision_vec=None, rl_mode=False, sample_action=False, inputs_embeds=None):
         # inputs_embeds (Phase A / STEP A2): optional precomputed text embedding
