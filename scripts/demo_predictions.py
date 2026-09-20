@@ -46,6 +46,24 @@ import re
 import sys
 from pathlib import Path
 
+IMPLEMENTATION_NOTES_PATH = Path(__file__).resolve().parent.parent / "docs" / "IMPLEMENTATION_NOTES.md"
+
+# Keys read from IMPLEMENTATION_NOTES.md's "14-run sigma comparison" section
+# for the mandatory representativeness disclosure (block1b, below). Not
+# hardcoded here - see _load_disclosure_facts().
+_DISCLOSURE_KEYS = (
+    "DISCLOSURE_TOTAL_OTHER_RUNS",
+    "DISCLOSURE_SIGMA_A",
+    "DISCLOSURE_SIGMA_A_RUNS",
+    "DISCLOSURE_SIGMA_A_COLLAPSED",
+    "DISCLOSURE_SIGMA_B",
+    "DISCLOSURE_SIGMA_B_RUNS",
+    "DISCLOSURE_SIGMA_B_COLLAPSED",
+    "DISCLOSURE_POSITIVE_COLLAPSE_F1",
+    "DISCLOSURE_NEGATIVE_COLLAPSE_F1",
+    "DISCLOSURE_BASE_RATE_POSITIVE_PCT",
+)
+
 ANCHOR_SESSION_ID = "client-405c6057ab84"
 ANCHOR_BACKUP_PATH = (
     Path.home() / ".federated" / "data" / "anchor_session_backups" / ANCHOR_SESSION_ID
@@ -162,6 +180,98 @@ def block1_scope_header(session_id: str) -> None:
     print(" They say NOTHING about the aggregated global model under")
     print(" differential privacy, which is measured separately and collapses")
     print(" (see Block 6 below).")
+    print()
+
+
+def _load_disclosure_facts() -> dict[str, str]:
+    """Parses the machine-readable DISCLOSURE_* block from
+    docs/IMPLEMENTATION_NOTES.md's "14-run sigma comparison" section for
+    block1b's mandatory representativeness disclosure, rather than
+    hardcoding those figures in this script. Fails loudly - not a silent
+    fallback - if the doc or any required key is missing: showing this
+    disclosure with wrong or stale numbers would be worse than refusing to
+    run, same reasoning as verify_against_recorded_metrics() above."""
+    if not IMPLEMENTATION_NOTES_PATH.exists():
+        raise SystemExit(
+            f"REFUSING TO DISPLAY: cannot find {IMPLEMENTATION_NOTES_PATH} to "
+            f"read the mandatory representativeness disclosure facts from."
+        )
+    text = IMPLEMENTATION_NOTES_PATH.read_text(encoding="utf-8")
+    facts: dict[str, str] = {}
+    for key in _DISCLOSURE_KEYS:
+        m = re.search(rf"^{key}:\s*(.+?)\s*$", text, re.MULTILINE)
+        if not m:
+            raise SystemExit(
+                f"REFUSING TO DISPLAY: {IMPLEMENTATION_NOTES_PATH} is missing "
+                f"required disclosure key {key!r}. Refusing to show the "
+                f"representativeness disclosure with an incomplete figure."
+            )
+        facts[key] = m.group(1)
+    return facts
+
+
+def _fmt_sigma(raw: str) -> str:
+    v = float(raw)
+    return f"{v:.1f}" if v == int(v) else f"{v:g}"
+
+
+def block1b_representativeness_disclosure(session_id: str, recorded: dict) -> None:
+    """Mandatory, never-suppressed disclosure of how representative this
+    session's result is against the 14-run sigma comparison documented in
+    IMPLEMENTATION_NOTES.md. This session's own F1 comes from its already-
+    loaded report (the actual ground truth for this run); every other
+    figure is read via _load_disclosure_facts(), not hardcoded."""
+    facts = _load_disclosure_facts()
+    this_f1 = recorded["f1"]
+    pos_ceiling = float(facts["DISCLOSURE_POSITIVE_COLLAPSE_F1"])
+    neg_ceiling = float(facts["DISCLOSURE_NEGATIVE_COLLAPSE_F1"])
+    total_other_runs = facts["DISCLOSURE_TOTAL_OTHER_RUNS"]
+    sigma_a = _fmt_sigma(facts["DISCLOSURE_SIGMA_A"])
+    sigma_b = _fmt_sigma(facts["DISCLOSURE_SIGMA_B"])
+    sigma_a_runs = facts["DISCLOSURE_SIGMA_A_RUNS"]
+    sigma_b_runs = facts["DISCLOSURE_SIGMA_B_RUNS"]
+    sigma_a_collapsed = facts["DISCLOSURE_SIGMA_A_COLLAPSED"]
+    sigma_b_collapsed = facts["DISCLOSURE_SIGMA_B_COLLAPSED"]
+    base_rate = facts["DISCLOSURE_BASE_RATE_POSITIVE_PCT"]
+    exceeds_both_ceilings = this_f1 > max(pos_ceiling, neg_ceiling)
+
+    print(_line())
+    print(" REPRESENTATIVENESS DISCLOSURE - READ BEFORE THE RESULTS BELOW")
+    print(_line())
+    print()
+    if exceeds_both_ceilings:
+        print(f" This session ({session_id}, F1={this_f1:.4f}) is the ONE observed run")
+        print(f" in {total_other_runs}+ recorded runs that achieved genuine class")
+        print(" discrimination.")
+    else:
+        print(f" This session ({session_id}, F1={this_f1:.4f}) does NOT exceed the fixed")
+        print(" degenerate-mode ceilings below - it is consistent with the collapse")
+        print(" pattern documented here, not the rare non-degenerate exception.")
+    print()
+    if sigma_a_collapsed == sigma_b_collapsed:
+        print(f" In a controlled {total_other_runs}-run experiment ({sigma_a_runs} runs at")
+        print(f" sigma={sigma_a}, {sigma_b_runs} at sigma={sigma_b}), {sigma_a_collapsed} of {sigma_a_runs}")
+        print(" runs at BOTH sigmas collapsed into a degenerate single-class")
+        print(" predictor.")
+    else:
+        print(f" In a controlled {total_other_runs}-run experiment, {sigma_a_collapsed} of")
+        print(f" {sigma_a_runs} runs at sigma={sigma_a} and {sigma_b_collapsed} of {sigma_b_runs}")
+        print(f" runs at sigma={sigma_b} collapsed into a degenerate single-class")
+        print(" predictor.")
+    if exceeds_both_ceilings:
+        print(" Zero runs at either sigma matched this session.")
+    print()
+    print(" The two degenerate modes have fixed scores on this eval split's")
+    print(f" {base_rate}% positive base rate: predict-all-positive gives F1 exactly")
+    print(f" {facts['DISCLOSURE_POSITIVE_COLLAPSE_F1']}, predict-all-negative gives F1")
+    print(f" exactly {facts['DISCLOSURE_NEGATIVE_COLLAPSE_F1']}.")
+    if exceeds_both_ceilings:
+        print(f" This session's {this_f1:.4f} exceeds both ceilings, which is what makes")
+        print(" it non-degenerate.")
+        print()
+        print(" Therefore this session is an outlier, shown because it is the one run")
+        print(" where the model genuinely discriminated - which is exactly what makes")
+        print(" it unrepresentative.")
     print()
 
 
@@ -369,6 +479,7 @@ def main() -> int:
     dp_receipt = find_dp_receipt(session_id)
 
     block1_scope_header(session_id)
+    block1b_representativeness_disclosure(session_id, data["eval_metrics"])
     rows = block2_per_patient_table(per_sample)
     block3_confusion_matrix(cm, data["eval_metrics"])
     block4_confidence_distribution(rows)
