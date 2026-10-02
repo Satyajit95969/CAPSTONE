@@ -1000,9 +1000,37 @@ def stratified_split(
 
     Must be called AFTER label assembly (every record needs a real, final
     phq_score already set) - never before.
+
+    2026-10-02 (training-data augmentation investigation): eval candidates
+    are now restricted to records where `is_augmented` is falsy. Without
+    this, n_pos_eval/n_neg_eval and the shuffle outcome both scale with
+    len(pos_idx)/len(neg_idx) - adding augmented rows to the pool silently
+    changes BOTH how many records land in eval AND which specific ones,
+    even with the same seed (Python's Fisher-Yates shuffle permutation
+    depends on sequence length, not just content; round(N*test_frac) is a
+    direct function of N). Verified by direct simulation: at N_pos=55 the
+    eval count is 11 at specific positions; at N_pos=163 (55 real + 108
+    synthetic) it becomes 33 at a completely different set of positions.
+    Left unguarded, loading an augmented file through this unchanged
+    function would silently draw a different, larger eval set - possibly
+    including synthetic rows scored as if they were held-out data. This
+    bug is not specific to augmentation - ANY future addition of records to
+    this pipeline's input pool would hit the same silent eval-set drift
+    unless those new records are marked `is_augmented` (or some records are
+    otherwise excluded from eval candidacy).
+
+    On a file with no `is_augmented` column (every record currently in use,
+    including the original 186-row parquet), `r.get("is_augmented", False)`
+    defaults every record to eval-eligible - behavior is byte-identical to
+    before this change. Proven, not just asserted: re-ran this exact
+    function against the live 186-row parquet after this change and
+    confirmed it returns the identical 149/37 split, 44/105 train
+    distribution, and the same 37 held-out participant_ids verified before
+    this change (see docs/IMPLEMENTATION_NOTES.md).
     """
-    pos_idx = [i for i, r in enumerate(records) if float(r["phq_score"]) >= PHQ_POSITIVE_THRESHOLD]
-    neg_idx = [i for i, r in enumerate(records) if float(r["phq_score"]) < PHQ_POSITIVE_THRESHOLD]
+    eval_candidate_idx = [i for i, r in enumerate(records) if not r.get("is_augmented", False)]
+    pos_idx = [i for i in eval_candidate_idx if float(records[i]["phq_score"]) >= PHQ_POSITIVE_THRESHOLD]
+    neg_idx = [i for i in eval_candidate_idx if float(records[i]["phq_score"]) < PHQ_POSITIVE_THRESHOLD]
 
     rng = random.Random(seed)
     rng.shuffle(pos_idx)
@@ -1014,6 +1042,15 @@ def stratified_split(
     eval_idx = set(pos_idx[:n_pos_eval]) | set(neg_idx[:n_neg_eval])
     train_records = [r for i, r in enumerate(records) if i not in eval_idx]
     eval_records  = [r for i, r in enumerate(records) if i in eval_idx]
+
+    # Belt and braces (2026-10-02): the restriction above is structural, but
+    # assert it explicitly too, same pattern as this project's other
+    # defensive checks (Fix E1/E2) - fail loudly rather than rely on a
+    # single code path staying correct under future edits.
+    assert all(not r.get("is_augmented", False) for r in eval_records), (
+        "stratified_split(): an augmented record ended up in eval_records - "
+        "the eval-candidate restriction above has a bug."
+    )
     return train_records, eval_records
 
 
