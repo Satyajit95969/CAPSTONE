@@ -2260,43 +2260,50 @@ settings throughout - only the training parquet varied:**
 Noise norm (~175 throughout) confirms DP settings were unaffected by
 training-set size, as expected.
 
-**Per-arm summary:**
+**Per-arm summary, n=5 (interim) then n=15 (pooled, final) - both shown
+deliberately, because the n=5 result reversed:**
 
-| arm | train n | NEITHER (non-uniform) | genuine rate | mean F1 | median F1 |
+| arm | train n | genuine rate @ n=5 | genuine rate @ n=15 (pooled) | mean F1 @ n=15 | median F1 @ n=15 |
 |---|---|---|---|---|---|
-| 1 - original | 149 | 1/5 | 20% | 0.1488 | 0.0000 |
-| 2 - +windowing | 264 | 3/5 | **60%** | 0.3389 | 0.4583 |
-| 3 - +windowing+SMOTE | 338 | 0/5 | **0%** | 0.1833 | 0.0000 |
+| 1 - original | 149 | 20% (1/5) | **40.0% (6/15)** | 0.2603 | 0.2857 |
+| 2 - +windowing | 264 | 60% (3/5) | **33.3% (5/15)** | 0.2803 | 0.4583 |
+| 3 - +windowing+SMOTE | 338 | 0% (0/5) | **40.0% (6/15)** | 0.2144 | 0.0000 |
 
-Compared to the 55-run sweep baseline at the same `FUSION_HIDDEN_DIM=56`
-(33.3% genuine-discrimination rate, n=15): Arm 1 here (20%, n=5) is
-consistent with that baseline within n=5 sampling noise (as the earlier
-55-run investigation already established at this sample size). **Arm 2
-(60%, n=5) is numerically above the baseline and is this sweep's best
-result - two of its three non-uniform runs (F1=0.4681) exceed the
-fixed collapse ceiling, something Arm 1 didn't achieve at all in this
-batch.** **Arm 3 (0/5) is a complete, unanimous collapse - every single
-run landed in an exact degenerate mode**, matching the pattern seen at the
-fusion-head capacity floor (H=12/H=1) rather than an improvement.
+**Neither apparent n=5 effect survived - stated plainly, as instructed, rather
+than presenting a number that reverses later.**
+- Arm 2's apparent 60% advantage at n=5 was noise: at n=15 it's 33.3%, the
+  *lowest* of the three arms, not the highest.
+- Arm 3's apparent 0/5 total collapse was also noise: at n=15 it's 40.0%,
+  *tied for highest* - the opposite of a floor effect. (This is a genuinely
+  different situation from the fusion-head capacity floor at H=12/H=1,
+  which was 0/10 across two *independent* variants and held up - a single
+  arm's 0/5 was never equivalent evidence to that, and this result confirms
+  it wasn't.)
+- All three arms converge to the same ~33-40% band already established as
+  this architecture's baseline range in the 55-run fusion-head sweep,
+  independent of fusion-head size. Neither more real text nor minority
+  rebalancing moved the genuine-discrimination rate outside that band in
+  either direction.
 
-**Plain answer on whether augmentation helped:** the extra real text
-(Arm 2, windowing only) looks promising - more non-degenerate runs and two
-runs beating the fixed ceiling - but n=5 is the same small sample size that
-already proved unreliable once in this project (the fusion-head sweep's
-initial n=5 result reversed at n=15). The minority-class rebalancing
-(Arm 3) looks actively harmful in this one batch, not merely neutral - but
-with only 5 runs, "0/5" here is suggestive, not yet as strong evidence as
-the H=12/H=1 finding (which was 0/10 across two independent variants).
-**Honest conclusion: do not treat either direction as settled without a
-larger sample (e.g. 15 runs/arm, matching the methodology that previously
-caught a false signal in this exact codebase).** What can be said
-confidently: augmentation did not reproduce the historical anchor session's
-F1=0.5517 in either direction, and did not eliminate the underlying
-collapse behavior - the best single run here (F1=0.4681) is only a small
-improvement over the fixed 0.4583 ceiling, not a qualitative fix.
+One secondary, non-overclaimed nuance: Arm 3's median F1 at n=15 (0.0000)
+is lower than Arm 1's (0.2857) and Arm 2's (0.4583) despite a similar
+NEITHER rate - three of its six non-uniform runs still scored F1=0.0 (one
+or two real negatives correctly caught, not literally zero predictions,
+but close to collapse). That's a quality difference among the non-uniform
+runs, not a rate difference, and isn't treated as settled either given how
+much variance this pipeline has already shown at n=15 elsewhere.
+
+**Honest conclusion: augmentation - neither text windowing alone nor
+windowing+minority-rebalancing - changed the genuine-discrimination rate
+in a way distinguishable from this pipeline's existing noise floor.** This
+is a real, negative result, not an inconclusive one: with n=15 per arm (the
+same sample size that previously caught a false signal in the fusion-head
+sweep), all three arms land in the same band. Augmentation did not
+reproduce the historical anchor session's F1=0.5517, and did not eliminate
+the underlying collapse behavior.
 
 No lr/epochs/batch size/class weights/clip_norm/sigma were tuned anywhere
 in this investigation. The 37 held-out records were never touched,
 verified structurally and by assertion in `scripts/augment_training_data.py`
-and in `stratified_split()` itself.
+and in `stratified_split()` itself, across all 45 runs.
 
