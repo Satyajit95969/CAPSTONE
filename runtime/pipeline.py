@@ -74,7 +74,13 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 # Fix A: participant-only text (Ellie's interviewer script filtered out at
 # source - see scripts/rebuild_participant_only_parquet.py). The original
 # dataset_build/daic_records_multimodal.parquet is left untouched.
-_MULTIMODAL_PARQUET = _REPO_ROOT / "dataset_build" / "daic_records_multimodal_participant_only.parquet"
+# 2026-10-02: overridable so training-data-augmentation sweeps can switch
+# between the original and augmented parquet without editing code. Default
+# unchanged - every existing run is byte-identical.
+_MULTIMODAL_PARQUET = Path(os.environ.get(
+    "MULTIMODAL_PARQUET_PATH",
+    str(_REPO_ROOT / "dataset_build" / "daic_records_multimodal_participant_only.parquet"),
+))
 # Fix D: "0" (or unset) is an explicit no-limit sentinel - load the full local
 # partition. Truncation is opt-in (set MULTIMODAL_MAX_SAMPLES to a positive
 # int) rather than opt-out, so a smoke test has to ask for it explicitly.
