@@ -2076,3 +2076,227 @@ epochs, not batch size, not class weights, not clip_norm, not sigma. Only
 `FUSION_HIDDEN_DIM` varied across the 70 total runs (25 initial + 30
 follow-up + the pre-existing 15 sigma-sweep baseline runs are separate).
 
+---
+
+## Feature naming correction: "wav2vec2" and "densenet" are the wrong names (2026-10-02)
+
+While investigating training-data augmentation, read the actual parquet
+and decoded `features` JSON directly rather than trusting prior
+documentation (including this file's own earlier entries, CLAUDE.md, and
+the architecture doc). **The JSON keys and column labels used throughout
+this project's documentation are wrong about what the features actually
+are:**
+
+- The 154-dim audio vector lives at `features.audio.wav2vec2` - the key
+  name implies a wav2vec2 deep-learning embedding. It is not. The same
+  JSON object carries its own `features.audio.spec.source` field, which
+  says `"COVAREP + FORMANT"`, and `features.audio.spec.names` lists all 77
+  underlying measures by name (`covarep_00_F0_mean`, `covarep_02_NAQ_std`,
+  `covarep_11_MCEP_0_mean`, `formant_1_mean`, etc., mean+std pooled = 154).
+  This is classical acoustic signal processing (COVAREP: Degottex et al.),
+  not a neural embedding.
+- The 84-dim video vector lives at `features.video.densenet` - again
+  implying a DenseNet CNN embedding. `build_daic_multimodal_features.py`
+  itself documents the real source directly in the record it writes:
+  `"source": "CLNF_AUs + CLNF_gaze + CLNF_pose"` (OpenFace's CLNF tracker
+  output - Action Units, gaze direction, head pose - mean+std pooled). No
+  DenseNet, no CNN, no raw video frames were ever involved.
+- Confirmed no raw `.wav`/video files exist anywhere on this machine - the
+  source DAIC-WOZ archives (`<pid>_P.zip`) contain only pre-extracted
+  per-frame feature files (`CLNF_AUs.txt`, `CLNF_gaze.txt`, `CLNF_pose.txt`,
+  `COVAREP.csv`, `FORMANT.csv` - confirmed via `audit_daic_archives.py`'s
+  `required_members`), never raw media.
+
+Likely origin of the mislabeling: an earlier version of this pipeline
+probably planned to use wav2vec2/DenseNet on raw media, then switched to
+classical pre-extracted features, but the JSON dict keys were never
+renamed. The dict keys (`wav2vec2`, `densenet`) are load-bearing - changing
+them would break `_extract_audio_vec()`/`_extract_video_vec()` in
+`trainer_mentalbert_privacy.py` - so this is a documentation correction,
+not a code fix: **every future reference to "154-dim wav2vec2 audio
+features" or "84-dim DenseNet video features" in this project's docs
+(including CLAUDE.md) should read "154-dim COVAREP+FORMANT acoustic
+descriptors" and "84-dim OpenFace/CLNF AUs+gaze+pose descriptors"
+instead.**
+
+This correction mattered directly for the augmentation work below: knowing
+these are low-dimensional, continuous, named classical statistical/
+geometric descriptors (not opaque deep embeddings) is what makes
+feature-space interpolation (SMOTE-style) a defensible augmentation
+technique here - interpolating between two real COVAREP/CLNF summary
+statistics is a well-understood operation; interpolating between two
+wav2vec2 activations would not have been.
+
+---
+
+## Finding: ~2/3 of real participant speech is never seen by the model (2026-10-02)
+
+Measured with the actual tokenizer (`bert-base-uncased`, same WordPiece
+vocabulary family as MentalBERT), not estimated from word counts: real
+transcript length across all 186 records is **min 207, median 1460.5, mean
+1678.9, max 5332 tokens**. `MULTIMODAL_MAX_LEN = 512` (the trainer's
+tokenizer truncation window) means the median record is truncated at
+roughly **35% of its real length** - the model never sees the remaining
+~65% of what the participant actually said, every single run, for as long
+as this pipeline has existed. 140 of 186 records (75%) have enough length
+for a second, genuinely different, non-overlapping 512-token window; within
+just the 149 train records, 115 (34 positive + 81 negative) qualify.
+
+This is the direct justification for the text-windowing augmentation
+technique below - it is not inventing new information, it is **exposing
+real, already-collected speech that the pipeline has been silently
+discarding from the start.**
+
+---
+
+## Finding: `stratified_split()` recomputes from pool size, not a fixed split (2026-10-02)
+
+Independent of augmentation - this would affect anyone adding ANY records
+to this pipeline's input pool in the future. `stratified_split()` does not
+read a saved, fixed train/eval partition; it recomputes `pos_idx`/`neg_idx`
+and shuffles them **fresh, from whatever pool it's handed, every time it's
+called.** Two consequences, both verified by direct simulation before
+trusting them:
+
+1. `n_pos_eval = round(len(pos_idx) * test_frac)` is a function of pool
+   size. At 55 real positives: `round(55*0.2) = 11`. Add 108 synthetic
+   positives to reach 163: `round(163*0.2) = 33` - a different eval-set
+   *size*, not just different members.
+2. Python's `random.Random(seed).shuffle()` permutation depends on the
+   full sequence length, not just its content - enlarging the list changes
+   the ENTIRE permutation, not just which new elements land where. Verified
+   directly: at `n_pos=55` the shuffled eval positions were
+   `[9, 11, 16, 19, 20, 23, 30, 35, 49, 50, 53]`; at `n_pos=163` (same
+   seed) they became `[0, 2, 11, 17, 18, 19, 30, 38, 42, 52, 61, ...]` -
+   unrelated sets.
+
+Net effect: naively adding records to the parquet and letting the
+unmodified function re-split would silently produce a **different, larger
+eval set that could include synthetic/newly-added rows scored as if they
+were held-out data** - a real leakage risk that would not raise any error,
+just quietly invalidate every before/after comparison.
+
+**Fix applied** (`stratified_split()`, `trainer_mentalbert_privacy.py`):
+restrict eval *candidates* to records where `is_augmented` is falsy, before
+computing `pos_idx`/`neg_idx`. On a file with no `is_augmented` column
+(every record in use before this change, including the current 186-row
+parquet), `r.get("is_augmented", False)` defaults every record to eval-
+eligible - **behavior is byte-identical to before this change.** Proven,
+not just asserted: re-ran the patched function against the live,
+unmodified 186-row parquet and confirmed it returns the identical 149/37
+split, the identical 44/105 train distribution, and the exact same 37
+held-out `participant_id`s verified before this change:
+```
+301, 302, 306, 316, 318, 326, 329, 334, 335, 338, 347, 349, 351, 352, 355,
+364, 374, 377, 388, 393, 399, 403, 404, 411, 415, 441, 442, 448, 451, 452,
+461, 469, 479, 480, 482, 485, 489
+```
+A belt-and-braces assertion was also added inside `stratified_split()`
+itself (`assert all(not r.get("is_augmented", False) for r in eval_records)`)
+so a future bug in the restriction logic fails loudly rather than silently
+recreating this exact problem.
+
+---
+
+## Training-data augmentation: 3-arm sweep (2026-10-02)
+
+**Goal:** test whether more training data (target ~300-350, up from 149)
+changes this pipeline's genuine-discrimination rate, using only
+non-fabricating, label-preserving techniques, with the 37 held-out records
+kept 100% untouched throughout.
+
+**New script**: `scripts/augment_training_data.py`. Runs the (patched)
+`stratified_split()` first to get the real 149/37 partition, augments ONLY
+the 149 train records, and asserts leakage-safety structurally (every
+augmented row's `source_record_id` is checked against the 37 held-out
+ids - see the script for the full assertion). Writes two new parquet
+files, never touching the original:
+
+- `dataset_build/daic_records_multimodal_participant_only_windowed.parquet`
+  (Arm 2): 186 real rows + 115 text-windowed rows (34 positive, 81
+  negative) = 301 total, 264 train / 37 eval. Class ratio unchanged
+  (29.5% positive in train) - windowing doesn't rebalance.
+- `dataset_build/daic_records_multimodal_participant_only_augmented.parquet`
+  (Arm 3): everything in Arm 2 + 74 SMOTE-style synthetic positive rows
+  (linear interpolation between two real positive train records' 154-dim
+  audio + 84-dim video feature vectors, alpha in [0.2, 0.8], text/
+  phq_score/coverage inherited unperturbed from whichever real parent alpha
+  favors) = 375 total, 338 train / 37 eval, 45.0% positive in train.
+
+Both files verified, not assumed: `read_parquet_records()` (completely
+unmodified) loads both with the correct record counts, decodes `features`
+correctly (154/84-dim lists), and `stratified_split()` on either file
+reproduces the exact same 37 held-out ids as the original - **the live
+pipeline reads both files with zero further code changes**, beyond the
+already-documented one-line `MULTIMODAL_PARQUET_PATH` env var in
+`runtime/pipeline.py` and the `stratified_split()` fix above.
+
+`runtime/pipeline.py:_MULTIMODAL_PARQUET` is now
+`Path(os.environ.get("MULTIMODAL_PARQUET_PATH", <original path>))` -
+default unchanged, every existing run byte-identical.
+
+**5 runs per arm, same sigma (0.75), same fusion head (default
+`FUSION_HIDDEN_DIM=56`, 75,454 params), same lr/epochs/batch size/DP
+settings throughout - only the training parquet varied:**
+
+| run | arm | accuracy | precision | recall | F1 | noise | collapse mode |
+|---|---|---|---|---|---|---|---|
+| 71 | 1 (orig, 149 train) | 0.2973 | 0.2973 | 1.0000 | 0.4583 | 175.50 | exact all-positive |
+| 72 | 1 | 0.7027 | 0.0000 | 0.0000 | 0.0000 | 175.44 | exact all-negative |
+| 73 | 1 | 0.7027 | 0.0000 | 0.0000 | 0.0000 | 176.02 | exact all-negative |
+| 74 | 1 | 0.7297 | 0.6667 | 0.1818 | 0.2857 | 174.80 | NEITHER, below ceiling |
+| 75 | 1 | 0.7027 | 0.0000 | 0.0000 | 0.0000 | 174.94 | exact all-negative |
+| 76 | 2 (+window, 264 train) | 0.3243 | 0.3056 | 1.0000 | 0.4681 | 175.58 | NEITHER, exceeds ceiling |
+| 77 | 2 | 0.6216 | 0.3333 | 0.2727 | 0.3000 | 175.35 | NEITHER, below ceiling |
+| 78 | 2 | 0.7027 | 0.0000 | 0.0000 | 0.0000 | 175.78 | exact all-negative |
+| 79 | 2 | 0.2973 | 0.2973 | 1.0000 | 0.4583 | 174.68 | exact all-positive |
+| 80 | 2 | 0.3243 | 0.3056 | 1.0000 | 0.4681 | 174.58 | NEITHER, exceeds ceiling |
+| 81 | 3 (+window+SMOTE, 338 train) | 0.2973 | 0.2973 | 1.0000 | 0.4583 | 174.61 | exact all-positive |
+| 82 | 3 | 0.7027 | 0.0000 | 0.0000 | 0.0000 | 175.42 | exact all-negative |
+| 83 | 3 | 0.2973 | 0.2973 | 1.0000 | 0.4583 | 174.48 | exact all-positive |
+| 84 | 3 | 0.7027 | 0.0000 | 0.0000 | 0.0000 | 174.84 | exact all-negative |
+| 85 | 3 | 0.7027 | 0.0000 | 0.0000 | 0.0000 | 175.24 | exact all-negative |
+
+Noise norm (~175 throughout) confirms DP settings were unaffected by
+training-set size, as expected.
+
+**Per-arm summary:**
+
+| arm | train n | NEITHER (non-uniform) | genuine rate | mean F1 | median F1 |
+|---|---|---|---|---|---|
+| 1 - original | 149 | 1/5 | 20% | 0.1488 | 0.0000 |
+| 2 - +windowing | 264 | 3/5 | **60%** | 0.3389 | 0.4583 |
+| 3 - +windowing+SMOTE | 338 | 0/5 | **0%** | 0.1833 | 0.0000 |
+
+Compared to the 55-run sweep baseline at the same `FUSION_HIDDEN_DIM=56`
+(33.3% genuine-discrimination rate, n=15): Arm 1 here (20%, n=5) is
+consistent with that baseline within n=5 sampling noise (as the earlier
+55-run investigation already established at this sample size). **Arm 2
+(60%, n=5) is numerically above the baseline and is this sweep's best
+result - two of its three non-uniform runs (F1=0.4681) exceed the
+fixed collapse ceiling, something Arm 1 didn't achieve at all in this
+batch.** **Arm 3 (0/5) is a complete, unanimous collapse - every single
+run landed in an exact degenerate mode**, matching the pattern seen at the
+fusion-head capacity floor (H=12/H=1) rather than an improvement.
+
+**Plain answer on whether augmentation helped:** the extra real text
+(Arm 2, windowing only) looks promising - more non-degenerate runs and two
+runs beating the fixed ceiling - but n=5 is the same small sample size that
+already proved unreliable once in this project (the fusion-head sweep's
+initial n=5 result reversed at n=15). The minority-class rebalancing
+(Arm 3) looks actively harmful in this one batch, not merely neutral - but
+with only 5 runs, "0/5" here is suggestive, not yet as strong evidence as
+the H=12/H=1 finding (which was 0/10 across two independent variants).
+**Honest conclusion: do not treat either direction as settled without a
+larger sample (e.g. 15 runs/arm, matching the methodology that previously
+caught a false signal in this exact codebase).** What can be said
+confidently: augmentation did not reproduce the historical anchor session's
+F1=0.5517 in either direction, and did not eliminate the underlying
+collapse behavior - the best single run here (F1=0.4681) is only a small
+improvement over the fixed 0.4583 ceiling, not a qualitative fix.
+
+No lr/epochs/batch size/class weights/clip_norm/sigma were tuned anywhere
+in this investigation. The 37 held-out records were never touched,
+verified structurally and by assertion in `scripts/augment_training_data.py`
+and in `stratified_split()` itself.
+
