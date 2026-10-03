@@ -58,7 +58,17 @@ Usage:
 
 from __future__ import annotations
 
-TITLE = "FEDERATED ALGORITHM COMPARISON - MEASURED ON THIS SYSTEM"
+TITLE = "FEDERATED ALGORITHM COMPARISON - HISTORICAL MEASUREMENTS"
+
+# Every row below was measured before the sigma and fusion-head changes
+# (DP_NOISE_MULTIPLIER 1.0 -> 0.75, FUSION_HIDDEN_DIM 256 -> 56) and has not
+# been re-measured since - the header says so on every print, so the table
+# is never read as describing the current configuration.
+MEASURED_UNDER = [
+    "Measured at: sigma=1.0, FUSION_HIDDEN_DIM=256, 281,254 trainable params.",
+    "NOT re-measured at the current configuration (sigma=0.75,",
+    "FUSION_HIDDEN_DIM=56, 75,454 trainable params).",
+]
 
 # ---------------------------------------------------------------------------
 # Measured rows. Each tuple: (algorithm, aggregation, dp, acc, f1, noise)
@@ -118,6 +128,7 @@ def main() -> int:
     # Step D3-2: prints ONLY the table - no NOT-IMPLEMENTED rows, no
     # "HOW TO READ THIS" prose, no trailing text of any kind, per the
     # explicit "output exactly this table and nothing else" instruction.
+    # The one later exception (2026-10-03) is the MEASURED_UNDER header.
     # FedProx/SCAFFOLD/Krum's NOT-IMPLEMENTED status and the "how to read
     # this" framing are documented in this file's own module docstring and
     # in docs/IMPLEMENTATION_NOTES.md - intentionally not printed here.
@@ -125,6 +136,8 @@ def main() -> int:
     print("=" * width)
     print(f" {TITLE}")
     print("=" * width)
+    for line in MEASURED_UNDER:
+        print(f" {line}")
     print()
     print(f" {'Algorithm':<12} {'Aggregation':<15} {'DP':<5} {'Acc.':<11} {'F1':<9} {'Noise after agg.'}")
     print(" " + "-" * (width - 2))
