@@ -110,6 +110,20 @@ XAI_EXPLAIN_DIR = Path.home() / ".federated" / "data" / "explain_logs"
 # random init happens to be.
 GLOBAL_INIT_SEED = os.environ.get("GLOBAL_INIT_SEED")
 
+# FedProx (2026-10-03, docs/IMPLEMENTATION_NOTES.md "FedProx"): adds
+# (mu/2) * ||w - w_ref||^2 over the TRAINABLE params to the local supervised
+# loss, w_ref being the weights local training starts from. Default 0.0: the
+# term is never built and nothing below changes behaviour. w_ref is only a
+# meaningful FedProx reference when every client starts from the same
+# weights, so mu > 0 requires either a loaded global model or
+# GLOBAL_INIT_SEED - orchestrate() refuses to train otherwise.
+FEDPROX_MU = float(os.environ.get("FEDPROX_MU", "0.0"))
+# Optional guard for a harness running several clients in one round: when
+# set, orchestrate() refuses to train unless the sha256 of its own initial
+# trainable weights equals this value (i.e. the clients really do share one
+# initialisation). Unset by default.
+EXPECTED_INIT_HASH = os.environ.get("EXPECTED_INIT_HASH")
+
 # Fix E3, loss rebalance ONLY (lr/epochs/init untouched this step - see
 # docs/IMPLEMENTATION_NOTES.md). Two problems, measured in Step 9a:
 #   1. loss_cls vs loss_reg: unweighted CrossEntropyLoss on a 30/70 imbalance
@@ -624,10 +638,17 @@ def train_model(dataset: MultiModalDataset, model: MultiModalModel,
                 output_dir: str = "./trainer_outputs",
                 epochs: int = SUPERVISED_EPOCHS, batch_size: int = 8, lr: float = SUPERVISED_LR,
                 device: str = DEFAULT_DEVICE,
-                eval_dataset: Optional[MultiModalDataset] = None):
+                eval_dataset: Optional[MultiModalDataset] = None,
+                prox_mu: float = 0.0,
+                prox_ref: Optional[Dict[str, torch.Tensor]] = None):
     """
     Complete supervised fine-tuning on labeled PHQ data + evaluation + explainability.
     Produces model weights, metrics.json, and explain.txt.
+
+    FedProx: when `prox_mu > 0` and `prox_ref` (name -> reference tensor, for
+    trainable params only) is given, (prox_mu/2) * ||w - prox_ref||^2 is
+    added to the loss before backward(). With the defaults the term is never
+    constructed - this function behaves exactly as it did before it existed.
 
     Fix E2: `dataset` is the TRAINING split only. If `eval_dataset` is given,
     metrics (accuracy/precision/recall/F1/MAE) are computed on it instead of
@@ -679,12 +700,24 @@ def train_model(dataset: MultiModalDataset, model: MultiModalModel,
     rpt.subheader(f"TRAINING LOOP ({epochs} epoch(s))")
     rpt.kv("Regression loss weight (REG_LOSS_WEIGHT)", REG_LOSS_WEIGHT)
     rpt.kv("PHQ normalization scale", PHQ_SCALE_MAX)
+    # FedProx: only trainable params that have a reference take part - the
+    # frozen text encoder is in neither list.
+    prox_active = prox_mu > 0.0 and prox_ref is not None
+    prox_pairs = (
+        [(p, prox_ref[n].to(device)) for n, p in model.named_parameters() if p.requires_grad and n in prox_ref]
+        if prox_active else []
+    )
+    if prox_active:
+        rpt.kv("FedProx mu", prox_mu)
+        rpt.kv("FedProx params in proximal term", f"{sum(p.numel() for p, _ in prox_pairs):,}")
     model.train()
     final_avg_loss = None
     _shapes_printed = False
     global_step = 0
     for epoch in range(epochs):
         total_loss = 0.0
+        total_prox = 0.0
+        prox_sq = None
         for b in loader:
             b = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in b.items()}
             if not _shapes_printed:
@@ -711,6 +744,11 @@ def train_model(dataset: MultiModalDataset, model: MultiModalModel,
             loss_reg = reg_loss_fn(reg_pred / PHQ_SCALE_MAX, b["phq"] / PHQ_SCALE_MAX)
             loss_reg_weighted = REG_LOSS_WEIGHT * loss_reg
             loss = loss_cls + loss_reg_weighted
+            if prox_active:
+                prox_sq = sum(((p - ref) ** 2).sum() for p, ref in prox_pairs)
+                loss_prox = 0.5 * prox_mu * prox_sq
+                loss = loss + loss_prox
+                total_prox += loss_prox.item()
             loss.backward()
 
             # Fix E3, point 4: standing instrumentation (was ad hoc in Step
@@ -736,6 +774,9 @@ def train_model(dataset: MultiModalDataset, model: MultiModalModel,
                     f"fc1_grad={fc1_grad_norm:.4f} cls_grad={classifier_grad_norm:.4f} phq_mu_grad={phq_mu_grad_norm:.4f}",
                     indent=2,
                 )
+                if prox_active:
+                    print(f"[train_model] step={global_step} loss_prox={loss_prox.item():.6f} "
+                          f"(mu={prox_mu}, dist_from_ref={math.sqrt(prox_sq.item()):.6f})")
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -744,6 +785,14 @@ def train_model(dataset: MultiModalDataset, model: MultiModalModel,
         final_avg_loss = total_loss / len(loader)
         print(f"[train_model] epoch {epoch+1}/{epochs} avg_loss={final_avg_loss:.4f}")
         rpt.kv(f"Epoch {epoch+1}/{epochs} average loss", f"{final_avg_loss:.4f}", indent=2)
+        if prox_active:
+            # avg_loss above includes the proximal term; it is split out here.
+            avg_prox = total_prox / len(loader)
+            end_dist = math.sqrt(prox_sq.item())
+            print(f"[train_model] epoch {epoch+1}/{epochs} avg_task_loss={final_avg_loss - avg_prox:.4f} "
+                  f"avg_loss_prox={avg_prox:.6f} dist_from_ref_at_epoch_end={end_dist:.6f}")
+            rpt.kv(f"Epoch {epoch+1}/{epochs} task loss / proximal term",
+                   f"{final_avg_loss - avg_prox:.4f} / {avg_prox:.6f}  (dist from ref {end_dist:.6f})", indent=2)
 
     # ---------- Evaluation (Fix E2: on the held-out split, never on `loader`) ----------
     model.eval()
@@ -1940,7 +1989,54 @@ def orchestrate(
 
     model.to(device)
     base_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
- 
+
+    # ── FedProx reference + shared-initialisation proof ──────────────────────
+    # Taken after the freeze, so only trainable params are ever in it. Skipped
+    # entirely (no output, no state) unless one of the three env vars is set.
+    warm_started = bool(global_model_path and Path(global_model_path).exists())
+    prox_ref = None
+    if FEDPROX_MU < 0.0:
+        raise ValueError(f"FEDPROX_MU must be >= 0, got {FEDPROX_MU}")
+    if FEDPROX_MU > 0.0 or GLOBAL_INIT_SEED is not None or EXPECTED_INIT_HASH is not None:
+        import hashlib
+        init_trainable = {n: p.detach().cpu().clone() for n, p in model.named_parameters() if p.requires_grad}
+        hasher = hashlib.sha256()
+        for n in sorted(init_trainable):
+            hasher.update(n.encode("utf-8"))
+            hasher.update(init_trainable[n].to(torch.float32).numpy().tobytes())
+        init_hash = hasher.hexdigest()
+        init_l2 = math.sqrt(sum((v.float().norm() ** 2).item() for v in init_trainable.values()))
+        init_count = sum(v.numel() for v in init_trainable.values())
+
+        rpt.subheader("INITIAL TRAINABLE WEIGHTS")
+        rpt.kv("Source", "global model (warm-start)" if warm_started
+               else (f"GLOBAL_INIT_SEED={GLOBAL_INIT_SEED}" if GLOBAL_INIT_SEED is not None else "unseeded random init"))
+        rpt.kv("Trainable params hashed", f"{init_count:,} in {len(init_trainable)} tensors")
+        rpt.kv("SHA-256", init_hash)
+        rpt.kv("L2 norm", f"{init_l2:.6f}")
+        print(f"[INIT-HASH] seed={GLOBAL_INIT_SEED} warm_start={warm_started} params={init_count} "
+              f"sha256={init_hash} l2={init_l2:.6f}")
+
+        if EXPECTED_INIT_HASH is not None and init_hash != EXPECTED_INIT_HASH.strip().lower():
+            raise RuntimeError(
+                f"Initial trainable weights do not match EXPECTED_INIT_HASH: got {init_hash}, "
+                f"expected {EXPECTED_INIT_HASH}. This client does not share the round's "
+                f"initialisation - refusing to train."
+            )
+
+        if FEDPROX_MU > 0.0:
+            if not warm_started and GLOBAL_INIT_SEED is None:
+                raise RuntimeError(
+                    "FEDPROX_MU > 0 but this client has neither a global model nor GLOBAL_INIT_SEED: "
+                    "its starting weights are a private random init, not a reference shared with the "
+                    "other clients, so the proximal term would be meaningless. Refusing to train."
+                )
+            prox_ref = init_trainable
+            rpt.kv("FedProx mu (FEDPROX_MU)", FEDPROX_MU)
+            rpt.kv("FedProx reference", "the initial trainable weights hashed above")
+            print(f"[FEDPROX] mu={FEDPROX_MU} reference=initial trainable weights ({init_count} params)")
+    # ─────────────────────────────────────────────────────────────────────────
+
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, collate_fn=collate_batch)
     preds  = run_inference(model, loader, device=device)
     for r, p in zip(records, preds):
@@ -2120,7 +2216,8 @@ def orchestrate(
         ds_eval = MultiModalDataset(eval_records, tokenizer, max_len=MULTIMODAL_MAX_LEN)
         result = train_model(ds_sup, model, output_dir=str(LOCAL_SAVE_DIR),
                              epochs=epochs, batch_size=batch_size, lr=lr, device=device,
-                             eval_dataset=ds_eval)
+                             eval_dataset=ds_eval,
+                             prox_mu=FEDPROX_MU, prox_ref=prox_ref)
         train_elapsed = time.time() - t_train0
         model.load_state_dict(torch.load(result["model_path"], map_location=device))
         after  = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
