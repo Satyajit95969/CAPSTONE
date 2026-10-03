@@ -22,8 +22,11 @@ section for the full investigation this was built from):
     [3/7] Enrollment       - trainer_outputs/demo_enroll.log (if present,
                              UTF-16LE+BOM) with a live MongoDB `devices`
                              collection fallback for whatever it can supply
-    [4/7] Client card      - trainer_outputs/demo_r{round}_client{N}.log
-                             (UTF-16LE+BOM, PowerShell Tee-Object default)
+    [4/7] Client card      - trainer_outputs/demo_r{round}_client{N}.log or
+                             trainer_outputs/demo_client_run{N}.log (the
+                             runbook's name), whichever is fresh, or
+                             --client-logs (UTF-16LE+BOM, PowerShell
+                             Tee-Object default)
     [5/7] Aggregation      - trainer_outputs/demo_orchestrator.log
     [6/7] DB Verification  - live MongoDB query (receipts, model_updates,
                              global_models, GridFS fs.files)
@@ -44,6 +47,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import textwrap
 import time
 from datetime import datetime
 from pathlib import Path
@@ -62,8 +66,32 @@ HOME = Path.home()
 # task spec, does not exist anywhere in this repo; dropped entirely per
 # instruction). The runbook's own wider observed range folds into the [~]
 # tier's explanation text below, not into the boundary itself.
-DELTA_L2_OK_LOW, DELTA_L2_OK_HIGH = 0.625, 0.729
+#
+# Delta L2 depends on the trainable-parameter count, so the [OK] range is
+# keyed on it - a range calibrated for one fusion-head size is never applied
+# to a log from another. A log whose trainable-param count has no entry here
+# gets no range verdict at all (rendered [--]), not a guessed one.
+#   281,254 (FUSION_HIDDEN_DIM=256): Fix E4's calibration range.
+#   75,454  (FUSION_HIDDEN_DIM=56, the current default): observed min-max
+#           over the 33 round-1 Mode A runs logged at this configuration
+#           (lr 1e-4, 10 epochs, full 149-record partition, original
+#           186-record parquet) - 15 fusion-head sweep runs (2026-09-20), 15
+#           augmentation-sweep Arm 1 runs (2026-10-02), 3 end-to-end demo
+#           clients (2026-10-03). Measured min 0.3886, max 0.4815, mean
+#           0.4332, stdev 0.0247; bounds rounded outward to 3 d.p. Delta L2
+#           is pre-DP, so it does not depend on sigma.
+DELTA_L2_OK_RANGES = {
+    281254: (0.625, 0.729, "281,254 trainable params (FUSION_HIDDEN_DIM=256), Fix E4 calibration"),
+    75454: (0.388, 0.482, "75,454 trainable params (FUSION_HIDDEN_DIM=56), lr 1e-4, 10 epochs, "
+                          "Mode A full 149-record partition - observed min-max over 33 runs, "
+                          "2026-09-20 to 2026-10-03"),
+}
 DELTA_L2_CLIP_THRESHOLD = 0.85
+
+# --session looks for each client's log under both naming conventions in use:
+# the round-scoped name this renderer was first written against, and the name
+# MENTOR_DEMO_RUNBOOK.md's Tee-Object commands actually write.
+CLIENT_LOG_PATTERNS = ("demo_r{round}_client{n}.log", "demo_client_run{n}.log")
 
 CONFIDENT_LOW, CONFIDENT_HIGH = 0.3, 0.7  # unused here directly, kept for reference parity with Phase B
 
@@ -607,8 +635,24 @@ KNOWN_CLIENT_MARKERS = [
 ]
 
 
+def resolve_client_log(round_id: int, n: int, min_mtime_epoch: Optional[float]) -> Path:
+    """Picks client n's log for --session from CLIENT_LOG_PATTERNS: the
+    newest candidate that is not stale (mtime at or after the current
+    orchestrator's start). If every existing candidate is stale, the newest
+    of those is returned so build_client_block() reports it as STALE; if
+    none exists, the first pattern's path is returned so it reports
+    not-found."""
+    candidates = [TRAINER_OUTPUTS / p.format(round=round_id, n=n) for p in CLIENT_LOG_PATTERNS]
+    existing = [p for p in candidates if p.exists()]
+    if not existing:
+        return candidates[0]
+    fresh = [p for p in existing if min_mtime_epoch is None or p.stat().st_mtime >= min_mtime_epoch]
+    return max(fresh or existing, key=lambda p: p.stat().st_mtime)
+
+
 def build_client_block(log_path: Path, client_num: int, total: int = 3, full_mode: bool = False,
-                        min_mtime_epoch: Optional[float] = None) -> dict:
+                        min_mtime_epoch: Optional[float] = None,
+                        expected_round: Optional[int] = None) -> dict:
     if not log_path.exists():
         return {"title": f"[4/7]  CLIENT {client_num} of {total}", "rows": [],
                 "verdict": "!!", "duration": None, "status_word": "MISSING",
@@ -638,6 +682,18 @@ def build_client_block(log_path: Path, client_num: int, total: int = 3, full_mod
     text = read_text_sniff_bom(log_path)
     raw_lines = text.splitlines()
     lines = [strip_ansi(l)[0] for l in raw_lines]
+
+    # demo_client_run{n}.log carries no round in its filename, so the round is
+    # checked from the log's own "Round ID" line - a fresh log from a
+    # different round of the same orchestrator session is not this round's.
+    if expected_round is not None:
+        logged_round = int_after_colon(find_line(lines, "Round ID"))
+        if logged_round is not None and logged_round != expected_round:
+            return {"title": f"[4/7]  CLIENT {client_num} of {total}", "rows": [],
+                    "verdict": "!!", "duration": None, "status_word": "MISSING",
+                    "explanation": (f"{log_path} is a round {logged_round} log, not round {expected_round}. "
+                                     f"Treated as not-run for this round."),
+                    "missing": True, "suppressed": None}
 
     noise_counts, _asserted = classify_and_count_noise(raw_lines, KNOWN_CLIENT_MARKERS)
 
@@ -790,15 +846,29 @@ def build_client_block(log_path: Path, client_num: int, total: int = 3, full_mod
     clamp_engaged = any("ENGAGED" in l and "SAFETY-CLAMP" in l for l in lines)
 
     delta_tier_explanations = []
-    if delta_l2 is not None:
-        if DELTA_L2_OK_LOW <= delta_l2 <= DELTA_L2_OK_HIGH:
+    delta_range = DELTA_L2_OK_RANGES.get(trainable_actual)
+    if delta_l2 is not None and delta_range is None:
+        # No range was ever calibrated for this trainable-param count - show
+        # the value, judge only what can be judged (the clip threshold).
+        v = "--" if delta_l2 < clip_threshold else "!!"
+        if v == "!!":
+            verdict_ok = False
+        sections["PRIVACY"].append(Row("Delta L2 (the genuine learning signal)", f"{delta_l2:.6f}",
+                                        expected="no range", verdict=v))
+        delta_tier_explanations.append(
+            f" [--] No delta L2 range has been calibrated for {trainable_actual} trainable params "
+            f"(known: {', '.join(f'{k:,}' for k in sorted(DELTA_L2_OK_RANGES))})."
+        )
+    elif delta_l2 is not None:
+        ok_low, ok_high, range_config = delta_range
+        if ok_low <= delta_l2 <= ok_high:
             v = "OK"
         elif delta_l2 < clip_threshold:
             v = "~"
             delta_tier_explanations.append(
                 f" [~] Delta L2 {delta_l2:.3f} is above the calibration range but well under the "
                 f"{clip_threshold} clip threshold. Clipping correctly did not fire. Run-to-run variation."
-                if delta_l2 > DELTA_L2_OK_HIGH else
+                if delta_l2 > ok_high else
                 f" [~] Delta L2 {delta_l2:.3f} is below the calibration range but well under the "
                 f"{clip_threshold} clip threshold. Run-to-run variation."
             )
@@ -806,7 +876,10 @@ def build_client_block(log_path: Path, client_num: int, total: int = 3, full_mod
             v = "!!"
             verdict_ok = False
         sections["PRIVACY"].append(Row("Delta L2 (the genuine learning signal)", f"{delta_l2:.6f}",
-                                        expected=f"{DELTA_L2_OK_LOW}-{DELTA_L2_OK_HIGH}", verdict=v))
+                                        expected=f"{ok_low}-{ok_high}", verdict=v))
+        delta_tier_explanations.append(textwrap.fill(
+            f"Delta L2 range {ok_low}-{ok_high} applies to: {range_config}.",
+            width=WIDTH - 1, initial_indent=" ", subsequent_indent=" "))
     else:
         sections["PRIVACY"].append(Row("Delta L2 (the genuine learning signal)", MISSING, verdict="!!")); verdict_ok = False
 
@@ -965,7 +1038,12 @@ def build_aggregation_block(round_id: int) -> dict:
     text = read_text_sniff_bom(log_path)
     lines = [strip_ansi(l)[0] for l in text.splitlines()]
 
-    trigger_line = find_line(lines, "Aggregation starting")
+    # This round's own trigger line, and only the log AFTER it - the startup
+    # recovery banner earlier in the same file also mentions rounds, hashes
+    # and "Next collecting round", none of which describe this aggregation.
+    trigger_idx = next((i for i, l in enumerate(lines)
+                        if "Aggregation starting" in l and re.search(rf"round={round_id}\b", l)), None)
+    trigger_line = lines[trigger_idx] if trigger_idx is not None else None
     if not trigger_line:
         return {"title": "[5/7]  SERVER AGGREGATION",
                 "rows": [Row("Trigger", MISSING, verdict="!!"), Row("Algorithm", MISSING, verdict="!!"),
@@ -984,16 +1062,30 @@ def build_aggregation_block(round_id: int) -> dict:
         rows.append(Row("Trigger", MISSING, verdict="!!"))
         rows.append(Row("Algorithm", MISSING, verdict="!!"))
 
-    complete_line = find_line(lines, "Round") and next((l for l in lines if "complete" in l.lower() and "aggregat" in l.lower()), None)
+    lines = lines[trigger_idx:]
+    complete_line = next((l for l in lines if "complete" in l.lower() and "aggregat" in l.lower()), None)
     rows.append(Row("Result", complete_line if complete_line else MISSING, verdict="OK" if complete_line else "!!"))
 
-    global_line = next((l for l in lines if "global_models" in l.lower() or ("hash" in l.lower() and "action" in l.lower())), None)
-    rows.append(Row("Global model", global_line if global_line else MISSING, verdict="OK" if global_line else "!!"))
+    # The orchestrator prints the persisted model as a multi-line banner
+    # ("GLOBAL MODEL PERSISTENCE", then one "Key : value" per line), so the
+    # hash and the persistence action are read from their own lines.
+    global_val = None
+    banner_idx = next((i for i, l in enumerate(lines) if "GLOBAL MODEL PERSISTENCE" in l), None)
+    if banner_idx is not None:
+        banner = lines[banner_idx:banner_idx + 12]
+        model_hash = extract_after_colon(find_line(banner, "Computed hash"))
+        action = extract_after_colon(find_line(banner, "Persistence action"))
+        if model_hash and action:
+            global_val = f"{action}, sha256 {model_hash[:16]}..."
+    rows.append(Row("Global model", global_val if global_val else MISSING, verdict="OK" if global_val else "!!"))
 
-    next_line = find_line(lines, "Next collecting round") or find_line(lines, "Round 2")
-    rows.append(Row("Next round", next_line if next_line else MISSING, verdict="OK" if next_line else "!!"))
+    m = next((m for m in (re.search(rf"Round {round_id + 1} ready\b.*", l) for l in lines) if m), None)
+    next_val = to_ascii(m.group()) if m else None
+    rows.append(Row("Next round", next_val if next_val else MISSING, verdict="OK" if next_val else "!!"))
 
-    verdict_ok = all(r.verdict == "OK" for r in rows)
+    # "Algorithm" is an informational row with no verdict of its own - it
+    # must not count against the block.
+    verdict_ok = all(r.verdict in ("OK", None) and not r.is_missing for r in rows)
 
     explanation = (
         " HONEST NOTE: at n=3, trimmed_mean drops the highest and lowest per coordinate,\n"
@@ -1068,14 +1160,52 @@ def _corpus_doc_count() -> Optional[int]:
     return len(re.findall(r'"id":\s*"', text))
 
 
-def build_ai_reports_block(round_id: int) -> dict:
+def get_round_freshness_epoch(mongo_uri: str, db_name: str, round_id: int) -> Optional[float]:
+    """Earliest moment a report about THIS session's round `round_id` could
+    have been written: the newest receipt recorded for that round (both
+    agents run after the round's updates exist), or failing that the current
+    orchestrator's start. round_{N}_*_report.md is NOT cleared between demo
+    sessions, so a report older than this belongs to an earlier session that
+    reused the round number. None if neither source is available."""
+    floor = get_orchestrator_start_epoch()
+    try:
+        client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+        doc = client[db_name]["receipts"].find_one({"round_id": round_id}, sort=[("timestamp", -1)])
+        client.close()
+        ts = doc.get("timestamp") if doc else None
+        if isinstance(ts, datetime):
+            import calendar
+            receipt_epoch = calendar.timegm(ts.timetuple()) + ts.microsecond / 1e6
+            floor = receipt_epoch if floor is None else max(floor, receipt_epoch)
+    except Exception:
+        pass
+    return floor
+
+
+def _stale_report_note(path: Path, min_mtime_epoch: Optional[float]) -> Optional[str]:
+    if min_mtime_epoch is None or path.stat().st_mtime >= min_mtime_epoch:
+        return None
+    return (f"written {datetime.fromtimestamp(path.stat().st_mtime):%Y-%m-%d %H:%M:%S}, before this "
+            f"session's round finished - left over from an earlier session")
+
+
+def build_ai_reports_block(round_id: int, min_mtime_epoch: Optional[float] = None) -> dict:
     privacy_path = HOME / ".federated" / "data" / "audit_reports" / f"round_{round_id}_privacy_report.md"
     clinical_path = HOME / ".federated" / "data" / "clinical_reports" / f"round_{round_id}_clinical_report.md"
 
     rows_info = {}
     duration = None
 
-    if privacy_path.exists():
+    # A stale report is rendered MISSING (with the reason), never as its old
+    # PASSED/WARNING verdict - same rule as a stale client log.
+    privacy_stale = _stale_report_note(privacy_path, min_mtime_epoch) if privacy_path.exists() else None
+    clinical_stale = _stale_report_note(clinical_path, min_mtime_epoch) if clinical_path.exists() else None
+
+    if privacy_stale:
+        rows_info["privacy_state"] = "MISSING"
+        rows_info["privacy_stale"] = privacy_stale
+        rows_info["privacy_path"] = f"{privacy_path}  (STALE - not this session's)"
+    elif privacy_path.exists():
         ptext = privacy_path.read_text(encoding="utf-8")
         pstate = _report_state(ptext)
         rt = re.search(r"Runtime: ([\d.]+)s total", ptext)
@@ -1090,7 +1220,11 @@ def build_ai_reports_block(round_id: int) -> dict:
         rows_info["privacy_state"] = "MISSING"
         rows_info["privacy_path"] = MISSING
 
-    if clinical_path.exists():
+    if clinical_stale:
+        rows_info["clinical_state"] = "MISSING"
+        rows_info["clinical_stale"] = clinical_stale
+        rows_info["clinical_path"] = f"{clinical_path}  (STALE - not this session's)"
+    elif clinical_path.exists():
         ctext = clinical_path.read_text(encoding="utf-8")
         cstate = _report_state(ctext)
         rt = re.search(r"Runtime: ([\d.]+)s total", ctext)
@@ -1132,7 +1266,9 @@ def render_ai_reports_block(info: dict) -> list[str]:
     out.append(" recorded results.")
     out.append("")
 
-    def state_line(label, state, untraceable):
+    def state_line(label, state, untraceable, stale=None):
+        if stale:
+            return f"   {label:<18s} MISSING   only a STALE report exists ({stale})"
         if state == "LLM_UNAVAILABLE":
             return f"   {label:<18s} LLM UNAVAILABLE  the report was written, but the local AI did not respond in time - it has no narrative section"
         if state == "PASSED":
@@ -1142,8 +1278,10 @@ def render_ai_reports_block(info: dict) -> list[str]:
             return f"   {label:<18s} CAUGHT {n}  the AI wrote a number that was not traceable to the facts: [{untraceable}]"
         return f"   {label:<18s} MISSING   report file not found"
 
-    out.append(state_line("Privacy report", info.get("privacy_state", "MISSING"), info.get("privacy_untraceable")))
-    out.append(state_line("Clinical report", info.get("clinical_state", "MISSING"), info.get("clinical_untraceable")))
+    out.append(state_line("Privacy report", info.get("privacy_state", "MISSING"), info.get("privacy_untraceable"),
+                          info.get("privacy_stale")))
+    out.append(state_line("Clinical report", info.get("clinical_state", "MISSING"), info.get("clinical_untraceable"),
+                          info.get("clinical_stale")))
     out.append("")
 
     if info.get("clinical_state") == "WARNING":
@@ -1279,7 +1417,33 @@ def render_three_client_comparison(comp: dict, mode_label: str = "Mode A / full"
 # SCORECARD
 # =============================================================================
 
-def build_and_render_scorecard(block_results: list[tuple[str, dict]], total_runtime: float) -> list[str]:
+def _signal_vs_noise_lines(comp: Optional[dict]) -> list[str]:
+    """The closing signal-vs-noise statement, computed from the client logs
+    being rendered (per-client noise norm / delta L2) - never a fixed figure,
+    since both sides move with sigma and the trainable-parameter count."""
+    pairs = []
+    if comp:
+        for d, n in zip(comp["rows_data"]["Delta L2"], comp["rows_data"]["Noise norm"]):
+            if isinstance(d, float) and isinstance(n, float) and d > 0:
+                pairs.append((d, n))
+    if not pairs:
+        return [" Signal-vs-noise ratio: [!!] MISSING - no client log in this render carries both",
+                " a delta L2 and a DP noise norm to compute it from."]
+
+    def span(vals: list[float], fmt: str) -> str:
+        lo, hi = format(min(vals), fmt), format(max(vals), fmt)
+        return lo if lo == hi else f"{lo}-{hi}"
+
+    deltas, noises = [p[0] for p in pairs], [p[1] for p in pairs]
+    ratios = [n / d for d, n in pairs]
+    return [f" Signal-vs-noise ratio: this run's local delta L2 ({span(deltas, '.3f')}) vs DP",
+            f" noise ({span(noises, '.1f')}) is a ~{span(ratios, '.0f')}x gap ({len(pairs)} client(s)) this",
+            " configuration does not close. Scope: this project's own measured",
+            " configuration at n=3 clients, not a general DP claim."]
+
+
+def build_and_render_scorecard(block_results: list[tuple[str, dict]], total_runtime: float,
+                               comp: Optional[dict] = None) -> list[str]:
     out = [hr(), " SESSION SUMMARY SCORECARD", hr()]
     n_ok = n_notes = n_fail = n_missing = 0
     for i, (name, b) in enumerate(block_results, 1):
@@ -1307,12 +1471,12 @@ def build_and_render_scorecard(block_results: list[tuple[str, dict]], total_runt
     out.append("")
     out.append(" WHAT IS HONESTLY REPORTED AS NOT WORKING")
     out.append(hr("-"))
-    out.append(" Signal-vs-noise ratio: local delta L2 (~0.6-0.8) vs DP noise (~450) is a")
-    out.append(" ~590x gap this configuration does not close. Scope: this project's own")
-    out.append(" measured configuration at n=3 clients, not a general DP claim.")
+    out.extend(_signal_vs_noise_lines(comp))
     out.append(" Aggregated F1 collapse: trimmed_mean at n=3 is a coordinate-wise median with")
-    out.append(" no averaging benefit - measured mean 260.25 vs trimmed_mean 301.80 on")
-    out.append(" identical data confirms mean is closer to the sqrt(3) prediction.")
+    out.append(" no averaging benefit - mean 260.25 vs trimmed_mean 301.80 on identical data")
+    out.append(" confirms mean is closer to the sqrt(3) prediction. HISTORICAL measurement")
+    out.append(" (Step 13: sigma=1.0, 281,254 trainable params) - NOT re-measured at the")
+    out.append(" current configuration.")
     out.append(" Sharding's corpus-size floor: genuine per-client partitioning at this")
     out.append(" corpus's size (149 train records / 3 clients) leaves too few positive")
     out.append(" examples per shard for reliable local training (documented, Step 20/21).")
@@ -1327,7 +1491,8 @@ def build_and_render_scorecard(block_results: list[tuple[str, dict]], total_runt
 # CLI / main
 # =============================================================================
 
-def run_session(round_id: int, full_mode: bool, mongo_uri: str, db_name: str) -> int:
+def run_session(round_id: int, full_mode: bool, mongo_uri: str, db_name: str,
+                client_logs: Optional[list[str]] = None) -> int:
     t_start = time.time()
     block_results = []
     output = []
@@ -1347,8 +1512,10 @@ def run_session(round_id: int, full_mode: bool, mongo_uri: str, db_name: str) ->
     orchestrator_start_epoch = get_orchestrator_start_epoch()
     client_blocks = []
     for n in (1, 2, 3):
-        log_path = TRAINER_OUTPUTS / f"demo_r{round_id}_client{n}.log"
-        cb = build_client_block(log_path, n, 3, full_mode, min_mtime_epoch=orchestrator_start_epoch)
+        log_path = (Path(client_logs[n - 1]) if client_logs
+                    else resolve_client_log(round_id, n, orchestrator_start_epoch))
+        cb = build_client_block(log_path, n, 3, full_mode, min_mtime_epoch=orchestrator_start_epoch,
+                                expected_round=round_id)
         output.extend(render_client_block(cb, full_mode))
         client_blocks.append(cb)
         block_results.append((f"Client {n}", cb))
@@ -1364,12 +1531,12 @@ def run_session(round_id: int, full_mode: bool, mongo_uri: str, db_name: str) ->
     output.extend(render_simple_block(verify_block))
     block_results.append(("DB Verification", verify_block))
 
-    reports_block = build_ai_reports_block(round_id)
+    reports_block = build_ai_reports_block(round_id, get_round_freshness_epoch(mongo_uri, db_name, round_id))
     output.extend(render_ai_reports_block(reports_block["info"]))
     block_results.append(("AI Reports", reports_block))
 
     total_runtime = time.time() - t_start
-    output.extend(build_and_render_scorecard(block_results, total_runtime))
+    output.extend(build_and_render_scorecard(block_results, total_runtime, comp))
 
     print("\n".join(output))
     return 0
@@ -1381,6 +1548,9 @@ def main() -> int:
     ap.add_argument("--client", help="path to one client log file")
     ap.add_argument("--compare", nargs=3, metavar=("LOG1", "LOG2", "LOG3"))
     ap.add_argument("--session", action="store_true")
+    ap.add_argument("--client-logs", nargs=3, metavar=("LOG1", "LOG2", "LOG3"),
+                    help="with --session: explicit client log paths, overriding the "
+                         "demo_r{round}_client{N}.log / demo_client_run{N}.log lookup")
     ap.add_argument("--round", type=int, default=1)
     ap.add_argument("--full", action="store_true", help="disable all noise suppression")
     ap.add_argument("--mongo-uri", default=DEFAULT_MONGO_URI)
@@ -1388,7 +1558,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.session:
-        return run_session(args.round, args.full, args.mongo_uri, args.db)
+        return run_session(args.round, args.full, args.mongo_uri, args.db, args.client_logs)
 
     if args.client:
         cb = build_client_block(Path(args.client), 1, 1, args.full)
@@ -1410,7 +1580,8 @@ def main() -> int:
             "enroll": lambda: render_simple_block(build_enrollment_block(args.mongo_uri, args.db)),
             "aggregate": lambda: render_simple_block(build_aggregation_block(args.round)),
             "verify": lambda: render_simple_block(build_db_verification_block(args.mongo_uri, args.db, args.round)),
-            "reports": lambda: render_ai_reports_block(build_ai_reports_block(args.round)["info"]),
+            "reports": lambda: render_ai_reports_block(build_ai_reports_block(
+                args.round, get_round_freshness_epoch(args.mongo_uri, args.db, args.round))["info"]),
         }
         if args.stage in builders:
             print("\n".join(builders[args.stage]()))

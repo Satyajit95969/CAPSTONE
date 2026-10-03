@@ -48,17 +48,23 @@ from pathlib import Path
 
 IMPLEMENTATION_NOTES_PATH = Path(__file__).resolve().parent.parent / "docs" / "IMPLEMENTATION_NOTES.md"
 
-# Keys read from IMPLEMENTATION_NOTES.md's "Fusion-head capacity sweep"
-# section (2026-09-20 - supersedes the earlier 14-run sigma comparison,
-# whose 6/7-collapse figure was itself a small-sample artifact) for the
-# mandatory representativeness disclosure (block1b, below). Not hardcoded
-# here - see _load_disclosure_facts().
+# Keys read from IMPLEMENTATION_NOTES.md's machine-readable DISCLOSURE_*
+# block (2026-10-03 - the 55-run fusion-head sweep pooled with the 45-run
+# training-data augmentation sweep, 100 runs; supersedes the fusion-head
+# sweep alone, and before it the 14-run sigma comparison) for the mandatory
+# representativeness disclosure (block1b, below). Not hardcoded here - see
+# _load_disclosure_facts().
 _DISCLOSURE_KEYS = (
     "DISCLOSURE_SWEEP_TOTAL_RUNS",
     "DISCLOSURE_SWEEP_GENUINE_COUNT",
     "DISCLOSURE_SWEEP_GENUINE_RATE_PCT",
-    "DISCLOSURE_SWEEP_BEST_RATE_PCT",
     "DISCLOSURE_SWEEP_WORST_RATE_PCT",
+    "DISCLOSURE_BAND_RUNS",
+    "DISCLOSURE_BAND_GENUINE_COUNT",
+    "DISCLOSURE_BAND_RATE_PCT",
+    "DISCLOSURE_BAND_LOW_PCT",
+    "DISCLOSURE_BAND_HIGH_PCT",
+    "DISCLOSURE_FLOOR_RUNS",
     "DISCLOSURE_SWEEP_BEST_RUN_F1",
     "DISCLOSURE_POSITIVE_COLLAPSE_F1",
     "DISCLOSURE_NEGATIVE_COLLAPSE_F1",
@@ -186,7 +192,7 @@ def block1_scope_header(session_id: str) -> None:
 
 def _load_disclosure_facts() -> dict[str, str]:
     """Parses the machine-readable DISCLOSURE_* block from
-    docs/IMPLEMENTATION_NOTES.md's "Fusion-head capacity sweep" section for
+    docs/IMPLEMENTATION_NOTES.md (just above its "Fusion-head capacity sweep" section) for
     block1b's mandatory representativeness disclosure, rather than
     hardcoding those figures in this script. Fails loudly - not a silent
     fallback - if the doc or any required key is missing: showing this
@@ -213,11 +219,11 @@ def _load_disclosure_facts() -> dict[str, str]:
 
 def block1b_representativeness_disclosure(session_id: str, recorded: dict) -> None:
     """Mandatory, never-suppressed disclosure of how representative this
-    session's result is against the 55-run fusion-head capacity sweep
-    documented in IMPLEMENTATION_NOTES.md (2026-09-20; supersedes the
-    original 14-run sigma comparison, whose 0/7-genuine figure at each
-    sigma was itself a small-sample artifact - a fresh baseline batch and
-    a tripled sample both moved that number well above zero). This
+    session's result is against the 100 runs of the fusion-head capacity
+    sweep and the training-data augmentation sweep documented in
+    IMPLEMENTATION_NOTES.md (2026-10-03; supersedes the fusion-head sweep
+    alone, and the original 14-run sigma comparison, whose 0/7-genuine
+    figure at each sigma was itself a small-sample artifact). This
     session's own F1 comes from its already-loaded report (the actual
     ground truth for this run); every sweep figure is read via
     _load_disclosure_facts(), not hardcoded."""
@@ -228,8 +234,13 @@ def block1b_representativeness_disclosure(session_id: str, recorded: dict) -> No
     total_runs = facts["DISCLOSURE_SWEEP_TOTAL_RUNS"]
     genuine_count = facts["DISCLOSURE_SWEEP_GENUINE_COUNT"]
     genuine_rate = facts["DISCLOSURE_SWEEP_GENUINE_RATE_PCT"]
-    best_rate = facts["DISCLOSURE_SWEEP_BEST_RATE_PCT"]
     worst_rate = facts["DISCLOSURE_SWEEP_WORST_RATE_PCT"]
+    band_runs = facts["DISCLOSURE_BAND_RUNS"]
+    band_count = facts["DISCLOSURE_BAND_GENUINE_COUNT"]
+    band_rate = facts["DISCLOSURE_BAND_RATE_PCT"]
+    band_low = facts["DISCLOSURE_BAND_LOW_PCT"]
+    band_high = facts["DISCLOSURE_BAND_HIGH_PCT"]
+    floor_runs = facts["DISCLOSURE_FLOOR_RUNS"]
     best_run_f1 = float(facts["DISCLOSURE_SWEEP_BEST_RUN_F1"])
     base_rate = facts["DISCLOSURE_BASE_RATE_POSITIVE_PCT"]
     exceeds_both_ceilings = this_f1 > max(pos_ceiling, neg_ceiling)
@@ -240,9 +251,9 @@ def block1b_representativeness_disclosure(session_id: str, recorded: dict) -> No
     print()
     if exceeds_both_ceilings:
         print(f" This session ({session_id}, F1={this_f1:.4f}) achieved genuine class")
-        print(f" discrimination - consistent with roughly {genuine_rate}% of runs")
-        print(f" ({genuine_count} of {total_runs}) in a capacity sweep across fusion-head")
-        print(" sizes. This is an above-typical result, but NOT unique: at least one")
+        print(f" discrimination - as roughly {band_low}-{band_high}% of runs do at workable")
+        print(f" fusion-head sizes ({band_count} of {band_runs} runs, {band_rate}% pooled).")
+        print(" This is an above-typical result, but NOT unique: at least one")
         print(f" other measured run reached F1={best_run_f1:.4f}, exceeding this session.")
     else:
         print(f" This session ({session_id}, F1={this_f1:.4f}) does NOT exceed the fixed")
@@ -250,11 +261,13 @@ def block1b_representativeness_disclosure(session_id: str, recorded: dict) -> No
         print(f" collapse pattern seen in {total_runs} measured runs ({genuine_count} of")
         print(f" which, {genuine_rate}%, achieved genuine discrimination).")
     print()
-    print(f" Across a {total_runs}-run sweep varying fusion-head size (same data, lr,")
-    print(" epochs, batch size, splits and DP settings throughout), the genuine-")
-    print(f" discrimination rate ranged from {worst_rate}% (smallest heads tested -")
-    print(f" total collapse, no exceptions) up to {best_rate}% depending on head size.")
-    print(" No head size tested reliably avoids collapse in most runs.")
+    print(f" Across {total_runs} measured runs in two sweeps (fusion-head size, then")
+    print(" training-data augmentation; same lr, epochs, batch size, eval split")
+    print(" and DP settings throughout), the genuine-discrimination rate was")
+    print(f" {band_low}-{band_high}% in every arm at a workable head size ({band_runs} runs),")
+    print(f" and {worst_rate}% at the smallest heads tested ({floor_runs} runs - total")
+    print(" collapse, no exceptions). No head size or augmentation tested")
+    print(" reliably avoids collapse in most runs.")
     print()
     print(" The two degenerate modes have fixed scores on this eval split's")
     print(f" {base_rate}% positive base rate: predict-all-positive gives F1 exactly")
@@ -328,10 +341,27 @@ def block3_confusion_matrix(cm: dict, recorded: dict) -> None:
     print(f" Recall:    {recorded['recall']:.4f}")
     print(f" F1:        {recorded['f1']:.4f}")
     print()
-    print(" High recall with lower precision means the model errs toward")
-    print(" flagging - for a SCREENING tool this is the safer error to make:")
-    print(" a false alarm gets ruled out by a clinician, a missed patient")
-    print(" does not.")
+    # The reading of these four numbers depends on which error the model
+    # actually made this session - chosen from the confusion matrix itself.
+    if tp + fp == 0:
+        print(" The model flagged NO ONE: every held-out patient was predicted")
+        print(f" PHQ-, so all {fn} truly-positive patients were missed. Accuracy")
+        print(" here is just the negative base rate. For a SCREENING tool this")
+        print(" is the unsafe error: a missed patient is not ruled back in.")
+    elif tn + fn == 0:
+        print(" The model flagged EVERYONE: recall is 1.0 only because every")
+        print(" held-out patient was predicted PHQ+, and precision is just the")
+        print(" positive base rate. No discrimination between patients.")
+    elif recorded["recall"] > recorded["precision"]:
+        print(" High recall with lower precision means the model errs toward")
+        print(" flagging - for a SCREENING tool this is the safer error to make:")
+        print(" a false alarm gets ruled out by a clinician, a missed patient")
+        print(" does not.")
+    else:
+        print(" Recall at or below precision means the model errs toward")
+        print(f" MISSING cases ({fn} missed vs {fp} false alarm(s)) - for a")
+        print(" SCREENING tool this is the less safe error to make: a false")
+        print(" alarm gets ruled out by a clinician, a missed patient does not.")
     print()
 
 
