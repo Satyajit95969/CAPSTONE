@@ -18,8 +18,12 @@ toy `videos\sample.mp4` fixture, and **not** the old `daic_records_multimodal.pa
   rounds after the first; **this demo only runs round 1, so LR_DECAY has no visible
   effect here** — `LR_DECAY**0 = 1` — it matters starting round 2, which this basic
   demo doesn't reach)
+- Fusion head: `FUSION_HIDDEN_DIM=56` (default since 2026-09-20 — was 256), which
+  makes the trainable surface **75,454** params (was 281,254)
 - DP: Gaussian, `clip_norm=0.85` (Fix E4 recalibration — was 1.0, then 0.15, now
-  0.85), `noise_multiplier=1.0`, `δ=1e-5`, `ε=5.302585` (RDP, single composition)
+  0.85), `noise_multiplier=0.75` (was 1.0), `δ=1e-5`, `ε=6.603254` (tighter RDP→DP
+  conversion, Canonne-Kamath-Steinke 2020, single composition — was 5.302585 under
+  the Mironov conversion at `noise_multiplier=1.0`)
 - Aggregation: trimmed_mean, `trim_ratio=0.1` (still the Rust orchestrator's
   hardcoded default — see disclosures below)
 
@@ -233,29 +237,31 @@ Get-Content "trainer_outputs\demo_blank_stdin.txt" | & ".venv\Scripts\python.exe
 Get-Content "trainer_outputs\demo_blank_stdin.txt" | & ".venv\Scripts\python.exe" "run_client_multimodal.py" *>&1 | Tee-Object -FilePath "trainer_outputs\demo_client_run3.log"
 ```
 
-**Expected values (Mode A) — use these to tell a good run from a bad one:**
+**Expected values (Mode A) — use these to tell a good run from a bad one.**
+Verified against a full end-to-end run on 2026-10-03 (3 clients, round 1):
 
 | Quantity | Expected value | Where it appears in the log |
 |---|---|---|
 | Audio dim | 154 (wav2vec2) | `[MULTIMODAL] audio encoder` section |
 | Video dim | 84 (DenseNet) | `[MULTIMODAL] video encoder` section |
-| Total model parameters | 109,763,494 | `MODEL CONFIGURATION` |
-| **Trainable** parameters | **281,254** | `FIX B — TEXT ENCODER FREEZE` (the number that actually gets trained/DP-noised/uploaded — not the 109.7M total) |
+| Total model parameters | 109,557,694 (75,454 trainable + 109,482,240 frozen; this section prints before the freeze is applied, so it lists all of them as trainable) | `MODEL CONFIGURATION` |
+| **Trainable** parameters | **75,454** | `FIX B — TEXT ENCODER FREEZE` (the number that actually gets trained/DP-noised/uploaded — not the 109.7M total) |
 | Frozen parameters | 109,482,240 | same section |
 | Round-1 effective learning rate | 1e-4 (0.0001) | `STEP 16 — ROUND-AWARE LR DECAY` (round_id=1 → decay factor 1.0, unaffected) |
 | Partition mode | `full` (`CLIENT_SHARD_ID`/`CLIENT_N_SHARDS` unset — every client trains on all 149) | `STEP 20 — CLIENT DATA PARTITION` |
-| Delta L2 norm (pre-clip, pre-DP) | ~0.55 – 0.68 (measured: ~0.63) | `DELTA / SAFETY CLAMP` → "Delta L2 norm before clamp" |
+| Delta L2 norm (pre-clip, pre-DP) | ~0.39 – 0.48 (33 runs at this configuration: min 0.389, max 0.481, mean 0.433) | `DELTA / SAFETY CLAMP` → "Delta L2 norm before clamp" |
 | Safety clamp engagement | should NOT engage | no `[SAFETY-CLAMP] ... ENGAGED` line anywhere in the log |
-| DP clipping applied | **False** (0.55–0.68 is below the 0.85 clip threshold) | `STEP 1 - CLIPPING` |
-| DP noise norm (added) | ~450 | `STEP 2 - NOISE` |
-| Epsilon (ε) | **5.302585** exactly | `STEP 4 - PRIVACY ACCOUNTING` |
-| Encrypted upload size | **~1.44 MB** (1,506,992 bytes) | `SECURE TRANSPORT` → "Payload size" |
-| Chunks | 2 (1 MB chunk size) | same section |
+| DP clipping applied | **False** (0.39–0.48 is below the 0.85 clip threshold) | `STEP 1 - CLIPPING` |
+| DP noise norm (added) | ~175 (measured: 174.5 – 175.3) | `STEP 2 - NOISE` |
+| Epsilon (ε) | **6.603254** exactly | `STEP 4 - PRIVACY ACCOUNTING` |
+| Encrypted upload size | **~400 KB** (409,264 bytes) | `SECURE TRANSPORT` → "Payload size" |
+| Chunks | 1 (1 MB chunk size) | same section |
 | Final status | `Round 1 update submitted`, `Overall E2E status: SUCCESS` | end of run |
-| Wall time per client | **~60–90 seconds** (typically ~70s) | not printed directly — time the run yourself |
+| Wall time per client | **~60–90 seconds** (measured: 75s, 83s); with `XAI_ENABLED=1` add about 6 minutes (measured: 440s) | not printed directly — time the run yourself |
 
-If trainable params show 109M+ instead of 281,254, `FREEZE_TEXT_ENCODER` isn't
-active — check the environment. If delta L2 is near 0 or the run trains in a handful
+If trainable params show 109M+ instead of 75,454 in the `FIX B` / `DELTA / SAFETY
+CLAMP` sections, `FREEZE_TEXT_ENCODER` isn't active — check the environment. If they
+show 281,254, `FUSION_HIDDEN_DIM` is being overridden to 256 in your shell. If delta L2 is near 0 or the run trains in a handful
 of steps, `epochs`/`lr` fell back to old defaults — check `SUPERVISED_EPOCHS` /
 `SUPERVISED_LR` aren't being overridden to something stale in your shell.
 
@@ -292,7 +298,9 @@ $env:CLIENT_SHARD_ID = "2"
 Get-Content "trainer_outputs\demo_blank_stdin.txt" | & ".venv\Scripts\python.exe" "run_client_multimodal.py" *>&1 | Tee-Object -FilePath "trainer_outputs\demo_client_run3.log"
 ```
 
-**Expected values (Mode B)** — measured in Step 20 Run A
+**Expected values (Mode B)** — shard sizes and class counts are unchanged, but the
+**delta L2 column was measured at the old 281,254-param fusion head and has not been
+re-measured at 75,454** (expect lower values). Measured in Step 20 Run A
 (`docs/IMPLEMENTATION_NOTES.md`, "Step 20" section), reproduced exactly by
 this seed/n_shards combination:
 
@@ -338,7 +346,8 @@ $env:CLIENT_SHARD_ID = "2"
 Get-Content "trainer_outputs\demo_blank_stdin.txt" | & ".venv\Scripts\python.exe" "run_client_multimodal.py" *>&1 | Tee-Object -FilePath "trainer_outputs\demo_client_run3.log"
 ```
 
-**Expected values (Mode C, alpha=0.5)** — measured in Step 20 Run B
+**Expected values (Mode C, alpha=0.5)** — as for Mode B, the delta L2 column is
+from the old 281,254-param head, not re-measured. Measured in Step 20 Run B
 (`docs/IMPLEMENTATION_NOTES.md`, "Step 20" section). **The exact split depends
 on the alpha and seed** — this table is what `alpha=0.5, seed=20240` produces;
 a different alpha or seed will produce a different (still deterministic,
@@ -425,8 +434,9 @@ $py | & ".venv\Scripts\python.exe" -
 Expected: `model_updates: 3`, `receipts: 3`, `global_models: 1`, and the printed
 `global_models` record's `file_id` matches the printed GridFS `_id` — proof the
 aggregated global model is durably persisted. The GridFS file's `length` should be
-**~1.4–1.5 MB** (three 281,254-parameter updates aggregated, not the old ~439 MB —
-that figure was from before Fix B froze the text encoder and stopped transmitting it).
+**~307 KB** (measured: 307,059 bytes — three 75,454-parameter updates aggregated; it
+was ~1.4–1.5 MB at the old 281,254-param head, and ~439 MB before Fix B froze the
+text encoder and stopped transmitting it).
 
 ---
 
@@ -485,7 +495,8 @@ wait to be asked about individually:
    count (median-of-3 is no more attack-resistant than mean-of-3 here). This session's
    investigation (`docs/IMPLEMENTATION_NOTES.md`, Step 13) measured that plain mean
    aggregation denoises measurably better at n=3 (delta L2 260.25 vs. 301.80 on
-   identical data) with no robustness given up — but making that the live default
+   identical data — a historical measurement at `noise_multiplier=1.0` and 281,254
+   params, not re-measured at the current configuration) with no robustness given up — but making that the live default
    requires changing a hardcoded literal at
    `server/orchestration_agent/src/grpc/server.rs:1499`, a Rust change intentionally
    **not made** in this branch (see "Fix F" below).
@@ -496,8 +507,9 @@ wait to be asked about individually:
    aggregation — they say nothing about the aggregated global model's utility. This
    session ran that measurement properly for the first time (Steps 12–17,
    `docs/IMPLEMENTATION_NOTES.md`): reconstructing the true aggregated global model
-   and evaluating it on held-out data. Headline result: **at this branch's DP
-   configuration (noise_multiplier=1.0) and 3-client scale, aggregated utility
+   and evaluating it on held-out data. Headline result: **at the DP configuration
+   then in use (noise_multiplier=1.0, 281,254 params — not re-measured at today's
+   0.75 / 75,454) and 3-client scale, aggregated utility
    collapses to a degenerate, saturated prediction — not a graceful
    privacy/utility tradeoff** — and a follow-up fix for a separate multi-round
    training divergence (Step 16's LR decay) does not recover it; if anything it
@@ -518,7 +530,7 @@ should not be started without a fresh scoping conversation:
 - `server.rs:1499`: `"mode": "trimmed_mean"` → `"mode": "mean"` (Rust, requires a
   scoped Rust change this investigation deliberately did not make)
 
-DP (Gaussian, `clip_norm=0.85`, `noise_multiplier=1.0`, `ε=5.302585`, `δ=1e-5`),
+DP (Gaussian, `clip_norm=0.85`, `noise_multiplier=0.75`, `ε=6.603254`, `δ=1e-5`),
 AES-GCM encryption, TPM-backed ECDSA device signing, mTLS transport, and trimmed-mean
 aggregation (`trim_ratio=0.1`) are all live and unmodified by this session for the
 purposes of this basic demo — only the training regime (Fix A/B/E1–E5, Step 16) and

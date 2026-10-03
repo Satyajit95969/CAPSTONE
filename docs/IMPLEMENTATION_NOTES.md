@@ -1947,7 +1947,8 @@ both modes at least once.
 accuracy=0.6486486486486487) used throughout `scripts/demo_predictions.py`
 and the mentor-demo materials.** 0.5517 exceeds *both* degenerate-mode
 ceilings (0.4583) and remains above-typical. **Superseded by the larger,
-better-measured fusion-head sweep below (2026-09-20): the anchor is no
+better-measured fusion-head sweep below (2026-09-20; pooled on 2026-10-03
+with the augmentation sweep, 33 genuine runs of 100): the anchor is no
 longer "the ONE run" that discriminated** - that claim was itself a
 small-sample artifact of the original 14-run count. Across the 55-run
 fusion-head sweep, 16 runs (29.1%) achieved genuine discrimination, and one
@@ -1957,24 +1958,40 @@ isn't unique the way the original disclosure claimed.
 
 **Machine-readable summary for `scripts/demo_predictions.py`'s
 representativeness disclosure block** (parsed at runtime, not hardcoded in
-the script - see that file's `_load_disclosure_facts()`; updated 2026-09-20
-to reflect the fusion-head sweep superseding the original 14-run sigma
-comparison, which is kept above for its own record but is no longer what
-the live disclosure quotes):
+the script - see that file's `_load_disclosure_facts()`; updated 2026-10-03
+to pool the 55-run fusion-head sweep with the 45-run training-data
+augmentation sweep, both documented below - the 14-run sigma comparison is
+kept above for its own record but is not what the live disclosure quotes):
 
 ```
 DISCLOSURE_ANCHOR_SESSION_ID: client-405c6057ab84
 DISCLOSURE_ANCHOR_F1: 0.5517
-DISCLOSURE_SWEEP_TOTAL_RUNS: 55
-DISCLOSURE_SWEEP_GENUINE_COUNT: 16
-DISCLOSURE_SWEEP_GENUINE_RATE_PCT: 29.1
+DISCLOSURE_SWEEP_TOTAL_RUNS: 100
+DISCLOSURE_SWEEP_GENUINE_COUNT: 33
+DISCLOSURE_SWEEP_GENUINE_RATE_PCT: 33.0
 DISCLOSURE_SWEEP_BEST_RATE_PCT: 40.0
 DISCLOSURE_SWEEP_WORST_RATE_PCT: 0.0
+DISCLOSURE_BAND_RUNS: 90
+DISCLOSURE_BAND_GENUINE_COUNT: 33
+DISCLOSURE_BAND_RATE_PCT: 36.7
+DISCLOSURE_BAND_LOW_PCT: 33.3
+DISCLOSURE_BAND_HIGH_PCT: 40.0
+DISCLOSURE_FLOOR_RUNS: 10
 DISCLOSURE_SWEEP_BEST_RUN_F1: 0.6207
 DISCLOSURE_POSITIVE_COLLAPSE_F1: 0.4583
 DISCLOSURE_NEGATIVE_COLLAPSE_F1: 0.0000
 DISCLOSURE_BASE_RATE_POSITIVE_PCT: 29.73
 ```
+
+How these figures are derived (every count is copied from a table in this
+file, none re-measured): the fusion-head sweep contributes 16 genuine runs
+of 55 (H=256 6/15, H=128 5/15, H=56 5/15, H=12 0/5, H=1 0/5) and the
+augmentation sweep 17 of 45 (Arm 1 6/15, Arm 2 5/15, Arm 3 6/15) - 33 of
+100. `DISCLOSURE_BAND_*` is the 90 runs at a workable head size (H>=56):
+six arms of n=15, each between 33.3% and 40.0%, 33 of 90 pooled (36.7%).
+`DISCLOSURE_FLOOR_RUNS` is the 10 runs at H=12 and H=1, all collapsed.
+The previous block (2026-09-20) quoted the fusion-head sweep alone: 16 of
+55, 29.1% - lower only because it pools in those 10 floor runs.
 
 ---
 
