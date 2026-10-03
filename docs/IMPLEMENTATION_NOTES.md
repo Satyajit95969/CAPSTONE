@@ -2346,3 +2346,143 @@ in this investigation. The 37 held-out records were never touched,
 verified structurally and by assertion in `scripts/augment_training_data.py`
 and in `stratified_split()` itself, across all 45 runs.
 
+
+---
+
+## Defect A, measured: the "global model" the client loads is DP noise (2026-10-03)
+
+First direct measurement of what Defect A (see "Step 12 findings" above)
+actually hands a round-2 client. Read from the four global models a client
+had downloaded during the 2026-09-20 multi-round session
+(`~/.federated/data/global_models_multimodal/global_round{2..5}.pt`, 281,254
+trainable params at the time), not inferred from the code:
+
+| file | keys | BERT keys | params | L2 norm |
+|---|---|---|---|---|
+| `global_round2.pt` | 16 | 0 | 281,254 | 231.5 |
+| `global_round3.pt` | 16 | 0 | 281,254 | 226.3 |
+| `global_round4.pt` | 16 | 0 | 281,254 | 247.7 |
+| `global_round5.pt` | 16 | 0 | 281,254 | 301.1 |
+
+- Every one of the 16 tensors - weights and biases alike - has a
+  per-element std of 0.43-0.44. A default-initialised `fusion.fc1` weight has
+  std 0.018, so these values are roughly 24x larger than real weights.
+- 0.43 is what pure noise predicts: per-coordinate DP noise is
+  sigma x clip = 0.75 x 0.85 = 0.6375, and the median of three such draws
+  (trimmed_mean at n=3) has std ~0.67 x 0.6375 = 0.43. The file is the
+  aggregated DP noise; the ~0.4-0.6 learning signal is not visible in it.
+- The client does load it: a round-2 log
+  (`trainer_outputs/demo_r2_client1.log`, 2026-08-28) records "Warm-started
+  from global model: 199 missing keys, 0 unexpected keys" - all 16 trainable
+  tensors overwritten with this noise, only MentalBERT keeping real weights.
+- Not measured: the equivalent file at today's 75,454 params. By the same
+  arithmetic its L2 would be about 0.43 x sqrt(75,454) = 118.
+
+Consequence: from round 2 onward a client's trainable layers start from
+noise, and "distance from the global model" is distance from noise.
+
+---
+
+## FedProx (2026-10-03)
+
+**What was added.** `FEDPROX_MU` (env, default `0.0`). When > 0,
+`train_model()` adds `(mu/2) * ||w - w_ref||^2` to the local supervised loss
+before `backward()`, summed over the trainable parameters only (75,454; the
+reference is snapshotted after the text-encoder freeze, so MentalBERT is
+never in it). `w_ref` is the weights local training starts from. The term's
+value and the distance from the reference are logged every
+`TRAIN_LOG_INTERVAL` steps and every epoch, separately from the task loss.
+FedProx changes the client's local objective, so it lives in the trainer,
+not in `scripts/fl_optimizers.py` (server-side FedAdam/FedYogi). No server,
+aggregation, DP, lr, epochs, batch size, clip_norm, sigma or
+`FUSION_HIDDEN_DIM` change.
+
+**Deviation from the original brief, deliberate.** The brief said the
+proximal term must be zero in round 1 and activate from round 2, because
+round 1 has no global model. That was overridden: the only global model
+this pipeline produces is DP noise (section above), so a round-2 proximal
+term would measure distance from noise, and a round-1 term fixed at zero
+would make FedProx inert in the only round that works. Instead the
+reference is the round's starting weights, with `GLOBAL_INIT_SEED` making
+them identical across clients - a shared initialisation is a valid round-0
+global model, and FedProx's local training starts at the global model by
+definition. The term is therefore active from round 1. When Defect A is
+fixed, a warm-started client's starting weights ARE the real global model
+and the same code applies unchanged.
+
+**The shared initialisation is proven per run, not assumed.** With
+`GLOBAL_INIT_SEED`, `FEDPROX_MU > 0` or `EXPECTED_INIT_HASH` set,
+`orchestrate()` logs the seed, the sha256 and the L2 of its initial
+trainable weights (`[INIT-HASH]`). It refuses to train if
+`EXPECTED_INIT_HASH` is set and differs, and if `FEDPROX_MU > 0` with
+neither a global model nor `GLOBAL_INIT_SEED` (a private random init is not
+a shared reference). `scripts/run_fedprox_modec.py` hands client 0's hash to
+clients 1 and 2 and re-compares all three; all 20 rounds below passed, and
+each seed gave the same hash at every mu.
+
+**mu=0 regression.** `train_model()` from the pre-FedProx commit and from
+this one, run under identical seeds on the full 149-record split, produced
+the same trained-weights sha256 (`2f0accef...2693c3`), the same metrics and
+the same stdout - with `FEDPROX_MU` unset and with it set to 0.
+
+**Measurement: Mode C, 3 shards, 4 mu values x 5 repeats = 60 client runs.**
+`CLIENT_N_SHARDS=3`, `CLIENT_SHARD_SEED=20240`, `CLIENT_NONIID_ALPHA=0.5`;
+seeds 1001-1005 reused at every mu (paired). Each client is the live
+`orchestrate()` entry point in its own process; DP, encryption, upload and
+aggregation were not run (delta L2 and local metrics are produced before
+them). Raw rows: `trainer_outputs/fedprox_modec/results.json`.
+
+Delta L2 (distance moved from the shared starting weights), mean over 5
+repeats, with the across-repeat variance in brackets:
+
+| mu | shard 0 (73 records, 11+/62-) | shard 1 (40, 1+/39-) | shard 2 (36, 32+/4-) | pooled mean |
+|---|---|---|---|---|
+| 0 | 0.2498 (7.8e-05) | 0.1942 (3.3e-04) | 0.1753 (1.2e-04) | 0.2064 |
+| 1 | 0.1460 (1.9e-05) | 0.0780 (1.9e-04) | 0.1206 (4.9e-04) | 0.1149 |
+| 10 | 0.0973 (7.5e-05) | 0.0444 (1.5e-04) | 0.0772 (1.2e-04) | 0.0730 |
+| 100 | 0.0492 (6.5e-05) | 0.0254 (1.5e-04) | 0.0498 (8.0e-05) | 0.0414 |
+
+Spread across the three clients of one round (variance of their three delta
+L2 values, mean over the 5 rounds), and the same spread relative to the
+mean:
+
+| mu | within-round variance | std / pooled mean |
+|---|---|---|
+| 0 | 1.68e-03 | 0.20 |
+| 1 | 1.38e-03 | 0.32 |
+| 10 | 8.3e-04 | 0.39 |
+| 100 | 3.0e-04 | 0.42 |
+
+What this does and does not show:
+- **The proximal term works as a drift limiter.** Every shard moves less
+  from the shared reference as mu rises, monotonically: pooled delta L2
+  falls 44% at mu=1, 65% at mu=10, 80% at mu=100.
+- **The absolute spread between clients falls** (within-round variance
+  1.68e-03 -> 3.0e-04), but **the relative spread rises** (0.20 -> 0.42):
+  the variance drops because every client's update shrinks, not because the
+  clients become more alike. And the across-repeat variance within a shard
+  shows no consistent drop (shard 2 at mu=1 is the highest in the table).
+- **Not measured:** the distance BETWEEN clients' updates. Delta L2 is each
+  client's distance from the reference; two clients can each move less and
+  still point in different directions. Whether FedProx makes the aggregate
+  better is untested and cannot be tested through aggregation until Defect A
+  is fixed.
+- **A prediction made before the run was wrong.** From logged gradient
+  norms (25-180 on `fusion.fc1` vs a proximal gradient under 0.5 at mu=1)
+  the expectation was no measurable effect below mu~10. mu=1 already cut
+  delta L2 by 44%. Likely reason, not verified: AdamW normalises each
+  parameter's step by its own gradient history, so a small but
+  consistently-signed pull is not swamped the way it would be under SGD.
+- **Shard 1 holds 1 positive in 40 records.** It predicted all-negative in
+  20 of 20 runs at every mu; its numbers are reported separately above for
+  that reason and say little about FedProx.
+
+**Local F1 did not improve, as expected.** Mean F1 over the 15 runs per mu:
+0.189 (mu=0), 0.153 (1), 0.178 (10), 0.181 (100). Non-uniform (NEITHER)
+runs: 2/15, 0/15, 1/15, 1/15 - all on shard 0 except one shard-2 run at
+mu=0. Shard 2 (32+/4-) predicted all-positive in 19 of 20 runs. FedProx
+does not address the collapse behaviour and is not presented as doing so.
+
+Also newly measured here: Mode C's delta L2 at the current 75,454-param
+head is 0.250 / 0.194 / 0.175 (mu=0 row), replacing the 0.374 / 0.265 /
+0.275 measured at 281,254 params in Step 20.
