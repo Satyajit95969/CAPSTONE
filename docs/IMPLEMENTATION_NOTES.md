@@ -1948,10 +1948,11 @@ accuracy=0.6486486486486487) used throughout `scripts/demo_predictions.py`
 and the mentor-demo materials.** 0.5517 exceeds *both* degenerate-mode
 ceilings (0.4583) and remains above-typical. **Superseded by the larger,
 better-measured fusion-head sweep below (2026-09-20; pooled on 2026-10-03
-with the augmentation sweep, 33 genuine runs of 100): the anchor is no
+with the augmentation sweep, 35 genuine runs of 100): the anchor is no
 longer "the ONE run" that discriminated** - that claim was itself a
 small-sample artifact of the original 14-run count. Across the 55-run
-fusion-head sweep, 16 runs (29.1%) achieved genuine discrimination, and one
+fusion-head sweep, 18 runs (32.7%; 16 and 29.1% before the 2026-10-03 H=56
+recount) achieved genuine discrimination, and one
 of them (`FUSION_HIDDEN_DIM=128`, run 24, F1=0.6207) **exceeded the anchor
 outright**. The anchor is still a good, above-typical result - it just
 isn't unique the way the original disclosure claimed.
@@ -1967,31 +1968,35 @@ kept above for its own record but is not what the live disclosure quotes):
 DISCLOSURE_ANCHOR_SESSION_ID: client-405c6057ab84
 DISCLOSURE_ANCHOR_F1: 0.5517
 DISCLOSURE_SWEEP_TOTAL_RUNS: 100
-DISCLOSURE_SWEEP_GENUINE_COUNT: 33
-DISCLOSURE_SWEEP_GENUINE_RATE_PCT: 33.0
-DISCLOSURE_SWEEP_BEST_RATE_PCT: 40.0
+DISCLOSURE_SWEEP_GENUINE_COUNT: 35
+DISCLOSURE_SWEEP_GENUINE_RATE_PCT: 35.0
+DISCLOSURE_SWEEP_BEST_RATE_PCT: 46.7
 DISCLOSURE_SWEEP_WORST_RATE_PCT: 0.0
 DISCLOSURE_BAND_RUNS: 90
-DISCLOSURE_BAND_GENUINE_COUNT: 33
-DISCLOSURE_BAND_RATE_PCT: 36.7
+DISCLOSURE_BAND_GENUINE_COUNT: 35
+DISCLOSURE_BAND_RATE_PCT: 38.9
 DISCLOSURE_BAND_LOW_PCT: 33.3
-DISCLOSURE_BAND_HIGH_PCT: 40.0
+DISCLOSURE_BAND_HIGH_PCT: 46.7
 DISCLOSURE_FLOOR_RUNS: 10
-DISCLOSURE_SWEEP_BEST_RUN_F1: 0.6207
+DISCLOSURE_SWEEP_BEST_RUN_F1: 0.6667
 DISCLOSURE_POSITIVE_COLLAPSE_F1: 0.4583
 DISCLOSURE_NEGATIVE_COLLAPSE_F1: 0.0000
 DISCLOSURE_BASE_RATE_POSITIVE_PCT: 29.73
 ```
 
 How these figures are derived (every count is copied from a table in this
-file, none re-measured): the fusion-head sweep contributes 16 genuine runs
-of 55 (H=256 6/15, H=128 5/15, H=56 5/15, H=12 0/5, H=1 0/5) and the
-augmentation sweep 17 of 45 (Arm 1 6/15, Arm 2 5/15, Arm 3 6/15) - 33 of
-100. `DISCLOSURE_BAND_*` is the 90 runs at a workable head size (H>=56):
-six arms of n=15, each between 33.3% and 40.0%, 33 of 90 pooled (36.7%).
-`DISCLOSURE_FLOOR_RUNS` is the 10 runs at H=12 and H=1, all collapsed.
-The previous block (2026-09-20) quoted the fusion-head sweep alone: 16 of
-55, 29.1% - lower only because it pools in those 10 floor runs.
+file, none re-measured): the fusion-head sweep contributes 18 genuine runs
+of 55 (H=256 6/15, H=128 5/15, H=56 7/15 after the 2026-10-03 recount
+below, H=12 0/5, H=1 0/5) and the augmentation sweep 17 of 45 (Arm 1 6/15,
+Arm 2 5/15, Arm 3 6/15) - 35 of 100. `DISCLOSURE_BAND_*` is the 90 runs at
+a workable head size (H>=56): six arms of n=15, each between 33.3% and
+46.7%, 35 of 90 pooled (38.9%). `DISCLOSURE_FLOOR_RUNS` is the 10 runs at
+H=12 and H=1, all collapsed. The previous block (2026-09-20) quoted the
+fusion-head sweep alone as 16 of 55, 29.1% - lower because it pools in
+those 10 floor runs and predates the H=56 recount.
+`DISCLOSURE_SWEEP_BEST_RUN_F1` is the best single run across all 100:
+0.6667 (augmentation Arm 2, run 99, read from its log); it was 0.6207
+(H=128, run 24) while the block covered the fusion-head sweep alone.
 
 ---
 
@@ -2066,18 +2071,33 @@ unanimous) reversed this:
 |---|---|---|---|---|---|---|
 | 256 (baseline) | 281,254 | 15 | 5 | 4 | **6** | **40.0%** |
 | 128 | 149,542 | 15 | 8 | 2 | **5** | **33.3%** |
-| 56 | 75,454 | 15 | 5 | 5 | **5** | **33.3%** |
+| 56 | 75,454 | 15 | 5 | 3 | **7** | **46.7%** |
 | 12 | 30,178 | 5 | 2 | 3 | **0** | **0%** |
 | 1 | 18,859 | 5 | 2 | 3 | **0** | **0%** |
 
-At n=15, baseline (40.0%) is *higher* than both H=128 and H=56 (33.3%
-each) - the apparent n=5 advantage for smaller heads did not survive and,
-if anything, reversed. **Conclusion: shrinking the fusion head from
+**Correction (2026-10-03): the H=56 row was recounted from the 15 run logs
+(`trainer_outputs/client_run_stdout{26-30,61-70}b.log`) and originally read
+5 / 5 / 5, 33.3%.** Runs 64 (accuracy 0.6757) and 66 (accuracy 0.6486) had
+been counted as all-negative because their F1 is 0.0000, but an exact
+all-negative output scores accuracy 0.7027 on this split - both runs
+predicted one or two positives, all wrong, so by the classification rule
+below they are NEITHER. Per-run, H=56: all-positive 29, 61, 62, 68, 69;
+all-negative 27, 65, 67; NEITHER 26, 28, 30, 63, 64, 66, 70. The same
+recount of every other arm (H=256, 128, 12, 1, and the three augmentation
+arms below) matched its documented counts exactly. Separately, the n=5
+figures quoted above (1/5, 2/5, 2/5) match the F1-above-ceiling check, not
+the NEITHER rule; by the NEITHER rule the first five runs of each arm were
+baseline 2/5, H=128 2/5, H=56 3/5.
+
+At n=15 the three workable sizes are 40.0% (baseline), 33.3% (H=128) and
+46.7% (H=56) - no ordering by head size, and the apparent n=5 advantage for
+H=128 did not survive. **Conclusion: shrinking the fusion head from
 281,254 to 149,542 or 75,454 params neither reliably helps nor reliably
 hurts the genuine-discrimination rate** - all three are statistically
-indistinguishable at this sample size (a 1-run difference out of 15). The
-only result that held up under a larger sample, and got *stronger* (0/10
-combined, not 0/7 or 0/5 individually), is the floor below 75,454 params.
+indistinguishable at this sample size (one or two runs' difference out of
+15). The only result that held up under a larger sample, and got *stronger*
+(0/10 combined, not 0/7 or 0/5 individually), is the floor below 75,454
+params.
 
 Classification rule used throughout: "NEITHER" = at least one prediction
 differs from the rest (not a uniform all-one-class output) - the literal
@@ -2298,7 +2318,9 @@ than presenting a number that reverses later.**
   it wasn't.)
 - All three arms converge to the same ~33-40% band already established as
   this architecture's baseline range in the 55-run fusion-head sweep,
-  independent of fusion-head size. Neither more real text nor minority
+  independent of fusion-head size (that sweep's H=56 arm was recounted on
+  2026-10-03 as 46.7%, so its band is 33-47%; these three arms still sit
+  inside it). Neither more real text nor minority
   rebalancing moved the genuine-discrimination rate outside that band in
   either direction.
 
